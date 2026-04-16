@@ -179,9 +179,3 @@ EPERM: operation not permitted, scandir '.next-build-check/types'
 - 能做批注和 AI 辅助
 - 能恢复历史与部分本地状态
 
-如果你想把它继续推进成公开可维护项目，下一步最值得补的是：
-
-- 首页截图 / GIF
-- License
-- 更细的部署文档
-- 自动化测试与 CI
