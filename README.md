@@ -1,8 +1,9 @@
 <div align="center">
-  <img src="public/icon.svg" alt="乖积 PDF icon" width="160" />
+  <img src="./public/icon.svg" alt="乖积 PDF 图标" width="160" />
   <h1>乖积 PDF</h1>
   <p><strong>让论文 PDF 从静态页面，变成可翻译、可对话、可批注的研究工作台。</strong></p>
-  <p>工程仓库名：<code>Doti</code></p>
+  <p>品牌名：<strong>乖积 PDF</strong> · 工程仓库名：<code>Doti</code></p>
+  <p><a href="https://github.com/l-moze/Doti">GitHub 仓库</a></p>
 </div>
 
 ## 简介
