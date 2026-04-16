@@ -1,0 +1,60 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# next / build outputs
+.next/
+.next-dev/
+.next-build*/
+out/
+build/
+dist/
+coverage/
+
+# local runtime data
+.cache/
+uploads/
+
+# environment files
+.env
+.env.*
+!.env.example
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+pnpm-debug.log*
+*.log
+
+# typescript
+*.tsbuildinfo
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+
+# local AI / MCP tooling
+.claude/
+.claude-flow/
+.mcp.json
+
+# internal working docs
+bug.md
+redme.md
+research-agent-markdown.md
+CLAUDE.md
+
+# OS / misc
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.pem
