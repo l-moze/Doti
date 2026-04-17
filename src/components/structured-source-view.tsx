@@ -1,11 +1,13 @@
 'use client';
+/* eslint-disable @next/next/no-img-element */
 
-import { memo, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import type { Options as ReactMarkdownOptions } from 'react-markdown';
+import type { DocumentSemanticBlock, DocumentSemanticChild, DocumentSemanticProjection } from '@/lib/document-semantic';
 import { repairDanglingHtmlTables } from '@/lib/markdown-table-utils';
 
-type MarkdownViewProps = {
-    value: string;
+type StructuredSourceViewProps = {
+    projection: DocumentSemanticProjection;
     className?: string;
 };
 
@@ -22,7 +24,6 @@ type MarkdownRuntimeModules = {
 type RemarkPluginList = NonNullable<ReactMarkdownOptions['remarkPlugins']>;
 type RehypePluginList = NonNullable<ReactMarkdownOptions['rehypePlugins']>;
 type MarkdownComponents = NonNullable<ReactMarkdownOptions['components']>;
-
 type MarkdownAstNode = {
     type?: string;
     value?: string;
@@ -179,14 +180,10 @@ async function loadMarkdownRuntimeModules(): Promise<MarkdownRuntimeModules> {
     };
 }
 
-function MarkdownViewComponent({ value, className }: MarkdownViewProps) {
+function useMarkdownRuntime() {
     const [runtimeModules, setRuntimeModules] = useState<MarkdownRuntimeModules | null>(null);
     const [loadFailed, setLoadFailed] = useState(false);
     const retryTimeoutRef = useRef<number | null>(null);
-    const normalizedValue = useMemo(
-        () => repairDanglingHtmlTables(normalizeEscapedTableHtml(value)),
-        [value]
-    );
 
     useEffect(() => {
         let cancelled = false;
@@ -254,32 +251,173 @@ function MarkdownViewComponent({ value, className }: MarkdownViewProps) {
         },
     }), []);
 
+    return {
+        runtimeModules,
+        loadFailed,
+        remarkPlugins,
+        rehypePlugins,
+        components,
+    };
+}
+
+function normalizeMarkdownFragment(value: string): string {
+    return repairDanglingHtmlTables(normalizeEscapedTableHtml(value));
+}
+
+function MarkdownFragment({
+    value,
+    runtimeModules,
+    remarkPlugins,
+    rehypePlugins,
+    components,
+}: {
+    value: string;
+    runtimeModules: MarkdownRuntimeModules | null;
+    remarkPlugins: RemarkPluginList;
+    rehypePlugins: RehypePluginList;
+    components: MarkdownComponents;
+}) {
+    const normalizedValue = useMemo(() => normalizeMarkdownFragment(value), [value]);
+
     if (!runtimeModules) {
-        return (
-            <div className={`markdown-body whitespace-pre-wrap break-words ${className || ''}`.trim()}>
-                {normalizedValue}
-                {loadFailed ? (
-                    <div className="mt-3 text-xs text-amber-600">
-                        Markdown 渲染模块热更新失败，已退回纯文本显示。刷新页面后会恢复富文本渲染。
-                    </div>
-                ) : null}
-            </div>
-        );
+        return <div className="whitespace-pre-wrap break-words">{normalizedValue}</div>;
     }
 
     const ReactMarkdown = runtimeModules.ReactMarkdown;
 
     return (
+        <ReactMarkdown
+            components={components}
+            remarkPlugins={remarkPlugins}
+            rehypePlugins={rehypePlugins}
+        >
+            {normalizedValue}
+        </ReactMarkdown>
+    );
+}
+
+function renderFigureGrid(children: DocumentSemanticChild[]) {
+    return children.map((child) => (
+        <figure
+            key={child.id}
+            className="flex min-w-0 flex-col gap-2 rounded-2xl border border-slate-200 bg-slate-50/70 p-3"
+            data-doti-subfigure="true"
+        >
+            {child.assetPath ? (
+                <img
+                    src={child.assetPath}
+                    alt={child.subfigureCaption || child.captionText || ''}
+                    className="w-full rounded-xl border border-slate-200 bg-white object-contain"
+                    loading="lazy"
+                />
+            ) : null}
+            {child.subfigureCaption || child.captionText ? (
+                <figcaption className="text-sm leading-6 text-slate-600" data-doti-subcaption="true">
+                    {child.subfigureCaption || child.captionText}
+                </figcaption>
+            ) : null}
+        </figure>
+    ));
+}
+
+function FigureBlock({ block }: { block: DocumentSemanticBlock }) {
+    if (block.children.length > 0) {
+        return (
+            <figure className="not-prose flex flex-col gap-4" data-doti-figure-group="true">
+                <div
+                    className={`grid gap-4 ${block.children.length >= 3 ? 'md:grid-cols-2 xl:grid-cols-3' : block.children.length === 2 ? 'md:grid-cols-2' : ''}`}
+                    data-doti-figure-grid="true"
+                >
+                    {renderFigureGrid(block.children)}
+                </div>
+                {block.captionText ? (
+                    <figcaption className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-700">
+                        {block.captionText}
+                    </figcaption>
+                ) : null}
+            </figure>
+        );
+    }
+
+    return (
+        <figure className="not-prose flex flex-col gap-3 rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
+            {block.assetPath ? (
+                <img
+                    src={block.assetPath}
+                    alt={block.captionText || ''}
+                    className="w-full rounded-2xl border border-slate-200 bg-white object-contain"
+                    loading="lazy"
+                />
+            ) : null}
+            {block.captionText ? (
+                <figcaption className="text-sm leading-6 text-slate-700">
+                    {block.captionText}
+                </figcaption>
+            ) : null}
+        </figure>
+    );
+}
+
+function blockWrapperClassName(block: DocumentSemanticBlock): string {
+    if (block.kind === 'figure') return 'semantic-block semantic-block-figure';
+    if (block.kind === 'table') return 'semantic-block semantic-block-table';
+    if (block.kind === 'code') return 'semantic-block semantic-block-code';
+    if (block.kind === 'equation') return 'semantic-block semantic-block-equation';
+    return 'semantic-block';
+}
+
+function renderBlockContent(
+    block: DocumentSemanticBlock,
+    markdownRenderer: (value: string) => ReactNode
+) {
+    if (block.kind === 'figure') {
+        return <FigureBlock block={block} />;
+    }
+
+    return markdownRenderer(block.markdown);
+}
+
+function StructuredSourceViewComponent({ projection, className }: StructuredSourceViewProps) {
+    const {
+        runtimeModules,
+        loadFailed,
+        remarkPlugins,
+        rehypePlugins,
+        components,
+    } = useMarkdownRuntime();
+
+    const renderMarkdown = (value: string) => (
+        <MarkdownFragment
+            value={value}
+            runtimeModules={runtimeModules}
+            remarkPlugins={remarkPlugins}
+            rehypePlugins={rehypePlugins}
+            components={components}
+        />
+    );
+
+    return (
         <div className={`markdown-body ${className || ''}`.trim()}>
-            <ReactMarkdown
-                components={components}
-                remarkPlugins={remarkPlugins}
-                rehypePlugins={rehypePlugins}
-            >
-                {normalizedValue}
-            </ReactMarkdown>
+            {loadFailed ? (
+                <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                    Markdown 渲染模块热更新失败，当前已退回稳定渲染模式。刷新页面后会恢复完整富文本能力。
+                </div>
+            ) : null}
+
+            {projection.blocks.map((block) => (
+                <section
+                    key={block.id}
+                    id={block.semanticId}
+                    data-semantic-block-id={block.semanticId}
+                    data-semantic-kind={block.kind}
+                    className={blockWrapperClassName(block)}
+                >
+                    {renderBlockContent(block, renderMarkdown)}
+                </section>
+            ))}
         </div>
     );
 }
 
-export const MarkdownView = memo(MarkdownViewComponent);
+export const StructuredSourceView = memo(StructuredSourceViewComponent);
+StructuredSourceView.displayName = 'StructuredSourceView';

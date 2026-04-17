@@ -1,12 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Chunker } from "@/lib/agent/think/chunker";
-import { refineModule } from "@/lib/agent/memory/refine";
+import { refineModule, type RefinedContext } from "@/lib/agent/memory/refine";
 import { ActModule } from "@/lib/agent/act/translate";
 import { ProgressTracker, type TranslationProgress } from "@/lib/progress-tracker";
 import type { Term } from "@/lib/agent/memory/terminology-store";
 import type { Chunk } from "@/lib/agent/think/chunker";
-import { DeepLXClient } from "@/lib/deeplx-client";
+import { DeepLXClient, usesDeepLXOfficialEndpoint } from "@/lib/deeplx-client";
 import type { RuntimeProviderProfile } from "@/lib/llm/client";
+import {
+    applySoftGlossaryCorrections,
+    protectLockedGlossaryTerms,
+    restorePreservedMarkdownFragments,
+} from "@/lib/markdown-table-utils";
+import { normalizeTranslationTypography } from "@/lib/translation-postprocess";
 import type { TranslationChunkPlan, TranslationMarkdownBlock } from "@/lib/translation-runtime";
 import crypto from "node:crypto";
 
@@ -96,6 +102,86 @@ function rebuildCompletedBlocks(
     return blocks;
 }
 
+async function translateRefinedContextToCompletion(input: {
+    refinedContext: RefinedContext;
+    targetLang: string;
+    actModule?: ActModule;
+    runtimeProfile?: RuntimeProviderProfile;
+}): Promise<string> {
+    if (input.refinedContext.isReference) {
+        return restorePreservedMarkdownFragments(
+            input.refinedContext.sourceText,
+            input.refinedContext.preservedFragments
+        );
+    }
+
+    if (input.runtimeProfile?.providerType === "deeplx") {
+        const prefersOfficialEndpoint = usesDeepLXOfficialEndpoint(input.runtimeProfile);
+        const useNativeGlossary = Boolean(
+            input.runtimeProfile.glossaryId?.trim() &&
+            input.runtimeProfile.sourceLang?.trim()
+        );
+        const shouldUseLockedTermFallback = !prefersOfficialEndpoint && !useNativeGlossary;
+        const { text: lockedTermsProtectedText, fragments: lockedTermFragments } = shouldUseLockedTermFallback
+            ? protectLockedGlossaryTerms(
+                input.refinedContext.sourceText,
+                input.refinedContext.relevantTerms
+            )
+            : { text: input.refinedContext.sourceText, fragments: [] };
+        const translated = await new DeepLXClient(input.runtimeProfile).translate(
+            lockedTermsProtectedText,
+            input.targetLang,
+            useNativeGlossary
+                ? {
+                    sourceLang: input.runtimeProfile.sourceLang,
+                    glossaryId: input.runtimeProfile.glossaryId,
+                }
+                : undefined
+        );
+        const withLockedTermsRestored = restorePreservedMarkdownFragments(
+            translated,
+            lockedTermFragments
+        );
+        const withSoftGlossaryCorrections = applySoftGlossaryCorrections(
+            withLockedTermsRestored,
+            input.refinedContext.relevantTerms
+        );
+
+        const restoredMarkdown = restorePreservedMarkdownFragments(
+            withSoftGlossaryCorrections,
+            input.refinedContext.preservedFragments
+        );
+
+        return normalizeTranslationTypography(restoredMarkdown, input.targetLang);
+    }
+
+    return input.actModule!.translate(input.refinedContext, input.targetLang);
+}
+
+async function* translateRefinedContextStream(input: {
+    refinedContext: RefinedContext;
+    targetLang: string;
+    actModule?: ActModule;
+    runtimeProfile?: RuntimeProviderProfile;
+}): AsyncGenerator<string, void, unknown> {
+    if (input.refinedContext.isReference) {
+        yield restorePreservedMarkdownFragments(
+            input.refinedContext.sourceText,
+            input.refinedContext.preservedFragments
+        );
+        return;
+    }
+
+    if (input.runtimeProfile?.providerType === "deeplx") {
+        yield await translateRefinedContextToCompletion(input);
+        return;
+    }
+
+    for await (const textPart of input.actModule!.translateStream(input.refinedContext, input.targetLang)) {
+        yield textPart;
+    }
+}
+
 async function translateChunkToCompletion(input: {
     chunk: Chunk;
     index: number;
@@ -113,19 +199,13 @@ async function translateChunkToCompletion(input: {
         input.extraTerms
     );
 
-    if (refinedContext.isReference) {
-        return {
-            index: input.index,
-            chunkId: input.chunkId,
-            title: input.title,
-            content: input.chunk.content,
-            state: "completed",
-        };
-    }
+    const content = await translateRefinedContextToCompletion({
+        refinedContext,
+        targetLang: input.targetLang,
+        actModule: input.actModule,
+        runtimeProfile: input.runtimeProfile,
+    });
 
-    const content = input.runtimeProfile?.providerType === 'deeplx'
-        ? await new DeepLXClient(input.runtimeProfile).translate(refinedContext.sourceText, input.targetLang)
-        : await input.actModule!.translate(refinedContext, input.targetLang);
     return {
         index: input.index,
         chunkId: input.chunkId,
@@ -388,15 +468,14 @@ async function* agentTranslateGenerator(
             // Stream the translated content
             let chunkTranslation = "";
 
-            if (runtimeProfile?.providerType === 'deeplx') {
-                const translated = await new DeepLXClient(runtimeProfile).translate(refinedContext.sourceText, targetLang);
-                yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: translated });
-                chunkTranslation = translated;
-            } else {
-                for await (const textPart of actModule!.translateStream(refinedContext, targetLang)) {
-                    yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
-                    chunkTranslation += textPart;
-                }
+            for await (const textPart of translateRefinedContextStream({
+                refinedContext,
+                targetLang,
+                actModule,
+                runtimeProfile,
+            })) {
+                yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
+                chunkTranslation += textPart;
             }
 
             chunkContent = chunkTranslation;
@@ -528,15 +607,15 @@ async function* translateWithoutCache(
             previousTranslation = chunk.content;
         } else {
             let chunkTranslation = "";
-            if (runtimeProfile?.providerType === 'deeplx') {
-                const translated = await new DeepLXClient(runtimeProfile).translate(refinedContext.sourceText, targetLang);
-                yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: translated });
-                chunkTranslation = translated;
-            } else {
-                for await (const textPart of actModule!.translateStream(refinedContext, targetLang)) {
-                    yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
-                    chunkTranslation += textPart;
-                }
+
+            for await (const textPart of translateRefinedContextStream({
+                refinedContext,
+                targetLang,
+                actModule,
+                runtimeProfile,
+            })) {
+                yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
+                chunkTranslation += textPart;
             }
             previousTranslation = chunkTranslation;
         }

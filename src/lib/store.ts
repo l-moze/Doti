@@ -17,9 +17,17 @@ import {
     type TranslationChunkPlan,
     type TranslationMarkdownBlock,
 } from './translation-runtime';
+import {
+    runPaperPolishRules,
+    type PaperPolishIssue,
+    type PaperPolishIssueWindow,
+    type PaperPolishMode,
+    type PaperPolishResidualIssue,
+} from './paper-polish';
 
 export type TaskStatus = 'idle' | 'uploading' | 'parsing' | 'parsed' | 'translating' | 'completed' | 'error';
 export type TranslationPhase = 'idle' | 'preparing' | 'chunking' | 'refining' | 'streaming' | 'stalled' | 'finalizing' | 'completed' | 'error';
+export type PaperPolishStatus = 'idle' | 'processing' | 'completed' | 'error' | 'cancelled';
 
 const TRANSLATION_STREAM_STALL_WARNING_MS = 45000;
 const TRANSLATION_STREAM_HARD_TIMEOUT_MS = 10 * 60 * 1000;
@@ -35,6 +43,17 @@ export interface HistoryItem {
     layoutUrl?: string | null;
     layoutJsonUrl?: string | null;
 }
+
+type PaperPolishUndoSnapshot = {
+    sourceMarkdown: string;
+    rawSourceMarkdown: string;
+    polishedSourceMarkdown: string;
+    targetMarkdown: string;
+    translationBlocks: TranslationMarkdownBlock[];
+    status: TaskStatus;
+    progress: number;
+    resumableTranslation: TranslationState['resumableTranslation'];
+};
 
 export interface TranslationState {
     // Config
@@ -54,6 +73,8 @@ export interface TranslationState {
     fileHash: string | null; // Cache key
     activeFileName: string | null;
     sourceMarkdown: string;
+    rawSourceMarkdown: string;
+    polishedSourceMarkdown: string;
     targetMarkdown: string;
     translationBlocks: TranslationMarkdownBlock[];
     translationRunId: string | null;
@@ -68,6 +89,19 @@ export interface TranslationState {
     translationPhase: TranslationPhase;
     translationLastEventAt: number | null;
     translationConcurrency: number;
+    paperPolishStatus: PaperPolishStatus;
+    paperPolishMode: PaperPolishMode | null;
+    paperPolishProgress: number;
+    paperPolishMessage: string;
+    paperPolishSummary: string[];
+    paperPolishIssues: PaperPolishIssue[];
+    paperPolishResidualIssues: PaperPolishResidualIssue[];
+    paperPolishIssueWindows: PaperPolishIssueWindow[];
+    paperPolishCanUseAiFallback: boolean;
+    paperPolishAutoEnabled: boolean;
+    paperPolishUndoSnapshot: PaperPolishUndoSnapshot | null;
+    paperPolishUndoExpiresAt: number | null;
+    paperPolishRevealKey: number;
 
     // Resume Translation
     resumableTranslation: {
@@ -102,6 +136,11 @@ export interface TranslationState {
     pollStatus: () => void;
     startTranslation: () => Promise<void>;
     performTranslation: (resume: boolean, forceFresh?: boolean) => Promise<void>;
+    setPaperPolishAutoEnabled: (enabled: boolean) => void;
+    runPaperPolish: (mode?: PaperPolishMode) => Promise<void>;
+    runPaperPolishAiFallback: () => Promise<void>;
+    cancelPaperPolish: () => void;
+    undoPaperPolish: () => Promise<void>;
     reset: () => void;
     setTargetLang: (lang: string) => void;
     setProvider: (providerId: string, model: string) => void;
@@ -217,6 +256,50 @@ function localizeTranslationStatus(message: unknown, concurrency: number): strin
     return message;
 }
 
+function deriveSourceMarkdownState(markdown: string, autoEnabled: boolean) {
+    const normalized = markdown.trim();
+    if (!normalized) {
+        return {
+            sourceMarkdown: '',
+            rawSourceMarkdown: '',
+            polishedSourceMarkdown: '',
+            summary: [] as string[],
+            issues: [] as PaperPolishIssue[],
+        };
+    }
+
+    if (!autoEnabled) {
+        return {
+            sourceMarkdown: normalized,
+            rawSourceMarkdown: normalized,
+            polishedSourceMarkdown: '',
+            summary: [] as string[],
+            issues: [] as PaperPolishIssue[],
+        };
+    }
+
+    const result = runPaperPolishRules(normalized, 'light');
+    return {
+        sourceMarkdown: result.markdown,
+        rawSourceMarkdown: normalized,
+        polishedSourceMarkdown: result.markdown !== normalized ? result.markdown : '',
+        summary: result.summary,
+        issues: result.issues,
+    };
+}
+
+type PaperPolishApiResponse = {
+    text?: string;
+    changed?: boolean;
+    issues?: PaperPolishIssue[];
+    summary?: string[];
+    residualIssues?: PaperPolishResidualIssue[];
+    issueWindows?: PaperPolishIssueWindow[];
+    canUseAiFallback?: boolean;
+    usedSource?: string;
+    error?: string;
+};
+
 async function persistActiveDocumentSnapshot(input: {
     fileHash: string | null;
     fileName: string | null;
@@ -224,6 +307,8 @@ async function persistActiveDocumentSnapshot(input: {
     progress: number;
     targetLang: string;
     sourceMarkdown: string;
+    rawSourceMarkdown: string;
+    polishedSourceMarkdown: string;
     targetMarkdown: string;
     layoutJsonUrl: string | null;
 }): Promise<void> {
@@ -237,6 +322,8 @@ async function persistActiveDocumentSnapshot(input: {
         updatedAt: Date.now(),
         targetLang: input.targetLang,
         sourceMarkdown: input.sourceMarkdown || undefined,
+        rawSourceMarkdown: input.rawSourceMarkdown || undefined,
+        polishedSourceMarkdown: input.polishedSourceMarkdown || undefined,
         targetMarkdown: input.targetMarkdown || undefined,
         layoutJsonUrl: input.layoutJsonUrl,
         lastOpenedAt: Date.now(),
@@ -257,6 +344,80 @@ async function fetchStoredTranslationMarkdown(fileHash: string, targetLang: stri
 export const useTranslationStore = create<TranslationState>()(
     persist(
         (set, get) => {
+            let paperPolishAbortController: AbortController | null = null;
+            let paperPolishProgressTimer: ReturnType<typeof setInterval> | null = null;
+
+            const clearPaperPolishProgressTimer = () => {
+                if (!paperPolishProgressTimer) return;
+                clearInterval(paperPolishProgressTimer);
+                paperPolishProgressTimer = null;
+            };
+
+            const schedulePaperPolishProgress = () => {
+                clearPaperPolishProgressTimer();
+                const checkpoints = [
+                    { progress: 14, message: '正在扫描段落边界...' },
+                    { progress: 33, message: '正在整理标题、列表与空行...' },
+                    { progress: 56, message: '正在合并跨页与图表打断片段...' },
+                    { progress: 74, message: '正在重建伪代码与结构块...' },
+                    { progress: 84, message: '正在等待模型返回整理结果...' },
+                ];
+                let pointer = 0;
+
+                paperPolishProgressTimer = setInterval(() => {
+                    const current = get();
+                    if (current.paperPolishStatus !== 'processing') {
+                        clearPaperPolishProgressTimer();
+                        return;
+                    }
+
+                    const checkpoint = checkpoints[Math.min(pointer, checkpoints.length - 1)];
+                    set({
+                        paperPolishProgress: checkpoint.progress,
+                        paperPolishMessage: checkpoint.message,
+                    });
+
+                    if (pointer < checkpoints.length - 1) {
+                        pointer += 1;
+                    }
+                }, 550);
+            };
+
+            const persistCurrentSnapshot = async () => {
+                const current = get();
+                await persistActiveDocumentSnapshot({
+                    fileHash: current.fileHash,
+                    fileName: current.activeFileName || current.file?.name || 'unknown.pdf',
+                    status: current.status,
+                    progress: current.progress,
+                    targetLang: current.targetLang,
+                    sourceMarkdown: current.sourceMarkdown,
+                    rawSourceMarkdown: current.rawSourceMarkdown,
+                    polishedSourceMarkdown: current.polishedSourceMarkdown,
+                    targetMarkdown: current.targetMarkdown,
+                    layoutJsonUrl: current.layoutJsonUrl,
+                });
+            };
+
+            const getParsedMarkdownState = (markdown: string) => deriveSourceMarkdownState(
+                markdown,
+                get().paperPolishAutoEnabled
+            );
+
+            const buildPaperPolishUndoSnapshot = (): PaperPolishUndoSnapshot => {
+                const current = get();
+                return {
+                    sourceMarkdown: current.sourceMarkdown,
+                    rawSourceMarkdown: current.rawSourceMarkdown,
+                    polishedSourceMarkdown: current.polishedSourceMarkdown,
+                    targetMarkdown: current.targetMarkdown,
+                    translationBlocks: current.translationBlocks,
+                    status: current.status,
+                    progress: current.progress,
+                    resumableTranslation: current.resumableTranslation,
+                };
+            };
+
             const syncTargetLanguageView = async (options?: {
                 targetLang?: string;
                 fallbackStatus?: TaskStatus;
@@ -321,6 +482,8 @@ export const useTranslationStore = create<TranslationState>()(
                     progress: persisted.progress,
                     targetLang: persisted.targetLang,
                     sourceMarkdown: persisted.sourceMarkdown,
+                    rawSourceMarkdown: persisted.rawSourceMarkdown,
+                    polishedSourceMarkdown: persisted.polishedSourceMarkdown,
                     targetMarkdown: persisted.targetMarkdown,
                     layoutJsonUrl: persisted.layoutJsonUrl,
                 });
@@ -344,6 +507,8 @@ export const useTranslationStore = create<TranslationState>()(
             fileHash: null,
             activeFileName: null,
             sourceMarkdown: '',
+            rawSourceMarkdown: '',
+            polishedSourceMarkdown: '',
             targetMarkdown: '',
             translationBlocks: [],
             translationRunId: null,
@@ -358,12 +523,261 @@ export const useTranslationStore = create<TranslationState>()(
             translationPhase: 'idle',
             translationLastEventAt: null,
             translationConcurrency: 1,
+            paperPolishStatus: 'idle',
+            paperPolishMode: null,
+            paperPolishProgress: 0,
+            paperPolishMessage: '',
+            paperPolishSummary: [],
+            paperPolishIssues: [],
+            paperPolishResidualIssues: [],
+            paperPolishIssueWindows: [],
+            paperPolishCanUseAiFallback: false,
+            paperPolishAutoEnabled: true,
+            paperPolishUndoSnapshot: null,
+            paperPolishUndoExpiresAt: null,
+            paperPolishRevealKey: 0,
             highlightedBlockId: null,
             history: [],
             resumableTranslation: null,
             isZenMode: false,
 
             toggleZenMode: () => set((state) => ({ isZenMode: !state.isZenMode })),
+
+            setPaperPolishAutoEnabled: (enabled) => {
+                const current = get();
+                const rawMarkdown = current.rawSourceMarkdown || current.sourceMarkdown;
+                const nextState = enabled ? getParsedMarkdownState(rawMarkdown) : {
+                    sourceMarkdown: rawMarkdown.trim(),
+                    rawSourceMarkdown: rawMarkdown.trim(),
+                    polishedSourceMarkdown: '',
+                    summary: [] as string[],
+                    issues: [] as PaperPolishIssue[],
+                };
+                const sourceChanged = nextState.sourceMarkdown !== current.sourceMarkdown;
+                const hadTranslation = Boolean(current.targetMarkdown.trim()) || current.translationBlocks.length > 0;
+
+                set({
+                    paperPolishAutoEnabled: enabled,
+                    sourceMarkdown: nextState.sourceMarkdown,
+                    rawSourceMarkdown: nextState.rawSourceMarkdown,
+                    polishedSourceMarkdown: nextState.polishedSourceMarkdown,
+                    paperPolishSummary: nextState.summary,
+                    paperPolishIssues: nextState.issues,
+                    paperPolishResidualIssues: [],
+                    paperPolishIssueWindows: [],
+                    paperPolishCanUseAiFallback: false,
+                    paperPolishStatus: 'idle',
+                    paperPolishMode: null,
+                    paperPolishProgress: 0,
+                    paperPolishMessage: '',
+                    paperPolishUndoSnapshot: null,
+                    paperPolishUndoExpiresAt: null,
+                    status: sourceChanged && hadTranslation ? 'parsed' : current.status,
+                    progress: sourceChanged && hadTranslation ? 60 : current.progress,
+                    targetMarkdown: sourceChanged && hadTranslation ? '' : current.targetMarkdown,
+                    translationBlocks: sourceChanged && hadTranslation ? [] : current.translationBlocks,
+                    translationStatus: sourceChanged && hadTranslation ? '源文结构已变化，请重新翻译。' : current.translationStatus,
+                    translationPhase: sourceChanged && hadTranslation ? 'idle' : current.translationPhase,
+                    translationLastEventAt: sourceChanged && hadTranslation ? null : current.translationLastEventAt,
+                    resumableTranslation: sourceChanged && hadTranslation ? null : current.resumableTranslation,
+                });
+
+                void persistCurrentSnapshot();
+            },
+
+            runPaperPolish: async (mode = 'light') => {
+                const current = get();
+                if (!current.sourceMarkdown.trim() || current.paperPolishStatus === 'processing' || current.status === 'translating') {
+                    return;
+                }
+
+                const undoSnapshot = buildPaperPolishUndoSnapshot();
+                const baseMarkdown = current.sourceMarkdown.trim();
+                const rawMarkdown = (current.rawSourceMarkdown || current.sourceMarkdown).trim();
+
+                set({
+                    paperPolishStatus: 'processing',
+                    paperPolishMode: mode,
+                    paperPolishProgress: mode === 'light' ? 18 : 8,
+                    paperPolishMessage: mode === 'light' ? '正在基于结构信息快速修复...' : '正在对疑难窗口执行 AI 深修...',
+                    paperPolishSummary: [],
+                    paperPolishIssues: [],
+                    paperPolishResidualIssues: mode === 'deep' ? current.paperPolishResidualIssues : [],
+                    paperPolishIssueWindows: mode === 'deep' ? current.paperPolishIssueWindows : [],
+                    paperPolishCanUseAiFallback: mode === 'deep' ? current.paperPolishCanUseAiFallback : false,
+                    paperPolishUndoSnapshot: null,
+                    paperPolishUndoExpiresAt: null,
+                    error: null,
+                });
+
+                if (mode === 'deep') {
+                    schedulePaperPolishProgress();
+                }
+
+                try {
+                    const fallbackResult = runPaperPolishRules(baseMarkdown, mode);
+                    const providerProfile = mode === 'deep' && current.assistProviderId.startsWith('custom:')
+                        ? await getProviderProfile(current.assistProviderId.slice('custom:'.length))
+                        : undefined;
+                    const userTerms = mode === 'deep' ? await listUserGlossaryRecords() : [];
+                    const enabledTerms = userTerms
+                        .filter((term) => term.enabled)
+                        .map((term) => ({ source: term.source, target: term.target, category: term.category }));
+
+                    paperPolishAbortController = new AbortController();
+                    const response = await fetch('/api/paper-polish', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        signal: paperPolishAbortController.signal,
+                        body: JSON.stringify({
+                            fileHash: current.fileHash,
+                            markdown: mode === 'deep' ? baseMarkdown : rawMarkdown,
+                            mode,
+                            issueWindows: mode === 'deep' ? current.paperPolishIssueWindows : undefined,
+                            providerId: mode === 'deep' ? current.assistProviderId : undefined,
+                            model: mode === 'deep' ? current.assistModel : undefined,
+                            providerProfile,
+                            targetLang: current.targetLang,
+                            extraTerms: enabledTerms,
+                        }),
+                    });
+                    const data = await response.json() as PaperPolishApiResponse;
+                    if (!response.ok) {
+                        throw new Error(data.error || 'PaperPolish 执行失败');
+                    }
+
+                    const result = {
+                        markdown: typeof data.text === 'string' ? data.text : fallbackResult.markdown,
+                        changed: typeof data.changed === 'boolean' ? data.changed : fallbackResult.changed,
+                        issues: Array.isArray(data.issues) ? data.issues : fallbackResult.issues,
+                        summary: Array.isArray(data.summary) ? data.summary : fallbackResult.summary,
+                        residualIssues: Array.isArray(data.residualIssues) ? data.residualIssues : [],
+                        issueWindows: Array.isArray(data.issueWindows) ? data.issueWindows : [],
+                        canUseAiFallback: Boolean(data.canUseAiFallback),
+                    };
+
+                    clearPaperPolishProgressTimer();
+                    paperPolishAbortController = null;
+
+                    const nextSourceMarkdown = result.markdown.trim() || baseMarkdown;
+                    const sourceChanged = nextSourceMarkdown !== current.sourceMarkdown.trim();
+                    const hadTranslation = Boolean(current.targetMarkdown.trim()) || current.translationBlocks.length > 0;
+
+                    set((state) => ({
+                        sourceMarkdown: nextSourceMarkdown,
+                        rawSourceMarkdown: rawMarkdown,
+                        polishedSourceMarkdown: nextSourceMarkdown !== rawMarkdown ? nextSourceMarkdown : '',
+                        paperPolishStatus: 'completed',
+                        paperPolishMode: mode,
+                        paperPolishProgress: 100,
+                        paperPolishMessage: mode === 'deep'
+                            ? (sourceChanged ? 'AI 深修完成' : 'AI 深修未改动正文')
+                            : result.canUseAiFallback
+                                ? `本地结构修复完成，发现 ${result.issueWindows.length} 处疑难结构`
+                                : (sourceChanged ? '本地结构修复完成' : '正文结构已较稳定'),
+                        paperPolishSummary: result.summary,
+                        paperPolishIssues: result.issues,
+                        paperPolishResidualIssues: result.residualIssues,
+                        paperPolishIssueWindows: result.issueWindows,
+                        paperPolishCanUseAiFallback: result.canUseAiFallback,
+                        paperPolishUndoSnapshot: undoSnapshot,
+                        paperPolishUndoExpiresAt: Date.now() + 3000,
+                        paperPolishRevealKey: sourceChanged
+                            ? state.paperPolishRevealKey + 1
+                            : state.paperPolishRevealKey,
+                        status: sourceChanged && hadTranslation ? 'parsed' : state.status,
+                        progress: sourceChanged && hadTranslation ? 60 : state.progress,
+                        targetMarkdown: sourceChanged && hadTranslation ? '' : state.targetMarkdown,
+                        translationBlocks: sourceChanged && hadTranslation ? [] : state.translationBlocks,
+                        translationStatus: sourceChanged && hadTranslation
+                            ? '源文结构已整理，请重新翻译。'
+                            : state.translationStatus,
+                        translationPhase: sourceChanged && hadTranslation ? 'idle' : state.translationPhase,
+                        translationLastEventAt: sourceChanged && hadTranslation ? null : state.translationLastEventAt,
+                        resumableTranslation: sourceChanged && hadTranslation ? null : state.resumableTranslation,
+                    }));
+
+                    await persistCurrentSnapshot();
+                } catch (error) {
+                    clearPaperPolishProgressTimer();
+                    paperPolishAbortController = null;
+
+                    const isAbort = error instanceof DOMException && error.name === 'AbortError';
+                    set({
+                        paperPolishStatus: isAbort ? 'cancelled' : 'error',
+                        paperPolishMode: mode,
+                        paperPolishProgress: 0,
+                        paperPolishMessage: isAbort ? '已取消本次整理' : '整理失败',
+                        paperPolishSummary: [],
+                        paperPolishIssues: [],
+                        paperPolishResidualIssues: mode === 'deep' ? current.paperPolishResidualIssues : [],
+                        paperPolishIssueWindows: mode === 'deep' ? current.paperPolishIssueWindows : [],
+                        paperPolishCanUseAiFallback: mode === 'deep' ? current.paperPolishCanUseAiFallback : false,
+                        error: isAbort ? null : getErrorMessage(error),
+                    });
+                }
+            },
+
+            runPaperPolishAiFallback: async () => {
+                const current = get();
+                if (current.paperPolishStatus === 'processing' || !current.paperPolishCanUseAiFallback || current.paperPolishIssueWindows.length === 0) {
+                    return;
+                }
+
+                await get().runPaperPolish('deep');
+            },
+
+            cancelPaperPolish: () => {
+                paperPolishAbortController?.abort();
+                paperPolishAbortController = null;
+                clearPaperPolishProgressTimer();
+                set({
+                    paperPolishStatus: 'cancelled',
+                    paperPolishProgress: 0,
+                    paperPolishMessage: '已取消本次整理',
+                });
+            },
+
+            undoPaperPolish: async () => {
+                const current = get();
+                const snapshot = current.paperPolishUndoSnapshot;
+                if (!snapshot) return;
+                if (current.paperPolishUndoExpiresAt && current.paperPolishUndoExpiresAt < Date.now()) {
+                    set({ paperPolishUndoSnapshot: null, paperPolishUndoExpiresAt: null });
+                    return;
+                }
+
+                const sourceChanged = current.sourceMarkdown !== snapshot.sourceMarkdown;
+                set((state) => ({
+                    sourceMarkdown: snapshot.sourceMarkdown,
+                    rawSourceMarkdown: snapshot.rawSourceMarkdown,
+                    polishedSourceMarkdown: snapshot.polishedSourceMarkdown,
+                    targetMarkdown: snapshot.targetMarkdown,
+                    translationBlocks: snapshot.translationBlocks,
+                    status: snapshot.status,
+                    progress: snapshot.progress,
+                    resumableTranslation: snapshot.resumableTranslation,
+                    paperPolishStatus: 'idle',
+                    paperPolishMode: null,
+                    paperPolishProgress: 0,
+                    paperPolishMessage: '已撤销上次整理',
+                    paperPolishSummary: ['已恢复到整理前的版本。'],
+                    paperPolishIssues: [],
+                    paperPolishResidualIssues: [],
+                    paperPolishIssueWindows: [],
+                    paperPolishCanUseAiFallback: false,
+                    paperPolishUndoSnapshot: null,
+                    paperPolishUndoExpiresAt: null,
+                    paperPolishRevealKey: sourceChanged
+                        ? state.paperPolishRevealKey + 1
+                        : state.paperPolishRevealKey,
+                    translationStatus: snapshot.status === 'translating' ? '翻译已中断' : '',
+                    translationPhase: snapshot.status === 'translating' ? 'stalled' : 'idle',
+                    translationLastEventAt: snapshot.status === 'translating' ? Date.now() : null,
+                }));
+
+                await persistCurrentSnapshot();
+            },
 
             addToHistory: (item) => {
                 const currentHistory = get().history;
@@ -395,6 +809,8 @@ export const useTranslationStore = create<TranslationState>()(
                     updatedAt: historyItem.updatedAt,
                     targetLang: current.targetLang,
                     sourceMarkdown: current.sourceMarkdown || undefined,
+                    rawSourceMarkdown: current.rawSourceMarkdown || undefined,
+                    polishedSourceMarkdown: current.polishedSourceMarkdown || undefined,
                     targetMarkdown: current.targetMarkdown || undefined,
                     layoutJsonUrl: current.layoutJsonUrl,
                     lastOpenedAt: Date.now(),
@@ -431,11 +847,24 @@ export const useTranslationStore = create<TranslationState>()(
                     activeFileName: item.fileName,
                     fileUrl: `/api/media/${hash}/original.pdf`,
                     sourceMarkdown: '',
+                    rawSourceMarkdown: '',
+                    polishedSourceMarkdown: '',
                     targetMarkdown: '',
                     translationBlocks: [],
                     translationRunId: null,
                     layoutUrl: item.layoutUrl || null,
                     layoutJsonUrl: item.layoutJsonUrl || null,
+                    paperPolishStatus: 'idle',
+                    paperPolishMode: null,
+                    paperPolishProgress: 0,
+                    paperPolishMessage: '',
+                    paperPolishSummary: [],
+                    paperPolishIssues: [],
+                    paperPolishResidualIssues: [],
+                    paperPolishIssueWindows: [],
+                    paperPolishCanUseAiFallback: false,
+                    paperPolishUndoSnapshot: null,
+                    paperPolishUndoExpiresAt: null,
                 });
 
                 try {
@@ -451,8 +880,17 @@ export const useTranslationStore = create<TranslationState>()(
                     }
 
                     if (cachedSnapshot) {
+                        const parsedState = cachedSnapshot.rawSourceMarkdown
+                            ? {
+                                sourceMarkdown: cachedSnapshot.sourceMarkdown || cachedSnapshot.rawSourceMarkdown || '',
+                                rawSourceMarkdown: cachedSnapshot.rawSourceMarkdown || '',
+                                polishedSourceMarkdown: cachedSnapshot.polishedSourceMarkdown || '',
+                            }
+                            : getParsedMarkdownState(cachedSnapshot.sourceMarkdown || '');
                         set({
-                            sourceMarkdown: cachedSnapshot.sourceMarkdown || '',
+                            sourceMarkdown: parsedState.sourceMarkdown,
+                            rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                            polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
                             translationBlocks: [],
                             layoutJsonUrl: cachedSnapshot.layoutJsonUrl || null,
@@ -465,7 +903,17 @@ export const useTranslationStore = create<TranslationState>()(
                     const sourceRes = await fetch(`/api/media/${hash}/full.md`);
                     if (sourceRes.ok) {
                         const sourceText = await sourceRes.text();
-                        set({ sourceMarkdown: sourceText });
+                        const parsedState = getParsedMarkdownState(sourceText);
+                        set({
+                            sourceMarkdown: parsedState.sourceMarkdown,
+                            rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                            polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
+                            paperPolishSummary: parsedState.summary,
+                            paperPolishIssues: parsedState.issues,
+                            paperPolishResidualIssues: [],
+                            paperPolishIssueWindows: [],
+                            paperPolishCanUseAiFallback: false,
+                        });
                     }
 
                     // Check if layout files exist
@@ -506,6 +954,8 @@ export const useTranslationStore = create<TranslationState>()(
                         progress: current.progress,
                         targetLang: current.targetLang,
                         sourceMarkdown: current.sourceMarkdown,
+                        rawSourceMarkdown: current.rawSourceMarkdown,
+                        polishedSourceMarkdown: current.polishedSourceMarkdown,
                         targetMarkdown: current.targetMarkdown,
                         layoutJsonUrl: current.layoutJsonUrl,
                     });
@@ -523,6 +973,8 @@ export const useTranslationStore = create<TranslationState>()(
                             status: cachedSnapshot?.sourceMarkdown ? 'parsed' : item.status,
                             error: null,
                             sourceMarkdown: cachedSnapshot.sourceMarkdown || '',
+                            rawSourceMarkdown: cachedSnapshot.rawSourceMarkdown || cachedSnapshot.sourceMarkdown || '',
+                            polishedSourceMarkdown: cachedSnapshot.polishedSourceMarkdown || '',
                             targetMarkdown: '',
                             translationBlocks: [],
                             layoutJsonUrl: cachedSnapshot.layoutJsonUrl || null,
@@ -658,6 +1110,8 @@ export const useTranslationStore = create<TranslationState>()(
                     progress: current.progress,
                     targetLang: current.targetLang,
                     sourceMarkdown: current.sourceMarkdown,
+                    rawSourceMarkdown: current.rawSourceMarkdown,
+                    polishedSourceMarkdown: current.polishedSourceMarkdown,
                     targetMarkdown: current.targetMarkdown,
                     layoutJsonUrl: current.layoutJsonUrl,
                 });
@@ -709,6 +1163,8 @@ export const useTranslationStore = create<TranslationState>()(
                     progress: current.progress,
                     targetLang: lang,
                     sourceMarkdown: current.sourceMarkdown,
+                    rawSourceMarkdown: current.rawSourceMarkdown,
+                    polishedSourceMarkdown: current.polishedSourceMarkdown,
                     targetMarkdown: current.targetMarkdown,
                     layoutJsonUrl: current.layoutJsonUrl,
                 });
@@ -722,6 +1178,9 @@ export const useTranslationStore = create<TranslationState>()(
             },
 
             setFile: (file) => {
+                paperPolishAbortController?.abort();
+                paperPolishAbortController = null;
+                clearPaperPolishProgressTimer();
                 const previousUrl = get().fileUrl;
                 if (previousUrl?.startsWith('blob:')) {
                     URL.revokeObjectURL(previousUrl);
@@ -744,9 +1203,22 @@ export const useTranslationStore = create<TranslationState>()(
                     layoutUrl: null,
                     layoutJsonUrl: null,
                     sourceMarkdown: '',
+                    rawSourceMarkdown: '',
+                    polishedSourceMarkdown: '',
                     targetMarkdown: '',
                     translationBlocks: [],
                     translationRunId: null,
+                    paperPolishStatus: 'idle',
+                    paperPolishMode: null,
+                    paperPolishProgress: 0,
+                    paperPolishMessage: '',
+                    paperPolishSummary: [],
+                    paperPolishIssues: [],
+                    paperPolishResidualIssues: [],
+                    paperPolishIssueWindows: [],
+                    paperPolishCanUseAiFallback: false,
+                    paperPolishUndoSnapshot: null,
+                    paperPolishUndoExpiresAt: null,
                 });
             },
 
@@ -768,6 +1240,7 @@ export const useTranslationStore = create<TranslationState>()(
                     const importedFileName = data.fileName || `${data.metadata?.arxivId || 'arxiv-paper'}.pdf`;
 
                     if (data.status === 'cached') {
+                        const parsedState = getParsedMarkdownState(data.markdown || '');
                         set({
                             file: null,
                             activeFileName: importedFileName,
@@ -776,7 +1249,9 @@ export const useTranslationStore = create<TranslationState>()(
                             translationPhase: 'idle',
                             translationLastEventAt: null,
                             translationConcurrency: 1,
-                            sourceMarkdown: data.markdown,
+                            sourceMarkdown: parsedState.sourceMarkdown,
+                            rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                            polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
                             translationBlocks: [],
                             translationRunId: null,
@@ -784,7 +1259,18 @@ export const useTranslationStore = create<TranslationState>()(
                             fileUrl: `/api/media/${data.fileHash}/original.pdf`,
                             progress: 60,
                             layoutUrl: data.layoutUrl || null,
-                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`
+                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
+                            paperPolishStatus: 'idle',
+                            paperPolishMode: null,
+                            paperPolishProgress: 0,
+                            paperPolishMessage: '',
+                            paperPolishSummary: parsedState.summary,
+                            paperPolishIssues: parsedState.issues,
+                            paperPolishResidualIssues: [],
+                            paperPolishIssueWindows: [],
+                            paperPolishCanUseAiFallback: false,
+                            paperPolishUndoSnapshot: null,
+                            paperPolishUndoExpiresAt: null,
                         });
                         void persistActiveDocumentSnapshot({
                             fileHash: data.fileHash,
@@ -792,7 +1278,9 @@ export const useTranslationStore = create<TranslationState>()(
                             status: 'parsed',
                             progress: 60,
                             targetLang: get().targetLang,
-                            sourceMarkdown: data.markdown,
+                            sourceMarkdown: parsedState.sourceMarkdown,
+                            rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                            polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
                             layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
                         });
@@ -825,6 +1313,19 @@ export const useTranslationStore = create<TranslationState>()(
                         fileHash: data.fileHash,
                         fileUrl: `/api/media/${data.fileHash}/original.pdf`,
                         progress: 30,
+                        rawSourceMarkdown: '',
+                        polishedSourceMarkdown: '',
+                        paperPolishStatus: 'idle',
+                        paperPolishMode: null,
+                        paperPolishProgress: 0,
+                        paperPolishMessage: '',
+                        paperPolishSummary: [],
+                        paperPolishIssues: [],
+                        paperPolishResidualIssues: [],
+                        paperPolishIssueWindows: [],
+                        paperPolishCanUseAiFallback: false,
+                        paperPolishUndoSnapshot: null,
+                        paperPolishUndoExpiresAt: null,
                     });
                     void persistActiveDocumentSnapshot({
                         fileHash: data.fileHash,
@@ -833,6 +1334,8 @@ export const useTranslationStore = create<TranslationState>()(
                         progress: 30,
                         targetLang: get().targetLang,
                         sourceMarkdown: '',
+                        rawSourceMarkdown: '',
+                        polishedSourceMarkdown: '',
                         targetMarkdown: '',
                         layoutJsonUrl: null,
                     });
@@ -874,6 +1377,7 @@ export const useTranslationStore = create<TranslationState>()(
                     // Handle Cache Hit
                     if (data.status === 'cached') {
                         console.log('Cache hit! Skipping parsing.');
+                        const parsedState = getParsedMarkdownState(data.markdown || '');
                         set({
                             status: 'parsed',
                             activeFileName: file.name,
@@ -881,7 +1385,9 @@ export const useTranslationStore = create<TranslationState>()(
                             translationPhase: 'idle',
                             translationLastEventAt: null,
                             translationConcurrency: 1,
-                            sourceMarkdown: data.markdown,
+                            sourceMarkdown: parsedState.sourceMarkdown,
+                            rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                            polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
                             translationBlocks: [],
                             translationRunId: null,
@@ -889,7 +1395,18 @@ export const useTranslationStore = create<TranslationState>()(
                             fileUrl: `/api/media/${data.fileHash}/original.pdf`, // Switch to server URL
                             progress: 60,
                             layoutUrl: data.layoutUrl || null,
-                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`
+                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
+                            paperPolishStatus: 'idle',
+                            paperPolishMode: null,
+                            paperPolishProgress: 0,
+                            paperPolishMessage: '',
+                            paperPolishSummary: parsedState.summary,
+                            paperPolishIssues: parsedState.issues,
+                            paperPolishResidualIssues: [],
+                            paperPolishIssueWindows: [],
+                            paperPolishCanUseAiFallback: false,
+                            paperPolishUndoSnapshot: null,
+                            paperPolishUndoExpiresAt: null,
                         });
                         void persistActiveDocumentSnapshot({
                             fileHash: data.fileHash,
@@ -897,7 +1414,9 @@ export const useTranslationStore = create<TranslationState>()(
                             status: 'parsed',
                             progress: 60,
                             targetLang: get().targetLang,
-                            sourceMarkdown: data.markdown,
+                            sourceMarkdown: parsedState.sourceMarkdown,
+                            rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                            polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
                             layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
                         });
@@ -929,7 +1448,20 @@ export const useTranslationStore = create<TranslationState>()(
                         batchId: data.batchId,
                         fileHash: data.fileHash,
                         fileUrl: `/api/media/${data.fileHash}/original.pdf`, // Switch to server URL immediately
-                        progress: 30
+                        progress: 30,
+                        rawSourceMarkdown: '',
+                        polishedSourceMarkdown: '',
+                        paperPolishStatus: 'idle',
+                        paperPolishMode: null,
+                        paperPolishProgress: 0,
+                        paperPolishMessage: '',
+                        paperPolishSummary: [],
+                        paperPolishIssues: [],
+                        paperPolishResidualIssues: [],
+                        paperPolishIssueWindows: [],
+                        paperPolishCanUseAiFallback: false,
+                        paperPolishUndoSnapshot: null,
+                        paperPolishUndoExpiresAt: null,
                     });
                     void persistActiveDocumentSnapshot({
                         fileHash: data.fileHash,
@@ -938,6 +1470,8 @@ export const useTranslationStore = create<TranslationState>()(
                         progress: 30,
                         targetLang: get().targetLang,
                         sourceMarkdown: '',
+                        rawSourceMarkdown: '',
+                        polishedSourceMarkdown: '',
                         targetMarkdown: '',
                         layoutJsonUrl: null,
                     });
@@ -983,6 +1517,8 @@ export const useTranslationStore = create<TranslationState>()(
                                 progress: newProgress,
                                 targetLang: current.targetLang,
                                 sourceMarkdown: current.sourceMarkdown,
+                                rawSourceMarkdown: current.rawSourceMarkdown,
+                                polishedSourceMarkdown: current.polishedSourceMarkdown,
                                 targetMarkdown: current.targetMarkdown,
                                 layoutJsonUrl: current.layoutJsonUrl,
                             });
@@ -996,12 +1532,26 @@ export const useTranslationStore = create<TranslationState>()(
                             }
                         } else if (data.state === 'done') {
                             clearInterval(interval);
+                            const parsedState = getParsedMarkdownState(data.markdown || '');
                             set({
                                 status: 'parsed',
-                                sourceMarkdown: data.markdown,
+                                sourceMarkdown: parsedState.sourceMarkdown,
+                                rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                                polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                                 progress: 60,
                                 layoutUrl: data.layoutUrl || null,
-                                layoutJsonUrl: data.layoutJsonUrl || `/api/media/${fileHash}/layout.json`
+                                layoutJsonUrl: data.layoutJsonUrl || `/api/media/${fileHash}/layout.json`,
+                                paperPolishStatus: 'idle',
+                                paperPolishMode: null,
+                                paperPolishProgress: 0,
+                                paperPolishMessage: '',
+                                paperPolishSummary: parsedState.summary,
+                                paperPolishIssues: parsedState.issues,
+                                paperPolishResidualIssues: [],
+                                paperPolishIssueWindows: [],
+                                paperPolishCanUseAiFallback: false,
+                                paperPolishUndoSnapshot: null,
+                                paperPolishUndoExpiresAt: null,
                             });
                             const current = get();
                             void persistActiveDocumentSnapshot({
@@ -1010,7 +1560,9 @@ export const useTranslationStore = create<TranslationState>()(
                                 status: 'parsed',
                                 progress: 60,
                                 targetLang: current.targetLang,
-                                sourceMarkdown: data.markdown,
+                                sourceMarkdown: parsedState.sourceMarkdown,
+                                rawSourceMarkdown: parsedState.rawSourceMarkdown,
+                                polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                                 targetMarkdown: current.targetMarkdown,
                                 layoutJsonUrl: data.layoutJsonUrl || `/api/media/${fileHash}/layout.json`,
                             });
@@ -1038,6 +1590,8 @@ export const useTranslationStore = create<TranslationState>()(
                                 progress: 0,
                                 targetLang: current.targetLang,
                                 sourceMarkdown: current.sourceMarkdown,
+                                rawSourceMarkdown: current.rawSourceMarkdown,
+                                polishedSourceMarkdown: current.polishedSourceMarkdown,
                                 targetMarkdown: current.targetMarkdown,
                                 layoutJsonUrl: current.layoutJsonUrl,
                             });
@@ -1148,6 +1702,8 @@ export const useTranslationStore = create<TranslationState>()(
                     progress: 0,
                     targetLang,
                     sourceMarkdown,
+                    rawSourceMarkdown: get().rawSourceMarkdown,
+                    polishedSourceMarkdown: get().polishedSourceMarkdown,
                     targetMarkdown: '',
                     layoutJsonUrl: get().layoutJsonUrl,
                 });
@@ -1211,6 +1767,8 @@ export const useTranslationStore = create<TranslationState>()(
                         progress: snapshotProgress,
                         targetLang,
                         sourceMarkdown,
+                        rawSourceMarkdown: get().rawSourceMarkdown,
+                        polishedSourceMarkdown: get().polishedSourceMarkdown,
                         targetMarkdown: nextTargetMarkdown ?? get().targetMarkdown,
                         layoutJsonUrl: get().layoutJsonUrl,
                     });
@@ -1564,6 +2122,9 @@ export const useTranslationStore = create<TranslationState>()(
             },
 
             reset: () => {
+                paperPolishAbortController?.abort();
+                paperPolishAbortController = null;
+                clearPaperPolishProgressTimer();
                 const previousUrl = get().fileUrl;
                 if (previousUrl?.startsWith('blob:')) {
                     URL.revokeObjectURL(previousUrl);
@@ -1571,6 +2132,8 @@ export const useTranslationStore = create<TranslationState>()(
                 set({
                     file: null,
                     sourceMarkdown: '',
+                    rawSourceMarkdown: '',
+                    polishedSourceMarkdown: '',
                     targetMarkdown: '',
                     translationBlocks: [],
                     translationRunId: null,
@@ -1587,7 +2150,18 @@ export const useTranslationStore = create<TranslationState>()(
                     activeFileName: null,
                     layoutUrl: null,
                     layoutJsonUrl: null,
-                    highlightedBlockId: null
+                    highlightedBlockId: null,
+                    paperPolishStatus: 'idle',
+                    paperPolishMode: null,
+                    paperPolishProgress: 0,
+                    paperPolishMessage: '',
+                    paperPolishSummary: [],
+                    paperPolishIssues: [],
+                    paperPolishResidualIssues: [],
+                    paperPolishIssueWindows: [],
+                    paperPolishCanUseAiFallback: false,
+                    paperPolishUndoSnapshot: null,
+                    paperPolishUndoExpiresAt: null,
                 });
             }
         });
@@ -1611,6 +2185,8 @@ export const useTranslationStore = create<TranslationState>()(
                     status: persistedStatus,
                     progress: state.progress,
                     sourceMarkdown: state.sourceMarkdown,
+                    rawSourceMarkdown: state.rawSourceMarkdown,
+                    polishedSourceMarkdown: state.polishedSourceMarkdown,
                     targetMarkdown: state.targetMarkdown,
                     targetLang: state.targetLang,
                     providerId: state.providerId,
@@ -1618,6 +2194,9 @@ export const useTranslationStore = create<TranslationState>()(
                     assistProviderId: state.assistProviderId,
                     assistModel: state.assistModel,
                     isZenMode: state.isZenMode,
+                    paperPolishAutoEnabled: state.paperPolishAutoEnabled,
+                    paperPolishSummary: state.paperPolishSummary,
+                    paperPolishIssues: state.paperPolishIssues,
                     // fileUrl and batchId are not persisted or handled separately
                     layoutUrl: state.layoutUrl,
                     layoutJsonUrl: state.layoutJsonUrl

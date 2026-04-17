@@ -1,5 +1,9 @@
 import { Chunk } from '../think/chunker';
 import { terminologyStore, Term } from './terminology-store';
+import {
+    protectMarkdownFragments,
+    type PreservedMarkdownFragment,
+} from '../../markdown-table-utils';
 
 export interface RefinedContext {
     chunkId: string;
@@ -7,6 +11,7 @@ export interface RefinedContext {
     relevantTerms: Term[];
     previousContext: string; // Tail of previous translation
     isReference: boolean;
+    preservedFragments: PreservedMarkdownFragment[];
 }
 
 export class RefineModule {
@@ -25,6 +30,7 @@ export class RefineModule {
             chunk.content.toLowerCase().includes(term.source.toLowerCase())
         );
         const terms = dedupeTerms([...matchedExtraTerms, ...builtInTerms]);
+        const { text: protectedSourceText, fragments: preservedFragments } = protectMarkdownFragments(chunk.content);
 
         // 2. Extract Previous Context
         // Take the last 500 characters of the previous translation to help with flow
@@ -35,10 +41,11 @@ export class RefineModule {
 
         return {
             chunkId: chunk.id,
-            sourceText: chunk.content,
+            sourceText: protectedSourceText,
             relevantTerms: terms,
             previousContext: prevContextSnippet,
-            isReference: chunk.type === 'references'
+            isReference: chunk.type === 'references',
+            preservedFragments,
         };
     }
 }

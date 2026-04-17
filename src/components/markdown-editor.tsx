@@ -30,11 +30,13 @@ import {
     type EditorTab,
     type SelectionSnapshot,
 } from '@/lib/annotation-utils';
+import type { DocumentSemanticProjection } from '@/lib/document-semantic';
 import { MarkdownView } from '@/components/markdown-view';
+import { StructuredSourceView } from '@/components/structured-source-view';
 import { ModelSelector } from '@/components/model-selector';
 import { StreamingTranslationPane } from '@/components/streaming-translation-pane';
 import type { TranslationStreamFrame } from '@/components/translation-stream';
-import { Loader2, MessageSquarePlus, NotebookPen, Search, Sparkles, Trash2, Wand2 } from 'lucide-react';
+import { CheckCircle2, Loader2, MessageSquarePlus, NotebookPen, RotateCcw, Search, Sparkles, Trash2, Wand2, X } from 'lucide-react';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 
 type SidePanelTab = 'notes' | 'ai';
@@ -131,6 +133,13 @@ function getSelectionIdentity(selection: SelectionSnapshot | null): string {
     ].join('::');
 }
 
+function hasActiveTextSelection(): boolean {
+    if (typeof window === 'undefined') return false;
+
+    const selection = window.getSelection();
+    return Boolean(selection && selection.rangeCount > 0 && !selection.isCollapsed && selection.toString().trim());
+}
+
 function getConversationSessionId(conversation: ConversationRecord): string {
     return conversation.sessionId || 'legacy-session';
 }
@@ -145,8 +154,10 @@ function formatSemanticBlockLabel(semanticBlockId?: string): string {
     const typeMap: Record<string, string> = {
         title: '标题',
         text: '段',
+        image: '图',
         table: '表',
         formula: '式',
+        list: '列表',
         code: '码',
     };
     const typeLabel = typeMap[rawType.toLowerCase()] || '片段';
@@ -228,9 +239,10 @@ function CollapsibleText({
 
 interface MarkdownEditorProps {
     onTranslationWorkspaceContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+    sourceProjection?: DocumentSemanticProjection | null;
 }
 
-export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEditorProps) {
+export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjection = null }: MarkdownEditorProps) {
     const sourceMarkdown = useTranslationStore((state) => state.sourceMarkdown);
     const status = useTranslationStore((state) => state.status);
     const progress = useTranslationStore((state) => state.progress);
@@ -240,6 +252,21 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
     const targetLang = useTranslationStore((state) => state.targetLang);
     const assistProviderId = useTranslationStore((state) => state.assistProviderId);
     const assistModel = useTranslationStore((state) => state.assistModel);
+    const paperPolishStatus = useTranslationStore((state) => state.paperPolishStatus);
+    const paperPolishMode = useTranslationStore((state) => state.paperPolishMode);
+    const paperPolishProgress = useTranslationStore((state) => state.paperPolishProgress);
+    const paperPolishMessage = useTranslationStore((state) => state.paperPolishMessage);
+    const paperPolishSummary = useTranslationStore((state) => state.paperPolishSummary);
+    const paperPolishResidualCount = useTranslationStore((state) => state.paperPolishIssueWindows.length);
+    const paperPolishCanUseAiFallback = useTranslationStore((state) => state.paperPolishCanUseAiFallback);
+    const paperPolishAutoEnabled = useTranslationStore((state) => state.paperPolishAutoEnabled);
+    const paperPolishUndoExpiresAt = useTranslationStore((state) => state.paperPolishUndoExpiresAt);
+    const paperPolishRevealKey = useTranslationStore((state) => state.paperPolishRevealKey);
+    const setPaperPolishAutoEnabled = useTranslationStore((state) => state.setPaperPolishAutoEnabled);
+    const runPaperPolish = useTranslationStore((state) => state.runPaperPolish);
+    const runPaperPolishAiFallback = useTranslationStore((state) => state.runPaperPolishAiFallback);
+    const cancelPaperPolish = useTranslationStore((state) => state.cancelPaperPolish);
+    const undoPaperPolish = useTranslationStore((state) => state.undoPaperPolish);
     const translationStatus = useTranslationStore((state) => state.translationStatus);
     const translationPhase = useTranslationStore((state) => state.translationPhase);
     const translationConcurrency = useTranslationStore((state) => state.translationConcurrency);
@@ -284,6 +311,9 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
     const [noteTargetExpanded, setNoteTargetExpanded] = useState(false);
     const [expandedAnnotationIds, setExpandedAnnotationIds] = useState<Record<string, boolean>>({});
     const [expandedConversationIds, setExpandedConversationIds] = useState<Record<string, boolean>>({});
+    const [displayedSourceMarkdown, setDisplayedSourceMarkdown] = useState('');
+    const [paperPolishVisualState, setPaperPolishVisualState] = useState<'idle' | 'processing' | 'fading' | 'revealing'>('idle');
+    const [paperPolishUndoVisible, setPaperPolishUndoVisible] = useState(false);
 
     const translationPaneRef = useRef<HTMLDivElement | null>(null);
     const sourcePaneRef = useRef<HTMLDivElement | null>(null);
@@ -291,11 +321,93 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
     const assistQuestionRef = useRef<HTMLTextAreaElement | null>(null);
     const previousHighlightedBlockIdRef = useRef<string | null>(null);
     const translationFrameMapRef = useRef<Record<string, TranslationStreamFrame>>({});
+    const pointerSelectionActiveRef = useRef(false);
+    const pointerSelectionCommitRef = useRef<number | null>(null);
+    const paperPolishTimersRef = useRef<number[]>([]);
 
     const renderedSourceMarkdown = useMemo(() => normalizeMarkdownMathForDisplay(sourceMarkdown), [sourceMarkdown]);
     const activeTab: EditorTab = manualTab ?? (status === 'parsed' && !hasTranslationContent ? 'source' : 'translation');
     const activeDocumentId = fileHash ? getDocumentId(fileHash, targetLang, activeTab) : null;
     const translationHeaderLabel = translationConcurrency > 1 ? `并发翻译中 · ${translationConcurrency} 路` : '翻译进行中';
+
+    useEffect(() => {
+        return () => {
+            for (const timer of paperPolishTimersRef.current) {
+                window.clearTimeout(timer);
+            }
+            paperPolishTimersRef.current = [];
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!displayedSourceMarkdown) {
+            setDisplayedSourceMarkdown(renderedSourceMarkdown);
+        }
+    }, [displayedSourceMarkdown, renderedSourceMarkdown]);
+
+    useEffect(() => {
+        if (paperPolishStatus === 'processing') {
+            for (const timer of paperPolishTimersRef.current) {
+                window.clearTimeout(timer);
+            }
+            paperPolishTimersRef.current = [];
+            setPaperPolishVisualState('processing');
+            startTransition(() => setManualTab('source'));
+            return;
+        }
+
+        if (paperPolishVisualState === 'processing') {
+            setPaperPolishVisualState('idle');
+        }
+    }, [paperPolishStatus, paperPolishVisualState]);
+
+    useEffect(() => {
+        if (paperPolishRevealKey <= 0) {
+            return;
+        }
+
+        for (const timer of paperPolishTimersRef.current) {
+            window.clearTimeout(timer);
+        }
+        paperPolishTimersRef.current = [];
+        setPaperPolishVisualState('fading');
+
+        const swapTimer = window.setTimeout(() => {
+            setDisplayedSourceMarkdown(renderedSourceMarkdown);
+            setPaperPolishVisualState('revealing');
+        }, 360);
+        const settleTimer = window.setTimeout(() => {
+            setPaperPolishVisualState('idle');
+        }, 1320);
+
+        paperPolishTimersRef.current = [swapTimer, settleTimer];
+    }, [paperPolishRevealKey, renderedSourceMarkdown]);
+
+    useEffect(() => {
+        if (paperPolishStatus !== 'processing' && paperPolishVisualState === 'idle') {
+            setDisplayedSourceMarkdown(renderedSourceMarkdown);
+        }
+    }, [paperPolishStatus, paperPolishVisualState, renderedSourceMarkdown]);
+
+    useEffect(() => {
+        if (!paperPolishUndoExpiresAt) {
+            setPaperPolishUndoVisible(false);
+            return;
+        }
+
+        const remaining = paperPolishUndoExpiresAt - Date.now();
+        if (remaining <= 0) {
+            setPaperPolishUndoVisible(false);
+            return;
+        }
+
+        setPaperPolishUndoVisible(true);
+        const timer = window.setTimeout(() => {
+            setPaperPolishUndoVisible(false);
+        }, remaining);
+
+        return () => window.clearTimeout(timer);
+    }, [paperPolishUndoExpiresAt]);
 
     const handleTranslationFramesChange = useCallback((frames: TranslationStreamFrame[]) => {
         translationFrameMapRef.current = Object.fromEntries(
@@ -535,7 +647,9 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
             let decorationState = createMarkdownDecorationState();
 
             for (const body of bodies) {
-                decorationState = decorateMarkdownBody(body, decorationState);
+                if (tab === 'translation') {
+                    decorationState = decorateMarkdownBody(body, decorationState);
+                }
                 const annotationsForBody = tab === 'translation'
                     ? paneAnnotations
                         .map((annotation) => localizeAnnotationForBody(body, annotation))
@@ -671,7 +785,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
     }, [activeTab, highlightedBlockId]);
 
     useEffect(() => {
-        const handleSelectionChange = () => {
+        const commitSelectionSnapshot = () => {
             if (!fileHash || !activeDocumentId) {
                 setSelection(null);
                 return;
@@ -698,8 +812,44 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
             }
         };
 
+        const handleSelectionChange = () => {
+            if (pointerSelectionActiveRef.current) return;
+            commitSelectionSnapshot();
+        };
+
+        const handlePointerDown = (event: PointerEvent) => {
+            const target = event.target as Node | null;
+            const activeContainer = activeTab === 'translation' ? translationPaneRef.current : sourcePaneRef.current;
+            pointerSelectionActiveRef.current = Boolean(target && activeContainer?.contains(target));
+        };
+
+        const handlePointerUp = () => {
+            if (!pointerSelectionActiveRef.current) return;
+
+            pointerSelectionActiveRef.current = false;
+            if (pointerSelectionCommitRef.current !== null) {
+                window.cancelAnimationFrame(pointerSelectionCommitRef.current);
+            }
+            pointerSelectionCommitRef.current = window.requestAnimationFrame(() => {
+                commitSelectionSnapshot();
+                pointerSelectionCommitRef.current = null;
+            });
+        };
+
         document.addEventListener('selectionchange', handleSelectionChange);
-        return () => document.removeEventListener('selectionchange', handleSelectionChange);
+        document.addEventListener('pointerdown', handlePointerDown, true);
+        document.addEventListener('pointerup', handlePointerUp, true);
+
+        return () => {
+            document.removeEventListener('selectionchange', handleSelectionChange);
+            document.removeEventListener('pointerdown', handlePointerDown, true);
+            document.removeEventListener('pointerup', handlePointerUp, true);
+            pointerSelectionActiveRef.current = false;
+            if (pointerSelectionCommitRef.current !== null) {
+                window.cancelAnimationFrame(pointerSelectionCommitRef.current);
+                pointerSelectionCommitRef.current = null;
+            }
+        };
     }, [activeDocumentId, activeTab, fileHash]);
 
     useEffect(() => {
@@ -835,8 +985,6 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
         (pendingAssistExchange.sessionId === currentAssistSessionId || currentAssistSessionId === 'draft-session')
     );
     const activeNoteTargetKey = getSelectionIdentity(activeNoteTarget);
-    const activeAssistContextKey = getSelectionIdentity(activeAssistContext);
-
     useEffect(() => {
         setNoteTargetExpanded(false);
     }, [activeNoteTargetKey]);
@@ -850,13 +998,15 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
 
     useEffect(() => {
         if (sidePanelTab !== 'ai') return;
+        if (hasActiveTextSelection()) return;
 
         const timer = window.setTimeout(() => {
+            if (hasActiveTextSelection()) return;
             assistQuestionRef.current?.focus();
         }, 50);
 
         return () => window.clearTimeout(timer);
-    }, [sidePanelTab, activeAssistContextKey]);
+    }, [sidePanelTab]);
 
     const clearEditorSelection = useCallback(() => {
         window.getSelection()?.removeAllRanges();
@@ -1008,6 +1158,31 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
         void runAssist('qa');
     };
 
+    const canRunPaperPolish = Boolean(sourceMarkdown.trim()) && status !== 'uploading' && status !== 'parsing' && status !== 'translating';
+    const paperPolishProcessing = paperPolishStatus === 'processing';
+    const handleRunPaperPolish = () => {
+        if (!canRunPaperPolish) return;
+        void runPaperPolish('light');
+    };
+
+    const handleRunPaperPolishAiFallback = () => {
+        if (!paperPolishCanUseAiFallback || paperPolishProcessing) return;
+        void runPaperPolishAiFallback();
+    };
+
+    const handleUndoPaperPolish = () => {
+        if (!paperPolishUndoVisible) return;
+        void undoPaperPolish();
+    };
+
+    const sourcePanePolishClass = paperPolishVisualState === 'processing'
+        ? 'paper-polish-shell is-processing'
+        : paperPolishVisualState === 'fading'
+            ? 'paper-polish-shell is-fading'
+            : paperPolishVisualState === 'revealing'
+                ? 'paper-polish-shell is-revealing'
+                : 'paper-polish-shell';
+
     const locateAnnotation = (annotation: AnnotationRecord) => {
         const targetTab: EditorTab = annotation.targetLang ? 'translation' : 'source';
         return focusAnnotationLocation({
@@ -1020,9 +1195,19 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
     const sharedStyles = `
         .markdown-body { background: transparent; color: inherit; font-family: inherit; }
         .markdown-body img { margin: 1.5rem auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); border-radius: 0.75rem; }
-        .markdown-body table { display: block; overflow-x: auto; border-collapse: collapse; width: 100%; }
-        .markdown-body table th, .markdown-body table td { border: 1px solid #e2e8f0; padding: 6px 13px; }
-        .markdown-body table tr:nth-child(2n) { background-color: #f8fafc; }
+        .markdown-body figure[data-doti-figure-group] { margin: 1.75rem 0; }
+        .markdown-body [data-doti-figure-grid] { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; align-items: start; }
+        .markdown-body [data-doti-subfigure] { border: 1px solid rgba(226, 232, 240, 0.95); border-radius: 1rem; background: rgba(248, 250, 252, 0.85); padding: 0.9rem; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8); }
+        .markdown-body [data-doti-subfigure] img { margin: 0 auto 0.75rem; width: 100%; }
+        .markdown-body [data-doti-subcaption] { margin: 0; text-align: center; font-size: 0.92rem; line-height: 1.6; color: #334155; }
+        .markdown-body figure[data-doti-figure-group] > figcaption { margin-top: 0.9rem; text-align: center; font-size: 0.95rem; line-height: 1.7; color: #475569; }
+        .markdown-body .markdown-table-wrap { margin: 1.5rem 0; width: 100%; overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 0.95rem; background: #ffffff; box-shadow: inset 0 1px 0 rgba(255,255,255,0.75); }
+        .markdown-body table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; table-layout: auto; }
+        .markdown-body table th, .markdown-body table td { border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; padding: 8px 14px; vertical-align: top; line-height: 1.65; }
+        .markdown-body table th { background: #f8fafc; font-weight: 600; color: #0f172a; }
+        .markdown-body table tr:nth-child(2n) td { background-color: #fcfdff; }
+        .markdown-body table tr > *:last-child { border-right: none; }
+        .markdown-body table tbody tr:last-child > * { border-bottom: none; }
         .vlook-doc .markdown-body { font-size: 15px; line-height: 1.8; }
         .vlook-doc h1, .vlook-doc h2, .vlook-doc h3 { margin-top: 1.5em; margin-bottom: 0.5em; }
         .annotation-highlight { background: rgba(251, 191, 36, 0.4); box-shadow: inset 0 -1px 0 rgba(245, 158, 11, 0.25); }
@@ -1049,6 +1234,127 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
             background: rgba(51, 65, 85, 0.98);
             border: 2px solid transparent;
             background-clip: padding-box;
+        }
+        .paper-polish-shell {
+            position: relative;
+            min-height: 100%;
+        }
+        .paper-polish-shell.is-processing::before,
+        .paper-polish-shell.is-fading::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background:
+                radial-gradient(circle at top left, rgba(125, 211, 252, 0.16), transparent 24%),
+                radial-gradient(circle at top right, rgba(251, 191, 36, 0.16), transparent 22%),
+                radial-gradient(circle at bottom left, rgba(192, 132, 252, 0.14), transparent 24%);
+            opacity: 1;
+            transition: opacity 280ms ease;
+        }
+        .paper-polish-shell.is-fading::before {
+            opacity: 0.4;
+        }
+        .paper-polish-shell.is-processing .markdown-body > *,
+        .paper-polish-shell.is-fading .markdown-body > * {
+            position: relative;
+            border: 1px solid rgba(255, 255, 255, 0.26);
+            background: rgba(255, 255, 255, 0.14);
+            backdrop-filter: blur(12px);
+            box-shadow: 0 0 18px rgba(125, 211, 252, 0.24);
+            text-shadow: 0 0 14px rgba(255, 255, 255, 0.18);
+            border-radius: 1.1rem;
+            transform: scale(1.02);
+            transition: opacity 360ms ease, transform 360ms ease, filter 360ms ease;
+            animation: paperPolishPulse 1.9s ease-in-out infinite;
+            padding: 0.55rem 0.8rem;
+        }
+        .paper-polish-shell.is-processing .markdown-body > *:nth-child(4n + 1),
+        .paper-polish-shell.is-fading .markdown-body > *:nth-child(4n + 1) {
+            background: rgba(191, 219, 254, 0.16);
+        }
+        .paper-polish-shell.is-processing .markdown-body > *:nth-child(4n + 2),
+        .paper-polish-shell.is-fading .markdown-body > *:nth-child(4n + 2) {
+            background: rgba(254, 215, 170, 0.15);
+        }
+        .paper-polish-shell.is-processing .markdown-body > *:nth-child(4n + 3),
+        .paper-polish-shell.is-fading .markdown-body > *:nth-child(4n + 3) {
+            background: rgba(216, 180, 254, 0.14);
+        }
+        .paper-polish-shell.is-processing .markdown-body > *:nth-child(4n + 4),
+        .paper-polish-shell.is-fading .markdown-body > *:nth-child(4n + 4) {
+            background: rgba(134, 239, 172, 0.14);
+        }
+        .paper-polish-shell.is-fading .markdown-body > * {
+            opacity: 0.28;
+            transform: scale(0.92);
+            filter: blur(6px);
+        }
+        .paper-polish-shell.is-revealing .markdown-body > * {
+            opacity: 0;
+            filter: blur(8px);
+            transform: translateY(20px) scale(0.85);
+            animation: paperPolishReveal 760ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+        }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(1) { animation-delay: 40ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(2) { animation-delay: 80ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(3) { animation-delay: 120ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(4) { animation-delay: 160ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(5) { animation-delay: 200ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(6) { animation-delay: 240ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(7) { animation-delay: 280ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(8) { animation-delay: 320ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(9) { animation-delay: 360ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(10) { animation-delay: 400ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(11) { animation-delay: 440ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(12) { animation-delay: 480ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(13) { animation-delay: 520ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(14) { animation-delay: 560ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(15) { animation-delay: 600ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(16) { animation-delay: 640ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(17) { animation-delay: 680ms; }
+        .paper-polish-shell.is-revealing .markdown-body > *:nth-child(18) { animation-delay: 720ms; }
+        .paper-polish-wand {
+            position: relative;
+            overflow: hidden;
+        }
+        .paper-polish-wand::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,0.34) 40%, transparent 75%);
+            transform: translateX(-120%);
+            transition: transform 360ms ease;
+        }
+        .paper-polish-wand:hover::after {
+            transform: translateX(120%);
+        }
+        .paper-polish-wand.is-idle {
+            animation: paperPolishPulse 2.8s ease-in-out infinite;
+        }
+        @keyframes paperPolishPulse {
+            0%, 100% { transform: scale(1); box-shadow: 0 0 0 rgba(56, 189, 248, 0.12); }
+            50% { transform: scale(1.02); box-shadow: 0 0 22px rgba(56, 189, 248, 0.24); }
+        }
+        @keyframes paperPolishReveal {
+            0% {
+                opacity: 0;
+                filter: blur(8px);
+                transform: translateY(20px) scale(0.85);
+                box-shadow: 0 0 18px rgba(96, 165, 250, 0.28);
+            }
+            60% {
+                opacity: 1;
+                filter: blur(0px);
+                transform: translateY(0px) scale(1.01);
+                box-shadow: 0 0 20px rgba(96, 165, 250, 0.18);
+            }
+            100% {
+                opacity: 1;
+                filter: blur(0px);
+                transform: translateY(0px) scale(1);
+                box-shadow: 0 0 0 rgba(96, 165, 250, 0);
+            }
         }
         @keyframes highlightFlash {
             0% { background-color: transparent; }
@@ -1145,7 +1451,79 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
                     </button>
                 </div>
 
-                <div className="flex items-center gap-3 text-xs text-slate-500">
+                <div className="flex flex-wrap items-center justify-end gap-2 text-xs text-slate-500">
+                    <label className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600">
+                        <span className={`inline-flex h-2.5 w-2.5 rounded-full ${paperPolishAutoEnabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                        自动整理
+                        <input
+                            type="checkbox"
+                            checked={paperPolishAutoEnabled}
+                            onChange={(event) => setPaperPolishAutoEnabled(event.target.checked)}
+                            className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                        />
+                    </label>
+
+                    <button
+                        type="button"
+                        onClick={handleRunPaperPolish}
+                        disabled={!canRunPaperPolish || paperPolishProcessing}
+                        className={`paper-polish-wand inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${paperPolishProcessing
+                            ? 'border-sky-200 bg-sky-50 text-sky-700'
+                            : 'border-slate-200 bg-white text-slate-700 hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700'
+                            } ${!paperPolishProcessing ? 'is-idle' : ''}`}
+                        title="先用本地结构信息快速修复当前 Markdown"
+                    >
+                        {paperPolishProcessing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
+                        <span>{paperPolishProcessing ? (paperPolishMode === 'deep' ? 'AI 深修中…' : '正在修复格式…') : '清理格式'}</span>
+                        <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${paperPolishProcessing ? 'bg-sky-100 text-sky-700' : 'bg-slate-100 text-slate-500'}`}>
+                            {paperPolishProcessing ? `${Math.round(paperPolishProgress)}%` : paperPolishCanUseAiFallback ? `局部 ${paperPolishResidualCount}` : 'PaperPolish'}
+                        </span>
+                    </button>
+
+                    {paperPolishCanUseAiFallback && !paperPolishProcessing ? (
+                        <button
+                            type="button"
+                            onClick={handleRunPaperPolishAiFallback}
+                            className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 transition hover:border-amber-300 hover:bg-amber-100"
+                            title="仅对残留的少量疑难窗口进行 AI 兜底"
+                        >
+                            <Sparkles size={14} />
+                            AI 深修
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-700">
+                                {paperPolishResidualCount}
+                            </span>
+                        </button>
+                    ) : null}
+
+                    {paperPolishProcessing ? (
+                        <button
+                            type="button"
+                            onClick={cancelPaperPolish}
+                            className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-white px-3 py-1.5 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
+                        >
+                            <X size={12} />
+                            取消
+                        </button>
+                    ) : null}
+
+                    {paperPolishUndoVisible ? (
+                        <button
+                            type="button"
+                            onClick={handleUndoPaperPolish}
+                            className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700 transition hover:bg-emerald-100"
+                        >
+                            <RotateCcw size={12} />
+                            撤销
+                        </button>
+                    ) : null}
+
+                    {paperPolishStatus === 'completed' && paperPolishSummary[0] ? (
+                        <span className="hidden rounded-full border border-sky-200 bg-sky-50 px-3 py-1 text-[11px] text-sky-700 xl:inline-flex">
+                            <CheckCircle2 size={12} className="mr-1" />
+                            {paperPolishSummary[0]}
+                        </span>
+                    ) : null}
+
                     {status === 'parsed' && <span className="font-medium text-sky-600">可开始翻译</span>}
                     {status === 'translating' && (
                         <>
@@ -1166,12 +1544,34 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
                 </div>
             </div>
 
+            {(paperPolishProcessing || (paperPolishStatus === 'completed' && paperPolishMessage) || (paperPolishStatus === 'error' && error)) ? (
+                <div className="border-b border-slate-200 bg-white/80 px-4 py-2.5">
+                    <div className="flex flex-wrap items-center gap-3">
+                        <div className="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
+                            {paperPolishProcessing ? <Loader2 size={14} className="animate-spin text-sky-600" /> : <Sparkles size={14} className="text-sky-600" />}
+                            <span>{paperPolishMessage || 'PaperPolish 已就绪'}</span>
+                        </div>
+                        {paperPolishProcessing ? (
+                            <div className="flex min-w-[220px] flex-1 items-center gap-3">
+                                <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
+                                    <div
+                                        className="h-full rounded-full bg-[linear-gradient(90deg,#38bdf8,#60a5fa,#f59e0b)] transition-all duration-500"
+                                        style={{ width: `${Math.min(100, Math.max(paperPolishProgress, 0))}%` }}
+                                    />
+                                </div>
+                                <span className="text-xs font-semibold text-sky-700">{Math.round(paperPolishProgress)}%</span>
+                            </div>
+                        ) : null}
+                    </div>
+                </div>
+            ) : null}
+
             <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_360px]">
                 <div className="relative min-h-0 overflow-hidden">
                     <div
                         ref={translationPaneRef}
                         onContextMenu={onTranslationWorkspaceContextMenu}
-                        className={`absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeTab === 'translation' ? 'visible' : 'invisible'}`}
+                        className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeTab === 'translation' ? 'visible' : 'invisible'}`}
                     >
                         <StreamingTranslationPane
                             viewportRef={translationPaneRef}
@@ -1181,9 +1581,15 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu }: MarkdownEd
 
                     <div
                         ref={sourcePaneRef}
-                        className={`absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeTab === 'source' ? 'visible' : 'invisible'}`}
+                        className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeTab === 'source' ? 'visible' : 'invisible'}`}
                     >
-                        <MarkdownView value={renderedSourceMarkdown || '_No source content available_'} />
+                        <div className={sourcePanePolishClass}>
+                            {sourceProjection ? (
+                                <StructuredSourceView projection={sourceProjection} />
+                            ) : (
+                                <MarkdownView value={displayedSourceMarkdown || renderedSourceMarkdown || '_No source content available_'} />
+                            )}
+                        </div>
                     </div>
                 </div>
 
