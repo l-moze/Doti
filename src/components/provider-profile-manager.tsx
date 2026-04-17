@@ -24,6 +24,8 @@ const EMPTY_DRAFT = {
     baseUrl: '',
     apiKey: '',
     model: '',
+    sourceLang: '',
+    glossaryId: '',
     capabilities: ['translate', 'assist'] as ProviderCapability[],
 };
 
@@ -38,7 +40,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
     const capabilityDescription = useMemo(() => {
         return draft.providerType === 'deeplx'
-            ? 'DeepLX 只参与翻译链路，不会出现在 AI 对话模型列表。兼容官方自建 TOKEN 模式，也兼容把 key 放进 URL 路径的托管网关。'
+            ? 'DeepLX 只参与翻译链路，不会出现在 AI 对话模型列表。兼容免费 /translate，也兼容官方 /v2/translate。若使用 DeepL 兼容 glossary，请在下方额外填写 glossary ID 与 source_lang。'
             : 'OpenAI-compatible provider 可用于翻译、AI 辅助，或两者同时使用。';
     }, [draft.providerType]);
 
@@ -93,6 +95,11 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
             return;
         }
 
+        if (draft.providerType === 'deeplx' && draft.glossaryId.trim() && !draft.sourceLang.trim()) {
+            setError('启用 DeepL glossary 时需要填写 source_lang，例如 EN。');
+            return;
+        }
+
         if (draft.providerType !== 'deeplx' && draft.capabilities.length === 0) {
             setError('至少选择一个能力范围。');
             return;
@@ -110,6 +117,8 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                 baseUrl: draft.baseUrl.trim().replace(/\/+$/, ''),
                 apiKey: draft.apiKey.trim() || undefined,
                 model: draft.model.trim(),
+                sourceLang: draft.sourceLang.trim() || undefined,
+                glossaryId: draft.glossaryId.trim() || undefined,
                 capabilities: draft.providerType === 'deeplx' ? ['translate'] : draft.capabilities,
                 updatedAt: Date.now(),
             });
@@ -141,6 +150,8 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                         baseUrl: draft.baseUrl.trim(),
                         apiKey: draft.apiKey.trim() || undefined,
                         model: draft.model.trim() || undefined,
+                        sourceLang: draft.sourceLang.trim() || undefined,
+                        glossaryId: draft.glossaryId.trim() || undefined,
                     },
                 }),
             });
@@ -202,6 +213,11 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                 <div className="mt-3 flex flex-wrap gap-2 text-xs">
                                     <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">{profile.providerType}</span>
                                     <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">{profile.model}</span>
+                                    {profile.providerType === 'deeplx' && profile.glossaryId ? (
+                                        <span className="rounded-full bg-blue-50 px-3 py-1 text-blue-700">
+                                            glossary · {profile.sourceLang || 'AUTO'}
+                                        </span>
+                                    ) : null}
                                     {profile.capabilities.map((capability) => (
                                         <span key={capability} className="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700">
                                             {capability === 'translate' ? '翻译' : 'AI 辅助'}
@@ -261,13 +277,14 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                 type="text"
                                 value={draft.baseUrl}
                                 onChange={(event) => setDraft((current) => ({ ...current, baseUrl: event.target.value }))}
-                                placeholder={draft.providerType === 'deeplx' ? 'http://127.0.0.1:1188 或 https://api.deeplx.org/{{apiKey}}/translate' : 'https://your-gateway.example.com/v1'}
+                                placeholder={draft.providerType === 'deeplx' ? 'http://127.0.0.1:1188 或 https://api.deeplx.org/{{apiKey}}/v2/translate' : 'https://your-gateway.example.com/v1'}
                                 className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                             />
                             {draft.providerType === 'deeplx' ? (
                                 <p className="text-xs leading-5 text-slate-500">
-                                    自建 DeepLX 按官方文档填写基础地址，例如 <code>http://127.0.0.1:1188</code>，Token 放在 API Key。
-                                    若使用托管网关，也可直接填写完整翻译地址，或在地址里使用 <code>{'{{apiKey}}'}</code> 占位符。
+                                    自建 DeepLX 免费接口可填写基础地址，例如 <code>http://127.0.0.1:1188</code>；
+                                    若要启用官方兼容 glossary，建议直接填写完整 <code>/v2/translate</code> 地址。
+                                    托管网关也可在地址里使用 <code>{'{{apiKey}}'}</code> 占位符。
                                 </p>
                             ) : null}
                         </label>
@@ -282,6 +299,35 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                 className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                             />
                         </label>
+
+                        {draft.providerType === 'deeplx' ? (
+                            <>
+                                <label className="block space-y-2 text-sm">
+                                    <span className="font-medium text-slate-700">Glossary ID（可选）</span>
+                                    <input
+                                        type="text"
+                                        value={draft.glossaryId}
+                                        onChange={(event) => setDraft((current) => ({ ...current, glossaryId: event.target.value }))}
+                                        placeholder="DeepL / DeepLX official glossary_id"
+                                        className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
+                                    />
+                                </label>
+
+                                <label className="block space-y-2 text-sm">
+                                    <span className="font-medium text-slate-700">Source Lang（可选）</span>
+                                    <input
+                                        type="text"
+                                        value={draft.sourceLang}
+                                        onChange={(event) => setDraft((current) => ({ ...current, sourceLang: event.target.value.toUpperCase() }))}
+                                        placeholder="使用 glossary 时填写，例如 EN"
+                                        className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
+                                    />
+                                    <p className="text-xs leading-5 text-slate-500">
+                                        DeepL 兼容 glossary 需要显式 source_lang；不使用 glossary 时可留空。
+                                    </p>
+                                </label>
+                            </>
+                        ) : null}
 
                         <label className="block space-y-2 text-sm">
                             <span className="font-medium text-slate-700">默认模型 / 标识</span>

@@ -3,6 +3,7 @@
 import dynamic from 'next/dynamic';
 import { useState, useEffect, useMemo } from 'react';
 import { useTranslationStore } from '@/lib/store';
+import type { DocumentSemanticAnchor, DocumentSemanticProjection } from '@/lib/document-semantic';
 import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Loader2, Layers } from 'lucide-react';
 
 // 动态导入 react-pdf 组件，禁用 SSR 以避免 DOMMatrix 错误
@@ -28,51 +29,32 @@ function PDFWorkerConfig() {
 
 // 布局块类型对应的颜色
 const BLOCK_TYPE_COLORS: Record<string, string> = {
-    'title': 'rgba(59, 130, 246, 0.3)',       // blue
-    'text': 'rgba(34, 197, 94, 0.2)',          // green
-    'image': 'rgba(234, 179, 8, 0.3)',         // yellow
-    'table': 'rgba(168, 85, 247, 0.3)',        // purple
-    'interline_equation': 'rgba(236, 72, 153, 0.3)', // pink
-    'list': 'rgba(20, 184, 166, 0.2)',         // teal
-    'code': 'rgba(249, 115, 22, 0.3)',         // orange
+    heading: 'rgba(59, 130, 246, 0.28)',
+    paragraph: 'rgba(34, 197, 94, 0.18)',
+    figure: 'rgba(234, 179, 8, 0.28)',
+    table: 'rgba(168, 85, 247, 0.28)',
+    equation: 'rgba(236, 72, 153, 0.28)',
+    list: 'rgba(20, 184, 166, 0.2)',
+    code: 'rgba(249, 115, 22, 0.28)',
+    footnote: 'rgba(100, 116, 139, 0.18)',
+    other: 'rgba(148, 163, 184, 0.2)',
 };
 
-// Layout JSON 数据结构
-interface LayoutBlock {
-    bbox: number[];
-    type: string;
-    index?: number;
-    lines?: Array<{
-        spans?: Array<{
-            content?: string;
-        }>;
-    }>;
-}
-
-interface PageLayout {
-    page_idx: number;
-    page_size: [number, number]; // [width, height]
-    para_blocks: LayoutBlock[];
-    discarded_blocks?: LayoutBlock[];
-}
-
-interface LayoutData {
-    pdf_info: PageLayout[];
+function toOpaqueBorderColor(color: string): string {
+    return color.replace(/rgba\(([^)]+),\s*(0?\.\d+)\)/i, 'rgba($1, 1)');
 }
 
 // 布局叠加层组件
 function LayoutOverlay({
-    layoutBlocks,
+    anchors,
     pdfWidth,
     pdfHeight,
-    pageIndex, // 传入当前页码
-    semanticMap // 传入语义化 ID 映射 { "page-blockIdx": "semanticId" }
+    pageIndex,
 }: {
-    layoutBlocks: LayoutBlock[];
+    anchors: DocumentSemanticAnchor[];
     pdfWidth: number;
     pdfHeight: number;
     pageIndex: number;
-    semanticMap: Record<string, string>;
 }) {
     const { setHighlightedBlock, highlightedBlockId } = useTranslationStore();
 
@@ -82,14 +64,11 @@ function LayoutOverlay({
             // 使用 % 定位，容器尺寸跟随父级（PDF Page 容器）
             style={{ width: '100%', height: '100%' }}
         >
-            {layoutBlocks.map((block, idx) => {
-                const [x0, y0, x1, y1] = block.bbox;
-                const color = BLOCK_TYPE_COLORS[block.type] || 'rgba(156, 163, 175, 0.3)';
-                const borderColor = color.replace('0.2', '1').replace('0.3', '1');
-
-                // 获取语义化 ID
-                const blockKey = `${pageIndex}-${idx}`;
-                const semanticId = semanticMap[blockKey];
+            {anchors.map((anchor) => {
+                const [x0, y0, x1, y1] = anchor.bbox;
+                const color = BLOCK_TYPE_COLORS[anchor.kind] || 'rgba(156, 163, 175, 0.3)';
+                const borderColor = toOpaqueBorderColor(color);
+                const semanticId = anchor.semanticId;
 
                 // 检查是否被高亮
                 const isHighlighted = semanticId === highlightedBlockId;
@@ -102,7 +81,7 @@ function LayoutOverlay({
 
                 return (
                     <div
-                        key={idx}
+                        key={anchor.id}
                         className={`absolute cursor-pointer transition-all duration-200 group ${isHighlighted ? 'z-50' : 'hover:z-20'}`}
                         style={{
                             left: `${left}%`,
@@ -114,10 +93,8 @@ function LayoutOverlay({
                         }}
                         onClick={(e) => {
                             e.stopPropagation();
-                            if (semanticId) {
-                                setHighlightedBlock(semanticId);
-                                console.log('Clicked block:', semanticId, block.type);
-                            }
+                            setHighlightedBlock(semanticId);
+                            console.log('Clicked block:', semanticId, anchor.kind, 'page:', pageIndex);
                         }}
                     >
                         {/* 边框 Hover 效果 */}
@@ -137,10 +114,7 @@ function LayoutOverlay({
                                 color: '#fff'
                             }}
                         >
-                            {/* 如果 block ID 是 image/table 但 type 是 text，说明是 Caption */}
-                            {block.type === 'text' && (semanticId?.includes('image') || semanticId?.includes('table'))
-                                ? 'caption'
-                                : block.type}
+                            {anchor.kind}
                             {semanticId ? ` (${semanticId})` : ''}
                         </span>
                     </div>
@@ -150,141 +124,53 @@ function LayoutOverlay({
     );
 }
 
-export function PDFViewer() {
-    const { fileUrl, layoutJsonUrl, highlightedBlockId } = useTranslationStore();
+export function PDFViewer({ projection = null }: { projection?: DocumentSemanticProjection | null }) {
+    const { fileUrl, highlightedBlockId } = useTranslationStore();
     const [numPages, setNumPages] = useState<number>(0);
     const [pageNumber, setPageNumber] = useState<number>(1);
     const [scale, setScale] = useState<number>(1.0);
     const [showLayout, setShowLayout] = useState(false);
-    const [layoutData, setLayoutData] = useState<LayoutData | null>(null);
-    const [loadingLayout, setLoadingLayout] = useState(false);
 
-    // 生成语义化映射表和反向查找表
-    const { semanticMap, semanticToPage } = useMemo(() => {
-        if (!layoutData?.pdf_info) return { semanticMap: {}, semanticToPage: {} };
+    const semanticToPage = useMemo(() => {
+        const nextSemanticToPage: Record<string, number> = {};
+        if (!projection) return nextSemanticToPage;
 
-        const semanticMap: Record<string, string> = {}; // "pageIdx-blockIdx" -> "sec-N-type-M"
-        const semanticToPage: Record<string, number> = {}; // "sec-N-type-M" -> pageIdx
+        for (const anchor of projection.anchors) {
+            if (nextSemanticToPage[anchor.semanticId] === undefined) {
+                nextSemanticToPage[anchor.semanticId] = anchor.pageIndex;
+            }
+        }
 
-        let titleIdx = -1;
-        let counters: Record<string, number> = { image: 0, table: 0, text: 0, formula: 0 };
+        for (const block of projection.blocks) {
+            if (nextSemanticToPage[block.semanticId] === undefined) {
+                nextSemanticToPage[block.semanticId] = block.pageIndex;
+            }
+        }
 
-        // 辅助函数：检测是否为 Caption
-        const isCaption = (text: string) => /^(Figure|Fig\.|Table)\s*\d+/i.test(text);
-        const getBlockText = (block: LayoutBlock) => block.lines?.[0]?.spans?.[0]?.content || '';
-
-        layoutData.pdf_info.forEach((page) => {
-            const blocks = page.para_blocks;
-
-            blocks.forEach((block, blockIdx) => {
-                const key = `${page.page_idx}-${blockIdx}`;
-
-                if (block.type === 'title') {
-                    titleIdx++;
-                    counters = { image: 0, table: 0, text: 0, formula: 0 };
-
-                    const sid = `sec-${titleIdx}-title-0`;
-                    semanticMap[key] = sid;
-                    semanticToPage[sid] = page.page_idx;
-                } else {
-                    // Caption 合并逻辑
-                    let isMergedCaption = false;
-                    let mergedId = '';
-
-                    if (block.type === 'text') {
-                        const text = getBlockText(block);
-                        if (isCaption(text)) {
-                            // 检查前一个或后一个是否是对应的媒体
-                            const prev = blocks[blockIdx - 1];
-                            const next = blocks[blockIdx + 1];
-
-                            // 关联 Prev (Box BELOW Caption?) usually caption is below figure, above table.
-                            if (prev && ['image', 'table', 'figure'].includes(prev.type)) {
-                                const prevKey = `${page.page_idx}-${blockIdx - 1}`;
-                                if (semanticMap[prevKey]) {
-                                    mergedId = semanticMap[prevKey];
-                                    isMergedCaption = true;
-                                }
-                            } else if (next && ['image', 'table', 'figure'].includes(next.type)) {
-                                // 预判下一个是媒体：借用下一个即将生成的流水号
-                                // 这是一个简化的假设：假设下一个 block 必然会按照常规逻辑生成 ID
-                                let typeKey = 'image';
-                                if (['table'].includes(next.type)) typeKey = 'table';
-
-                                const currentTitleIdx = titleIdx;
-                                const count = counters[typeKey] || 0;
-                                // 注意：我们这是在"引用"媒体的 ID，真正的媒体处理时会生成它
-                                mergedId = `sec-${currentTitleIdx}-${typeKey}-${count}`;
-                                isMergedCaption = true;
-                            }
-                        }
-                    }
-
-                    if (isMergedCaption) {
-                        semanticMap[key] = mergedId;
-                        // 不更新 semanticToPage，因为这只是 caption，让页面跳转也尽量去主物体
-                        // 但如果是 caption 先出现 (Table Caption)，那可能需要 map
-                        if (!semanticToPage[mergedId]) {
-                            semanticToPage[mergedId] = page.page_idx;
-                        }
-                    } else {
-                        // 标准逻辑
-                        let typeKey = 'text';
-                        if (['image', 'figure'].includes(block.type)) typeKey = 'image';
-                        else if (['table'].includes(block.type)) typeKey = 'table';
-                        else if (['interline_equation', 'equation'].includes(block.type)) typeKey = 'formula';
-
-                        const currentTitleIdx = titleIdx;
-                        const count = counters[typeKey] || 0;
-                        counters[typeKey] = count + 1;
-
-                        const sid = `sec-${currentTitleIdx}-${typeKey}-${count}`;
-                        semanticMap[key] = sid;
-                        semanticToPage[sid] = page.page_idx;
-                    }
-                }
-            });
-        });
-
-        return { semanticMap, semanticToPage };
-    }, [layoutData]);
+        return nextSemanticToPage;
+    }, [projection]);
 
     // 监听 highlightedBlockId 变化，自动跳转页面
     useEffect(() => {
         if (highlightedBlockId && semanticToPage) {
             const targetPage = semanticToPage[highlightedBlockId];
             if (targetPage !== undefined) {
-                setPageNumber(targetPage + 1);
+                const frame = window.requestAnimationFrame(() => {
+                    setPageNumber(targetPage + 1);
+                });
+                return () => window.cancelAnimationFrame(frame);
             }
         }
     }, [highlightedBlockId, semanticToPage]);
 
     // 重置状态当文件改变时
     useEffect(() => {
-        // 当fileUrl改变时,清理旧文件的状态
-        setLayoutData(null);
-        setNumPages(0);
-        setPageNumber(1);
+        const frame = window.requestAnimationFrame(() => {
+            setNumPages(0);
+            setPageNumber(1);
+        });
+        return () => window.cancelAnimationFrame(frame);
     }, [fileUrl]);
-
-    // 加载布局数据
-    useEffect(() => {
-        if (showLayout && layoutJsonUrl && !layoutData) {
-            setLoadingLayout(true);
-            fetch(layoutJsonUrl)
-                .then(res => res.json())
-                .then(data => {
-                    setLayoutData(data);
-                    setLoadingLayout(false);
-                })
-                .catch(err => {
-                    console.error('Failed to load layout data:', err);
-                    setLoadingLayout(false);
-                });
-        }
-    }, [showLayout, layoutJsonUrl, layoutData]);
-
-
 
     function onDocumentLoadSuccess({ numPages }: { numPages: number }) {
         setNumPages(numPages);
@@ -298,10 +184,9 @@ export function PDFViewer() {
         );
     }
 
-    // 获取当前页面的布局信息
-    const currentPageLayout = layoutData?.pdf_info?.find(p => p.page_idx === pageNumber - 1);
-    const currentBlocks = currentPageLayout?.para_blocks || [];
-    const pdfPageSize = currentPageLayout?.page_size || [612, 792]; // 默认 Letter 尺寸
+    const currentAnchors = projection?.anchors.filter((anchor) => anchor.pageIndex === pageNumber - 1) || [];
+    const pdfPageSize = projection?.pageSizes?.[pageNumber - 1] || [612, 792];
+    const canShowLayout = currentAnchors.length > 0 || (projection?.anchors.length || 0) > 0;
 
     return (
         <div className="flex flex-col h-full bg-slate-50 border rounded-lg overflow-hidden">
@@ -329,8 +214,7 @@ export function PDFViewer() {
                     </button>
                 </div>
 
-                {/* Layout Toggle - Only show if layoutJsonUrl is available */}
-                {layoutJsonUrl && (
+                {canShowLayout && (
                     <div className="flex items-center gap-2">
                         <label className="text-xs font-medium cursor-pointer flex items-center gap-2 select-none">
                             <input
@@ -342,7 +226,6 @@ export function PDFViewer() {
                             <Layers size={14} />
                             Show Layout
                         </label>
-                        {loadingLayout && <Loader2 size={14} className="animate-spin text-primary" />}
                     </div>
                 )}
 
@@ -383,15 +266,12 @@ export function PDFViewer() {
                             renderAnnotationLayer={false}
                             className="relative" // 确保 Page 是 relative 的，由于 react-pdf 的 Page 内部结构复杂，我们可能需要在外部包裹
                         >
-                            {/* Layout Overlay 作为 Page 的子元素（如果 Page 支持 children 渲染在最上层）或者使用绝对定位覆盖 */}
-                            {/* 为了稳健，我们使用绝对定位覆盖在 Page 上。React-PDF Page 通常渲染一个 Canvas */}
-                            {showLayout && currentBlocks.length > 0 && (
+                            {showLayout && currentAnchors.length > 0 && (
                                 <LayoutOverlay
-                                    layoutBlocks={currentBlocks}
+                                    anchors={currentAnchors}
                                     pdfWidth={pdfPageSize[0]}
                                     pdfHeight={pdfPageSize[1]}
-                                    pageIndex={pageNumber - 1} // 0-indexed
-                                    semanticMap={semanticMap}
+                                    pageIndex={pageNumber - 1}
                                 />
                             )}
                         </Page>

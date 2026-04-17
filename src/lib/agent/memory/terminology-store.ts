@@ -8,6 +8,21 @@ export interface Term {
     category?: string;
 }
 
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isWordLikeCharacter(value: string | undefined): boolean {
+    return Boolean(value && /[\p{L}\p{N}_]/u.test(value));
+}
+
+function createTermMatcher(source: string): RegExp {
+    const trimmedSource = source.trim();
+    const prefix = isWordLikeCharacter(trimmedSource[0]) ? "(?<![\\p{L}\\p{N}_])" : "";
+    const suffix = isWordLikeCharacter(trimmedSource.at(-1)) ? "(?![\\p{L}\\p{N}_])" : "";
+    return new RegExp(`${prefix}${escapeRegExp(trimmedSource)}${suffix}`, "iu");
+}
+
 export class TerminologyStore {
     private terms: Term[] = [];
     private isLoaded: boolean = false;
@@ -72,20 +87,21 @@ export class TerminologyStore {
     findTerms(text: string): Term[] {
         if (!text) return [];
 
-        const lowerText = text.toLowerCase();
-        const foundTerms: Term[] = [];
+        const foundTerms = this.terms
+            .filter((term) => term.source.trim() && createTermMatcher(term.source).test(text))
+            .sort((left, right) => right.source.length - left.source.length);
 
-        // Simple substring match for now. 
-        // Optimization: Could use Aho-Corasick or Regex if performance becomes an issue.
-        for (const term of this.terms) {
-            if (lowerText.includes(term.source.toLowerCase())) {
-                foundTerms.push(term);
-            }
+        const seen = new Set<string>();
+        const result: Term[] = [];
+
+        for (const term of foundTerms) {
+            const key = `${term.source.toLowerCase()}::${term.target.toLowerCase()}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            result.push(term);
         }
 
-        // Deduplicate by source (prefer longer matches or specific categories? 
-        // For now just return all unique matches)
-        return Array.from(new Set(foundTerms));
+        return result;
     }
 
     getTerms(): Term[] {

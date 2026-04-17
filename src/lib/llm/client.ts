@@ -16,6 +16,8 @@ export interface RuntimeProviderProfile {
     baseUrl: string;
     apiKey?: string;
     model?: string;
+    sourceLang?: string;
+    glossaryId?: string;
 }
 
 export interface LLMClient {

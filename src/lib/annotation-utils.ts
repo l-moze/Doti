@@ -20,6 +20,27 @@ export interface MarkdownDecorationState {
     counters: Record<string, number>;
 }
 
+export type SemanticBlockType =
+    | 'title'
+    | 'text'
+    | 'image'
+    | 'table'
+    | 'formula'
+    | 'list'
+    | 'code';
+
+export type SemanticContentBlockType = Exclude<SemanticBlockType, 'title'>;
+
+const MARKDOWN_BLOCK_SELECTOR = 'h1,h2,h3,h4,h5,h6,p,blockquote,pre,.markdown-table-wrap,ul,ol,.katex-display';
+const CAPTION_TYPE_PATTERNS: Array<{ type: Extract<SemanticBlockType, 'image' | 'table'>; pattern: RegExp }> = [
+    { type: 'image', pattern: /^(figure|fig\.?)\s*\d+[\s:：.-]*/i },
+    { type: 'image', pattern: /^图\s*\d+[\s:：.-]*/i },
+    { type: 'table', pattern: /^table\s*\d+[\s:：.-]*/i },
+    { type: 'table', pattern: /^表\s*\d+[\s:：.-]*/i },
+];
+const LIST_ITEM_PREFIX_PATTERN = /^(?:[-*+•▪◦]\s+|\d+[.)]\s+|[A-Za-z][.)]\s+)/;
+const INLINE_LIST_MARKER_PATTERN = /(?:^|\s)(?:[-*+•▪◦]|\d+[.)]|[A-Za-z][.)])\s+/g;
+
 export function getDocumentId(fileHash: string, targetLang: string, tab: EditorTab): string {
     return tab === 'translation'
         ? `${fileHash}::translation::${targetLang}`
@@ -37,6 +58,84 @@ export function getMarkdownBody(container: HTMLElement | null): HTMLElement | nu
 
 export function getPlainText(container: HTMLElement): string {
     return container.textContent || '';
+}
+
+export function buildSemanticBlockId(
+    sectionIndex: number,
+    type: SemanticContentBlockType,
+    blockIndex: number
+): string {
+    return `sec-${sectionIndex}-${type}-${blockIndex}`;
+}
+
+export function detectCaptionBlockType(text: string): Extract<SemanticBlockType, 'image' | 'table'> | null {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) return null;
+
+    for (const candidate of CAPTION_TYPE_PATTERNS) {
+        if (candidate.pattern.test(normalized)) {
+            return candidate.type;
+        }
+    }
+
+    return null;
+}
+
+function getMarkdownElementText(element: HTMLElement): string {
+    return element.textContent?.replace(/\s+/g, ' ').trim() || '';
+}
+
+function isStandaloneListParagraph(text: string): boolean {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) return false;
+
+    if (LIST_ITEM_PREFIX_PATTERN.test(normalized)) {
+        return true;
+    }
+
+    const inlineMarkers = normalized.match(INLINE_LIST_MARKER_PATTERN);
+    return (inlineMarkers?.length || 0) > 1;
+}
+
+function getMarkdownSemanticType(element: HTMLElement): SemanticContentBlockType {
+    const tagName = element.tagName.toLowerCase();
+    const text = getMarkdownElementText(element);
+
+    if (element.classList.contains('markdown-table-wrap')) return 'table';
+    if (element.classList.contains('katex-display')) return 'formula';
+    if (tagName === 'pre') return 'code';
+    if (tagName === 'ul' || tagName === 'ol') return 'list';
+    if (tagName === 'p' && element.querySelector('img')) return 'image';
+    if (tagName === 'p' && isStandaloneListParagraph(text)) return 'list';
+
+    return 'text';
+}
+
+function findAdjacentSemanticElement(
+    elements: HTMLElement[],
+    startIndex: number,
+    direction: -1 | 1
+): HTMLElement | null {
+    let cursor = startIndex + direction;
+
+    while (cursor >= 0 && cursor < elements.length) {
+        const candidate = elements[cursor];
+        const tagName = candidate.tagName.toLowerCase();
+        if (!tagName.startsWith('h')) {
+            return candidate;
+        }
+        cursor += direction;
+    }
+
+    return null;
+}
+
+function getAssignedSemanticId(
+    element: HTMLElement | null,
+    reservedSemanticIds: Map<HTMLElement, string>
+): string | null {
+    if (!element) return null;
+    return element.dataset.semanticBlockId || reservedSemanticIds.get(element) || null;
 }
 
 function getSelectionOffsets(container: HTMLElement, range: Range): { start: number; end: number } {
@@ -147,9 +246,16 @@ function findRangeFromQuote(container: HTMLElement, annotation: AnnotationRecord
 export function findRangeForAnnotation(container: HTMLElement, annotation: AnnotationRecord): Range | null {
     const start = annotation.anchor.position?.start;
     const end = annotation.anchor.position?.end;
+    const exact = annotation.anchor.quote?.exact?.trim();
 
     if (typeof start === 'number' && typeof end === 'number') {
-        return createRangeFromOffsets(container, start, end) || findRangeFromQuote(container, annotation);
+        const positionedRange = createRangeFromOffsets(container, start, end);
+        if (positionedRange) {
+            if (!exact || positionedRange.toString().trim() === exact) {
+                return positionedRange;
+            }
+        }
+        return findRangeFromQuote(container, annotation);
     }
 
     return findRangeFromQuote(container, annotation);
@@ -197,7 +303,7 @@ export function createMarkdownDecorationState(): MarkdownDecorationState {
     return {
         sectionIndex: -1,
         headingIndex: -1,
-        counters: { text: 0, table: 0, formula: 0, code: 0 },
+        counters: { text: 0, image: 0, table: 0, formula: 0, list: 0, code: 0 },
     };
 }
 
@@ -206,12 +312,13 @@ export function decorateMarkdownBody(
     initialState: MarkdownDecorationState = createMarkdownDecorationState()
 ): MarkdownDecorationState {
     const elements = Array.from(
-        body.querySelectorAll<HTMLElement>('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,table,.katex-display')
+        body.querySelectorAll<HTMLElement>(MARKDOWN_BLOCK_SELECTOR)
     );
     let { sectionIndex, headingIndex } = initialState;
     let counters = { ...initialState.counters };
+    const reservedSemanticIds = new Map<HTMLElement, string>();
 
-    for (const element of elements) {
+    for (const [index, element] of elements.entries()) {
         const ancestor = element.parentElement?.closest('[data-semantic-block-id]');
         if (ancestor && ancestor !== element && body.contains(ancestor)) {
             continue;
@@ -221,7 +328,7 @@ export function decorateMarkdownBody(
         if (tagName.startsWith('h')) {
             sectionIndex += 1;
             headingIndex += 1;
-            counters = { text: 0, table: 0, formula: 0, code: 0 };
+            counters = { text: 0, image: 0, table: 0, formula: 0, list: 0, code: 0 };
             const semanticId = `sec-${sectionIndex}-title-0`;
             element.dataset.semanticBlockId = semanticId;
             element.dataset.headingIndex = headingIndex.toString();
@@ -230,15 +337,75 @@ export function decorateMarkdownBody(
         }
 
         const activeSection = Math.max(sectionIndex, 0);
-        let typeKey = 'text';
-        if (tagName === 'table') typeKey = 'table';
-        if (tagName === 'pre') typeKey = 'code';
-        if (element.classList.contains('katex-display')) typeKey = 'formula';
+        const reservedSemanticId = reservedSemanticIds.get(element);
+
+        if (reservedSemanticId) {
+            element.dataset.semanticBlockId = reservedSemanticId;
+            reservedSemanticIds.delete(element);
+            continue;
+        }
+
+        if (tagName === 'p') {
+            const captionType = detectCaptionBlockType(getMarkdownElementText(element));
+            if (captionType) {
+                const previousElement = findAdjacentSemanticElement(elements, index, -1);
+                const nextElement = findAdjacentSemanticElement(elements, index, 1);
+                const previousType = previousElement ? getMarkdownSemanticType(previousElement) : null;
+                const nextType = nextElement ? getMarkdownSemanticType(nextElement) : null;
+
+                if (previousElement && previousType === captionType) {
+                    const previousSemanticId = getAssignedSemanticId(previousElement, reservedSemanticIds);
+                    if (previousSemanticId) {
+                        element.dataset.semanticBlockId = previousSemanticId;
+                        continue;
+                    }
+                }
+
+                if (nextElement && nextType === captionType) {
+                    let semanticId = getAssignedSemanticId(nextElement, reservedSemanticIds);
+                    if (!semanticId) {
+                        const count = counters[captionType] || 0;
+                        counters[captionType] = count + 1;
+                        semanticId = buildSemanticBlockId(activeSection, captionType, count);
+                        reservedSemanticIds.set(nextElement, semanticId);
+                    }
+                    element.dataset.semanticBlockId = semanticId;
+                    continue;
+                }
+            }
+        }
+
+        const typeKey = getMarkdownSemanticType(element);
+        if (typeKey === 'list') {
+            const previousElement = findAdjacentSemanticElement(elements, index, -1);
+            const nextElement = findAdjacentSemanticElement(elements, index, 1);
+            const previousType = previousElement ? getMarkdownSemanticType(previousElement) : null;
+            const nextType = nextElement ? getMarkdownSemanticType(nextElement) : null;
+
+            if (previousElement && previousType === 'list') {
+                const previousSemanticId = getAssignedSemanticId(previousElement, reservedSemanticIds);
+                if (previousSemanticId) {
+                    element.dataset.semanticBlockId = previousSemanticId;
+                    continue;
+                }
+            }
+
+            if (nextElement && nextType === 'list') {
+                let semanticId = getAssignedSemanticId(nextElement, reservedSemanticIds);
+                if (!semanticId) {
+                    const count = counters.list || 0;
+                    counters.list = count + 1;
+                    semanticId = buildSemanticBlockId(activeSection, 'list', count);
+                    reservedSemanticIds.set(nextElement, semanticId);
+                }
+                element.dataset.semanticBlockId = semanticId;
+                continue;
+            }
+        }
 
         const count = counters[typeKey] || 0;
         counters[typeKey] = count + 1;
-
-        element.dataset.semanticBlockId = `sec-${activeSection}-${typeKey}-${count}`;
+        element.dataset.semanticBlockId = buildSemanticBlockId(activeSection, typeKey, count);
     }
 
     return {

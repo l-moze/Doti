@@ -40,6 +40,8 @@ type TranslationStreamBlockProps = {
 type ViewTransitionDocument = Document & {
     startViewTransition?: (update: () => void) => {
         finished: Promise<void>;
+        ready?: Promise<void>;
+        updateCallbackDone?: Promise<void>;
     };
 };
 
@@ -63,6 +65,23 @@ export type TranslationStreamFrame = {
 };
 
 const MORPH_DURATION_MS = 360;
+
+function isIgnorableViewTransitionError(error: unknown): boolean {
+    if (error instanceof DOMException) {
+        return error.name === 'AbortError' || error.name === 'InvalidStateError';
+    }
+
+    if (error instanceof Error) {
+        return (
+            error.name === 'AbortError' ||
+            error.name === 'InvalidStateError' ||
+            error.message.includes('Transition was skipped') ||
+            error.message.includes('Transition was aborted')
+        );
+    }
+
+    return false;
+}
 
 function sanitizeTransitionName(id: string): string {
     return `translation-block-${id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
@@ -158,6 +177,7 @@ function TranslationStreamBlock({
     const overlayTimerRef = useRef<number | null>(null);
     const rafRef = useRef<number | null>(null);
     const lastDraftRef = useRef<DraftVisual | null>(null);
+    const viewTransitionInFlightRef = useRef(false);
     const normalizedMarkdown = useMemo(
         () => normalizeMarkdownMathForDisplay(block.rawText),
         [block.rawText]
@@ -219,35 +239,76 @@ function TranslationStreamBlock({
         if (overlayTimerRef.current !== null) window.clearTimeout(overlayTimerRef.current);
         if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
 
-        const doc = document as ViewTransitionDocument;
+        const finalizeWithOverlayFallback = () => {
+            if (previousDraft?.rawText.trim()) {
+                setOverlayDraft(previousDraft);
+                setOverlayLeaving(false);
+            }
 
-        if (typeof doc.startViewTransition === 'function') {
-            doc.startViewTransition(() => {
+            setIsFinalized(true);
+
+            if (previousDraft?.rawText.trim()) {
+                rafRef.current = window.requestAnimationFrame(() => {
+                    setOverlayLeaving(true);
+                });
+
+                overlayTimerRef.current = window.setTimeout(() => {
+                    setOverlayDraft(null);
+                    setOverlayLeaving(false);
+                }, MORPH_DURATION_MS);
+            }
+        };
+
+        const doc = document as ViewTransitionDocument;
+        const canUseNativeTransition = (
+            typeof doc.startViewTransition === 'function'
+            && document.visibilityState === 'visible'
+            && !viewTransitionInFlightRef.current
+        );
+
+        if (!canUseNativeTransition) {
+            finalizeWithOverlayFallback();
+            return;
+        }
+
+        try {
+            viewTransitionInFlightRef.current = true;
+            const transition = doc.startViewTransition(() => {
                 flushSync(() => {
                     setIsFinalized(true);
                     setOverlayDraft(null);
                     setOverlayLeaving(false);
                 });
             });
-            return;
-        }
 
-        if (previousDraft?.rawText.trim()) {
-            setOverlayDraft(previousDraft);
-            setOverlayLeaving(false);
-        }
-
-        setIsFinalized(true);
-
-        if (previousDraft?.rawText.trim()) {
-            rafRef.current = window.requestAnimationFrame(() => {
-                setOverlayLeaving(true);
+            void transition.ready?.catch((error) => {
+                if (!isIgnorableViewTransitionError(error)) {
+                    console.warn('[TranslationStream] View Transition ready() failed:', error);
+                }
             });
 
-            overlayTimerRef.current = window.setTimeout(() => {
-                setOverlayDraft(null);
-                setOverlayLeaving(false);
-            }, MORPH_DURATION_MS);
+            void transition.updateCallbackDone?.catch((error) => {
+                if (!isIgnorableViewTransitionError(error)) {
+                    console.warn('[TranslationStream] View Transition updateCallbackDone() failed:', error);
+                }
+            });
+
+            void transition.finished
+                .catch((error) => {
+                    if (!isIgnorableViewTransitionError(error)) {
+                        console.warn('[TranslationStream] View Transition finished() failed:', error);
+                    }
+                })
+                .finally(() => {
+                    viewTransitionInFlightRef.current = false;
+                });
+            return;
+        } catch (error) {
+            viewTransitionInFlightRef.current = false;
+            if (!isIgnorableViewTransitionError(error)) {
+                console.warn('[TranslationStream] Failed to start View Transition:', error);
+            }
+            finalizeWithOverlayFallback();
         }
     }, [activeDraft, block.stage, isFinalized]);
 

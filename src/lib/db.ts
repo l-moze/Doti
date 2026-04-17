@@ -10,6 +10,8 @@ export interface DocumentSnapshotRecord {
     updatedAt: number;
     targetLang?: string;
     sourceMarkdown?: string;
+    rawSourceMarkdown?: string;
+    polishedSourceMarkdown?: string;
     targetMarkdown?: string;
     layoutJsonUrl?: string | null;
     lastOpenedAt?: number;
@@ -61,6 +63,8 @@ export interface ProviderProfileRecord {
     baseUrl: string;
     apiKey?: string;
     model: string;
+    sourceLang?: string;
+    glossaryId?: string;
     capabilities: ProviderCapability[];
     updatedAt: number;
 }
@@ -162,6 +166,8 @@ export async function saveDocumentSnapshot(
         : { ...input };
 
     if (input.sourceMarkdown !== undefined) nextRecord.sourceMarkdown = input.sourceMarkdown;
+    if (input.rawSourceMarkdown !== undefined) nextRecord.rawSourceMarkdown = input.rawSourceMarkdown;
+    if (input.polishedSourceMarkdown !== undefined) nextRecord.polishedSourceMarkdown = input.polishedSourceMarkdown;
     if (input.targetMarkdown !== undefined) nextRecord.targetMarkdown = input.targetMarkdown;
     if (input.layoutJsonUrl !== undefined) nextRecord.layoutJsonUrl = input.layoutJsonUrl;
     if (input.lastOpenedAt !== undefined) nextRecord.lastOpenedAt = input.lastOpenedAt;

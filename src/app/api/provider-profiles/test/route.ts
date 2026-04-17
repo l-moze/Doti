@@ -13,7 +13,10 @@ export async function POST(request: NextRequest) {
 
         if (runtimeProfile.providerType === "deeplx") {
             const client = new DeepLXClient(runtimeProfile);
-            const translated = await client.translate("Hello world.", "Chinese");
+            const translated = await client.translate("Hello world.", "Chinese", {
+                sourceLang: runtimeProfile.sourceLang,
+                glossaryId: runtimeProfile.glossaryId,
+            });
             return NextResponse.json({
                 ok: true,
                 message: "DeepLX 测试成功",

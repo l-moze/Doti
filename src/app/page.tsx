@@ -10,6 +10,7 @@ import { ModelSelector } from '@/components/model-selector';
 import { PDFViewer } from '@/components/pdf-viewer';
 import { ProviderProfileManager } from '@/components/provider-profile-manager';
 import { StoragePanel } from '@/components/storage-panel';
+import { useDocumentSemanticProjection } from '@/hooks/use-document-semantic-projection';
 import { useTranslationStore } from '@/lib/store';
 import {
   BookText,
@@ -165,6 +166,7 @@ export default function Home() {
     getOnlineSnapshot,
     getServerOnlineSnapshot
   );
+  const { projection: sourceProjection } = useDocumentSemanticProjection(fileHash, sourceMarkdown);
 
   useEffect(() => {
     if (didRehydrateStoreRef.current) return;
@@ -185,7 +187,12 @@ export default function Home() {
     };
   }, [hydrateStore]);
 
-  const toc = useMemo(() => extractToc(sourceMarkdown), [sourceMarkdown]);
+  const toc = useMemo(() => {
+    if (sourceProjection?.toc.length) {
+      return sourceProjection.toc;
+    }
+    return extractToc(sourceMarkdown);
+  }, [sourceMarkdown, sourceProjection]);
   const hasParsedDocument = Boolean(sourceMarkdown.trim());
   const hasFinishedTranslation = Boolean(targetMarkdown.trim());
   const translationControlState = useMemo<TranslationControlState>(() => {
@@ -813,14 +820,17 @@ export default function Home() {
               {!isZenMode && (
                 <AppErrorBoundary title="PDF 预览面板异常">
                   <div className="h-full min-h-0">
-                    <PDFViewer />
+                    <PDFViewer projection={sourceProjection} />
                   </div>
                 </AppErrorBoundary>
               )}
 
               <AppErrorBoundary title="Markdown 工作区异常">
                 <div className="h-full min-h-0">
-                  <MarkdownEditor onTranslationWorkspaceContextMenu={openTranslationContextMenu} />
+                  <MarkdownEditor
+                    onTranslationWorkspaceContextMenu={openTranslationContextMenu}
+                    sourceProjection={sourceProjection}
+                  />
                 </div>
               </AppErrorBoundary>
             </div>
