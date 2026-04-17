@@ -7,7 +7,6 @@ import {
     type PretextMeasureResponseItem,
     type PretextLayoutSnapshot,
 } from '@/lib/pretext';
-你
 type PretextWorkerResponse = {
     type: 'measured';
     requestId: number;

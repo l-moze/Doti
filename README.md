@@ -1,10 +1,46 @@
 <div align="center">
-  <img src="./public/icon.svg" alt="乖积 PDF 图标" width="160" />
+  <img src="./public/icon.svg" alt="乖积 PDF 图标" width="168" />
   <h1>乖积 PDF</h1>
-  <p><strong>让论文 PDF 从静态页面，变成可翻译、可对话、可批注的研究工作台。</strong></p>
-  <p>品牌名：<strong>乖积 PDF</strong> · 工程仓库名：<code>Doti</code></p>
-  <p><a href="https://github.com/l-moze/Doti">GitHub 仓库</a></p>
+  <p><strong>把论文 PDF 变成可解析、可翻译、可对话、可批注的研究工作台。</strong></p>
+  <p>
+    <strong>乖积 PDF</strong> 是一个面向研究阅读与知识整理场景的桌面式 Web 工作台，
+    工程仓库名为 <code>Doti</code>。
+    它把 <code>MinerU</code>、多模型翻译、术语库、批注、AI 辅助和
+    <code>@chenglou/pretext</code> 流式布局优化串成一条完整工作流。
+  </p>
+  <p>
+    <img alt="GitHub stars" src="https://img.shields.io/github/stars/l-moze/Doti?style=flat-square&logo=github" />
+    <img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/l-moze/Doti?style=flat-square&logo=git" />
+    <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-111827?style=flat-square&logo=next.js" />
+    <img alt="React 19" src="https://img.shields.io/badge/React-19-0f172a?style=flat-square&logo=react" />
+    <img alt="Status active development" src="https://img.shields.io/badge/status-active%20development-f59e0b?style=flat-square" />
+  </p>
+  <p>
+    <a href="#快速开始"><strong>快速开始</strong></a>
+    ·
+    <a href="#当前亮点"><strong>功能亮点</strong></a>
+    ·
+    <a href="#核心工作流"><strong>核心工作流</strong></a>
+    ·
+    <a href="#技术栈"><strong>技术栈</strong></a>
+    ·
+    <a href="#当前状态"><strong>项目状态</strong></a>
+    ·
+    <a href="https://github.com/l-moze/Doti/issues"><strong>提交反馈</strong></a>
+  </p>
+  <p><sub>PDF Parsing · Streaming Translation · Notes & Glossary · AI Assist · Print / Export</sub></p>
 </div>
+
+> 目标不是再做一个“把 PDF 丢给模型翻一下”的工具，而是把论文处理成一个可持续阅读、持续追问、持续沉淀知识的研究工作台。
+
+| 解析底座 | 翻译能力 | 阅读工作台 |
+| --- | --- | --- |
+| `MinerU` 保留 Markdown / HTML / LaTeX / layout 等结构化结果 | 支持 `Gemini / OpenAI / Claude / DeepSeek / GLM / Ollama / DeepLX` | 原文对照、批注、术语库、AI 连续追问、历史恢复、打印导出 |
+
+<p align="center">
+  <img src="./public/image.png" alt="乖积 PDF 首页工作台截图" width="100%" />
+</p>
+<p align="center"><sub>首页工作台截图</sub></p>
 
 ## 简介
 
