@@ -1,7 +1,11 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
-import { findPreferredRelativeFilePath } from "@/lib/upload-artifacts";
+import { buildMediaDeliveryUrl, isPublicDeploymentMode } from "@/lib/media-access";
+import { getAccessibleFileHashes } from "@/lib/media-session";
+import { parseTargetLangFromTranslationArtifactName } from "@/lib/translation-cache-key";
+import { findUploadArtifactPaths } from "@/lib/upload-artifacts";
+import { getPdfParseCacheDir, getUploadsRoot } from "@/lib/server/runtime-paths";
 
 /**
  * 历史记录项接口（与前端 HistoryItem 对应）
@@ -37,10 +41,10 @@ interface CacheMeta {
  * - uploads/[hash]/full.md 存在 → parsed
  * - 目录存在但无 full.md → parsing（可能中断）
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
     try {
-        const uploadsDir = path.join(process.cwd(), 'uploads');
-        const cacheDir = path.join(process.cwd(), '.cache', 'pdf-parse');
+        const uploadsDir = getUploadsRoot();
+        const cacheDir = getPdfParseCacheDir();
 
         // 检查 uploads 目录是否存在
         try {
@@ -52,7 +56,13 @@ export async function GET() {
 
         // 获取所有 fileHash 目录
         const entries = await fs.readdir(uploadsDir, { withFileTypes: true });
-        const hashDirs = entries.filter(e => e.isDirectory()).map(e => e.name);
+        const accessibleFileHashes = isPublicDeploymentMode()
+            ? getAccessibleFileHashes(request)
+            : null;
+        const hashDirs = entries
+            .filter(e => e.isDirectory())
+            .map(e => e.name)
+            .filter((fileHash) => !accessibleFileHashes || accessibleFileHashes.has(fileHash));
 
         const historyItems: HistoryItem[] = [];
 
@@ -108,41 +118,23 @@ export async function GET() {
                 if (completedTranslationFile) {
                     status = 'completed';
                     progress = 100;
-                    // 提取目标语言，例如 translation-Chinese.md → Chinese
-                    const match = completedTranslationFile.match(/^translation-(.+)\.md$/);
-                    if (match) {
-                        targetLang = match[1];
-                    }
+                    targetLang = parseTargetLangFromTranslationArtifactName(completedTranslationFile) || undefined;
                 } else if (partialTranslationFile) {
                     // 有部分翻译，状态为已解析（可以继续翻译）
                     status = 'parsed';
                     progress = 60;
-                    // 提取目标语言
-                    const match = partialTranslationFile.match(/^translation-(.+)\.partial\.md$/);
-                    if (match) {
-                        targetLang = match[1];
-                    }
+                    targetLang = parseTargetLangFromTranslationArtifactName(partialTranslationFile) || undefined;
                 } else if (files.includes('full.md')) {
                     // 有源 Markdown 但无翻译
                     status = 'parsed';
                     progress = 60;
                 }
 
-                const nestedLayoutJsonPath = findPreferredRelativeFilePath(
-                    uploadPath,
-                    (relativePath, fileNameInDir) =>
-                        fileNameInDir === "layout.json" || relativePath.endsWith("/layout.json")
-                );
-                const nestedLayoutPdfPath = findPreferredRelativeFilePath(
-                    uploadPath,
-                    (relativePath, fileNameInDir) =>
-                        fileNameInDir === "layout.pdf" ||
-                        fileNameInDir.endsWith("_layout.pdf") ||
-                        relativePath.endsWith("/layout.pdf")
-                );
+                const { layoutJsonRelativePath: nestedLayoutJsonPath, layoutPdfRelativePath: nestedLayoutPdfPath } =
+                    await findUploadArtifactPaths(uploadPath);
 
-                layoutJsonUrl = nestedLayoutJsonPath ? `/api/media/${fileHash}/${nestedLayoutJsonPath}` : null;
-                layoutUrl = nestedLayoutPdfPath ? `/api/media/${fileHash}/${nestedLayoutPdfPath}` : null;
+                layoutJsonUrl = nestedLayoutJsonPath ? buildMediaDeliveryUrl(fileHash, nestedLayoutJsonPath) : null;
+                layoutUrl = nestedLayoutPdfPath ? buildMediaDeliveryUrl(fileHash, nestedLayoutPdfPath) : null;
                 // 否则保持 parsing 状态（可能是中断的任务）
             } catch {
                 // 无法读取目录，标记为错误

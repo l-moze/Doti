@@ -20,8 +20,14 @@ export interface RuntimeProviderProfile {
     glossaryId?: string;
 }
 
+export interface LLMGenerationOptions {
+    temperature?: number;
+    topP?: number;
+    maxTokens?: number;
+}
+
 export interface LLMClient {
-    generateStream(prompt: string): AsyncGenerator<string, void, unknown>;
+    generateStream(prompt: string, options?: LLMGenerationOptions): AsyncGenerator<string, void, unknown>;
 }
 
 function getErrorStatus(error: unknown): number | undefined {
@@ -97,12 +103,15 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
         });
 
         return {
-            async *generateStream(prompt: string): AsyncGenerator<string, void, unknown> {
+            async *generateStream(prompt: string, options?: LLMGenerationOptions): AsyncGenerator<string, void, unknown> {
                 try {
                     const stream = await client.chat.completions.create({
                         model: runtimeProfile.model || model,
                         messages: [{ role: 'user', content: prompt }],
                         stream: true,
+                        ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+                        ...(typeof options?.topP === 'number' ? { top_p: options.topP } : {}),
+                        ...(typeof options?.maxTokens === 'number' ? { max_tokens: Math.max(1, Math.floor(options.maxTokens)) } : {}),
                     });
 
                     for await (const chunk of stream) {
@@ -118,6 +127,9 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
                         model: runtimeProfile.model || model,
                         messages: [{ role: 'user', content: prompt }],
                         stream: false,
+                        ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+                        ...(typeof options?.topP === 'number' ? { top_p: options.topP } : {}),
+                        ...(typeof options?.maxTokens === 'number' ? { max_tokens: Math.max(1, Math.floor(options.maxTokens)) } : {}),
                     });
                     const content = extractOpenAIMessageText(completion.choices[0]?.message?.content);
                     if (content) {
@@ -146,16 +158,22 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
         );
 
         return {
-            async *generateStream(prompt: string): AsyncGenerator<string, void, unknown> {
+            async *generateStream(prompt: string, options?: LLMGenerationOptions): AsyncGenerator<string, void, unknown> {
                 let retries = 0;
                 const maxRetries = 5;
 
                 while (true) {
                     try {
+                        const requestedMaxTokens = typeof options?.maxTokens === 'number'
+                            ? Math.max(1, Math.floor(options.maxTokens))
+                            : maxOutputTokens;
+                        const cappedMaxTokens = Math.min(maxOutputTokens, requestedMaxTokens);
                         const stream = anthropic.messages.stream({
                             model,
-                            max_tokens: maxOutputTokens,
+                            max_tokens: cappedMaxTokens,
                             messages: [{ role: 'user', content: prompt }],
+                            ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+                            ...(typeof options?.topP === 'number' ? { top_p: options.topP } : {}),
                         });
 
                         for await (const event of stream) {
@@ -210,7 +228,7 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
         const client = new OpenAI({ apiKey: apiKey || 'placeholder', baseURL });
 
         return {
-            async *generateStream(prompt: string): AsyncGenerator<string, void, unknown> {
+            async *generateStream(prompt: string, options?: LLMGenerationOptions): AsyncGenerator<string, void, unknown> {
                 let retries = 0;
                 const maxRetries = 5;
 
@@ -220,6 +238,9 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
                             model,
                             messages: [{ role: 'user', content: prompt }],
                             stream: true,
+                            ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+                            ...(typeof options?.topP === 'number' ? { top_p: options.topP } : {}),
+                            ...(typeof options?.maxTokens === 'number' ? { max_tokens: Math.max(1, Math.floor(options.maxTokens)) } : {}),
                         });
 
                         for await (const chunk of stream) {
@@ -233,6 +254,9 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
                                 model,
                                 messages: [{ role: 'user', content: prompt }],
                                 stream: false,
+                                ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+                                ...(typeof options?.topP === 'number' ? { top_p: options.topP } : {}),
+                                ...(typeof options?.maxTokens === 'number' ? { max_tokens: Math.max(1, Math.floor(options.maxTokens)) } : {}),
                             });
                             const content = extractOpenAIMessageText(completion.choices[0]?.message?.content);
                             if (content) {
@@ -272,7 +296,7 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
         const ai = new GoogleGenAI({ apiKey });
 
         return {
-            async *generateStream(prompt: string): AsyncGenerator<string, void, unknown> {
+            async *generateStream(prompt: string, options?: LLMGenerationOptions): AsyncGenerator<string, void, unknown> {
                 let retries = 0;
                 const maxRetries = 5;
 
@@ -281,6 +305,17 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
                         const response = await ai.models.generateContentStream({
                             model,
                             contents: prompt,
+                            ...(typeof options?.temperature === 'number' ||
+                            typeof options?.topP === 'number' ||
+                            typeof options?.maxTokens === 'number'
+                                ? {
+                                    config: {
+                                        ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+                                        ...(typeof options?.topP === 'number' ? { topP: options.topP } : {}),
+                                        ...(typeof options?.maxTokens === 'number' ? { maxOutputTokens: Math.max(1, Math.floor(options.maxTokens)) } : {}),
+                                    },
+                                }
+                                : {}),
                         });
 
                         for await (const chunk of response) {

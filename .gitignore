@@ -12,9 +12,13 @@ node_modules/
 .next/
 .next-dev/
 .next-build*/
+.next-prod/
 out/
 build/
 dist/
+dist-electron/
+.desktop-app/
+.desktop-build-home/
 coverage/
 
 # local runtime data
@@ -52,6 +56,10 @@ bug.md
 redme.md
 research-agent-markdown.md
 CLAUDE.md
+
+# local debug artifacts
+/table-debug-print.png
+/MAX_PARAGRAPH_LAYOUT_CACHE_SIZE)
 
 # OS / misc
 .DS_Store

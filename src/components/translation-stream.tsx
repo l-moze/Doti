@@ -10,12 +10,10 @@ import {
     type CSSProperties,
     type RefObject,
 } from 'react';
-import { flushSync } from 'react-dom';
 import { Loader2 } from 'lucide-react';
 import { MarkdownView } from '@/components/markdown-view';
 import { useDocumentLayoutProfile } from '@/hooks/use-document-layout-profile';
 import { normalizeMarkdownMathForDisplay } from '@/lib/markdown-normalizer';
-import { getPretextLayoutSnapshotFromPrepared } from '@/lib/pretext';
 import {
     buildStreamingRenderBlocks,
     STREAM_DRAFT_BLOCK_GAP,
@@ -35,14 +33,6 @@ type TranslationStreamBlockProps = {
     top: number;
     onHeightChange: (blockId: string, height: number) => void;
     debug: boolean;
-};
-
-type ViewTransitionDocument = Document & {
-    startViewTransition?: (update: () => void) => {
-        finished: Promise<void>;
-        ready?: Promise<void>;
-        updateCallbackDone?: Promise<void>;
-    };
 };
 
 type DraftVisual = {
@@ -66,23 +56,6 @@ export type TranslationStreamFrame = {
 
 const MORPH_DURATION_MS = 360;
 
-function isIgnorableViewTransitionError(error: unknown): boolean {
-    if (error instanceof DOMException) {
-        return error.name === 'AbortError' || error.name === 'InvalidStateError';
-    }
-
-    if (error instanceof Error) {
-        return (
-            error.name === 'AbortError' ||
-            error.name === 'InvalidStateError' ||
-            error.message.includes('Transition was skipped') ||
-            error.message.includes('Transition was aborted')
-        );
-    }
-
-    return false;
-}
-
 function sanitizeTransitionName(id: string): string {
     return `translation-block-${id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
 }
@@ -93,22 +66,12 @@ function renderDraftVisual(
     isOverlay = false
 ) {
     const isStreaming = draft.draftState === 'streaming';
-    const projectedParagraphs = draft.paragraphs.map((paragraph) => ({
-        ...paragraph,
-        lines: paragraph.prepared
-            ? (getPretextLayoutSnapshotFromPrepared(
-                paragraph.prepared,
-                draft.textWidth,
-                STREAM_DRAFT_LINE_HEIGHT
-            )?.lines ?? [])
-            : paragraph.lines,
-    }));
 
     return (
         <div
-            className={`not-prose rounded-3xl border px-5 py-4 shadow-sm transition-[min-height,background-color,border-color,box-shadow,opacity,transform,filter] duration-300 ease-out ${isOverlay ? 'h-full' : ''} ${isStreaming
-                ? 'border-sky-100 bg-sky-50/80'
-                : 'border-slate-200 bg-slate-50/90'
+            className={`not-prose rounded-3xl border px-5 py-4 shadow-sm duration-300 ease-out ${isOverlay ? 'h-full' : ''} ${isStreaming
+                ? 'border-sky-100 bg-sky-50/80 transition-[background-color,border-color]'
+                : 'border-slate-200 bg-slate-50/90 transition-[min-height,background-color,border-color,box-shadow,opacity,transform,filter]'
                 }`}
             style={{ minHeight: draft.estimatedHeight }}
         >
@@ -128,7 +91,7 @@ function renderDraftVisual(
 
             {draft.paragraphs.length > 0 ? (
                 <div className="mt-3 space-y-3">
-                    {projectedParagraphs.map((paragraph) => (
+                    {draft.paragraphs.map((paragraph) => (
                         <div
                             key={paragraph.id}
                             className={paragraph.stage === 'stabilized-block' ? 'opacity-75' : ''}
@@ -177,11 +140,14 @@ function TranslationStreamBlock({
     const overlayTimerRef = useRef<number | null>(null);
     const rafRef = useRef<number | null>(null);
     const lastDraftRef = useRef<DraftVisual | null>(null);
-    const viewTransitionInFlightRef = useRef(false);
-    const normalizedMarkdown = useMemo(
-        () => normalizeMarkdownMathForDisplay(block.rawText),
-        [block.rawText]
+
+    // 惰性正规化：streaming 阶段 rawText 每 ~120ms 变化一次，此时 MarkdownView
+    // 尚未挂载，提前执行 normalizeMarkdownMathForDisplay 是纯浪费。
+    // 仅在 block 进入 final-rich 时执行一次并持久化到 ref，避免重复计算。
+    const finalizedMarkdownRef = useRef<string | null>(
+        block.stage === 'final-rich' ? normalizeMarkdownMathForDisplay(block.rawText) : null
     );
+
     const transitionName = useMemo(() => sanitizeTransitionName(block.id), [block.id]);
 
     const activeDraft = useMemo<DraftVisual>(() => ({
@@ -239,78 +205,27 @@ function TranslationStreamBlock({
         if (overlayTimerRef.current !== null) window.clearTimeout(overlayTimerRef.current);
         if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
 
-        const finalizeWithOverlayFallback = () => {
-            if (previousDraft?.rawText.trim()) {
-                setOverlayDraft(previousDraft);
+        if (previousDraft?.rawText.trim()) {
+            setOverlayDraft(previousDraft);
+            setOverlayLeaving(false);
+        }
+
+        // 此处是 block 生命周期内唯一一次执行正规化的时机：文本已稳定，
+        // MarkdownView 即将挂载。函数本身带 LRU 缓存，重复调用成本极低。
+        finalizedMarkdownRef.current = normalizeMarkdownMathForDisplay(block.rawText);
+        setIsFinalized(true);
+
+        if (previousDraft?.rawText.trim()) {
+            rafRef.current = window.requestAnimationFrame(() => {
+                setOverlayLeaving(true);
+            });
+
+            overlayTimerRef.current = window.setTimeout(() => {
+                setOverlayDraft(null);
                 setOverlayLeaving(false);
-            }
-
-            setIsFinalized(true);
-
-            if (previousDraft?.rawText.trim()) {
-                rafRef.current = window.requestAnimationFrame(() => {
-                    setOverlayLeaving(true);
-                });
-
-                overlayTimerRef.current = window.setTimeout(() => {
-                    setOverlayDraft(null);
-                    setOverlayLeaving(false);
-                }, MORPH_DURATION_MS);
-            }
-        };
-
-        const doc = document as ViewTransitionDocument;
-        const canUseNativeTransition = (
-            typeof doc.startViewTransition === 'function'
-            && document.visibilityState === 'visible'
-            && !viewTransitionInFlightRef.current
-        );
-
-        if (!canUseNativeTransition) {
-            finalizeWithOverlayFallback();
-            return;
+            }, MORPH_DURATION_MS);
         }
-
-        try {
-            viewTransitionInFlightRef.current = true;
-            const transition = doc.startViewTransition(() => {
-                flushSync(() => {
-                    setIsFinalized(true);
-                    setOverlayDraft(null);
-                    setOverlayLeaving(false);
-                });
-            });
-
-            void transition.ready?.catch((error) => {
-                if (!isIgnorableViewTransitionError(error)) {
-                    console.warn('[TranslationStream] View Transition ready() failed:', error);
-                }
-            });
-
-            void transition.updateCallbackDone?.catch((error) => {
-                if (!isIgnorableViewTransitionError(error)) {
-                    console.warn('[TranslationStream] View Transition updateCallbackDone() failed:', error);
-                }
-            });
-
-            void transition.finished
-                .catch((error) => {
-                    if (!isIgnorableViewTransitionError(error)) {
-                        console.warn('[TranslationStream] View Transition finished() failed:', error);
-                    }
-                })
-                .finally(() => {
-                    viewTransitionInFlightRef.current = false;
-                });
-            return;
-        } catch (error) {
-            viewTransitionInFlightRef.current = false;
-            if (!isIgnorableViewTransitionError(error)) {
-                console.warn('[TranslationStream] Failed to start View Transition:', error);
-            }
-            finalizeWithOverlayFallback();
-        }
-    }, [activeDraft, block.stage, isFinalized]);
+    }, [activeDraft, block.rawText, block.stage, isFinalized]);
 
     const sectionStyle = useMemo(() => ({
         position: 'absolute',
@@ -329,7 +244,9 @@ function TranslationStreamBlock({
                 style={sectionStyle}
             >
                 <div className="transition-[opacity,transform,filter] duration-300 ease-out">
-                    <MarkdownView value={normalizedMarkdown} />
+                    {/* finalizedMarkdownRef 在 block 进入 final-rich 时写入，
+                        内容稳定后才触发 MarkdownView 渲染，streaming 期间不执行正规化。 */}
+                    <MarkdownView value={finalizedMarkdownRef.current ?? block.rawText} />
                 </div>
                 {overlayDraft ? (
                     <div
@@ -361,8 +278,15 @@ const MemoizedTranslationStreamBlock = memo(TranslationStreamBlock);
 
 function TranslationStreamComponent({ blocks, viewportRef, onFramesChange }: TranslationStreamProps) {
     const layoutProfile = useDocumentLayoutProfile(viewportRef);
-    const [viewportTop, setViewportTop] = useState(0);
-    const [viewportHeight, setViewportHeight] = useState(0);
+
+    // 合并 top 和 height 为单一 state，这样每次 scroll 只触发一次渲染而非两次。
+    const [viewportState, setViewportState] = useState({ top: 0, height: 0 });
+    const viewportTop = viewportState.top;
+    const viewportHeight = viewportState.height;
+
+    // RAF 节流 ref：记录 pending 的动画帧 ID，避免高速滚动时多帧重复排队。
+    const pendingViewportRafRef = useRef<number | null>(null);
+
     const [measuredState, setMeasuredState] = useState<{
         profileVersion: number;
         heights: Record<string, number>;
@@ -375,23 +299,38 @@ function TranslationStreamComponent({ blocks, viewportRef, onFramesChange }: Tra
         const element = viewportRef.current;
         if (!element || typeof window === 'undefined') return;
 
-        const updateViewport = () => {
-            setViewportTop(element.scrollTop);
-            setViewportHeight(element.clientHeight);
+        const readAndCommit = () => {
+            pendingViewportRafRef.current = null;
+            const nextTop = element.scrollTop;
+            const nextHeight = element.clientHeight;
+            setViewportState((current) => {
+                if (current.top === nextTop && current.height === nextHeight) return current;
+                return { top: nextTop, height: nextHeight };
+            });
         };
 
-        const handleScroll = () => updateViewport();
-        const observer = new ResizeObserver(() => updateViewport());
+        // scroll 事件改为 rAF 节流：每个动画帧最多排队一次，避免高频 scroll 事件
+        // 每次都触发 setState，与浏览器刷新率对齐。
+        const handleScroll = () => {
+            if (pendingViewportRafRef.current !== null) return;
+            pendingViewportRafRef.current = window.requestAnimationFrame(readAndCommit);
+        };
 
-        updateViewport();
+        const observer = new ResizeObserver(readAndCommit);
+
+        readAndCommit();
         element.addEventListener('scroll', handleScroll, { passive: true });
         observer.observe(element);
 
         return () => {
+            if (pendingViewportRafRef.current !== null) {
+                window.cancelAnimationFrame(pendingViewportRafRef.current);
+            }
             element.removeEventListener('scroll', handleScroll);
             observer.disconnect();
         };
     }, [viewportRef]);
+
 
     const renderBlocks = useMemo(
         () => buildStreamingRenderBlocks(blocks, layoutProfile),

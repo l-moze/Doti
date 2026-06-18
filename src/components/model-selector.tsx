@@ -5,6 +5,7 @@ import { useTranslationStore } from '@/lib/store';
 import { useEffect, useState } from 'react';
 import { subscribeSyncEvents } from '@/lib/sync-channel';
 import { ChevronDown, Loader2, XCircle } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 
 interface ProviderDef {
     id: string;
@@ -37,7 +38,14 @@ export function ModelSelector({ mode = 'translation', className, compact = false
         assistModel,
         setProvider,
         setAssistProvider,
-    } = useTranslationStore();
+    } = useTranslationStore(useShallow((state) => ({
+        providerId: state.providerId,
+        model: state.model,
+        assistProviderId: state.assistProviderId,
+        assistModel: state.assistModel,
+        setProvider: state.setProvider,
+        setAssistProvider: state.setAssistProvider,
+    })));
     const [data, setData] = useState<ModelsResponse | null>(null);
     const [customProfiles, setCustomProfiles] = useState<ProviderProfileRecord[]>([]);
     const [loading, setLoading] = useState(true);

@@ -6,6 +6,19 @@ import { listAnnotationsForDocument, type AnnotationRecord } from '@/lib/db';
 import { MarkdownView } from '@/components/markdown-view';
 import { normalizeMarkdownMathForDisplay } from '@/lib/markdown-normalizer';
 
+async function resolveMediaUrl(fileHash: string, relativePath: string): Promise<string | null> {
+    try {
+        const response = await fetch(
+            `/api/media/sign?fileHash=${encodeURIComponent(fileHash)}&path=${encodeURIComponent(relativePath)}`
+        );
+        if (!response.ok) return null;
+        const data = await response.json();
+        return typeof data?.url === 'string' ? data.url : null;
+    } catch {
+        return null;
+    }
+}
+
 function annotationToMarkdown(annotations: AnnotationRecord[]): string {
     if (annotations.length === 0) return '_No annotations_';
 
@@ -22,6 +35,7 @@ function PrintPageContent() {
     const fileHash = searchParams.get('fileHash');
     const targetLang = searchParams.get('targetLang') || 'Chinese';
     const mode = searchParams.get('mode') || 'translation';
+    const translationArtifact = searchParams.get('translationArtifact');
 
     const [sourceMarkdown, setSourceMarkdown] = useState('');
     const [targetMarkdown, setTargetMarkdown] = useState('');
@@ -30,18 +44,43 @@ function PrintPageContent() {
     useEffect(() => {
         if (!fileHash) return;
 
-        fetch(`/api/media/${fileHash}/full.md`)
-            .then((res) => res.ok ? res.text() : '')
-            .then(setSourceMarkdown)
-            .catch(() => setSourceMarkdown(''));
+        void (async () => {
+            const sourceUrl = await resolveMediaUrl(fileHash, 'full.md');
+            if (sourceUrl) {
+                try {
+                    const response = await fetch(sourceUrl);
+                    setSourceMarkdown(response.ok ? await response.text() : '');
+                } catch {
+                    setSourceMarkdown('');
+                }
+            } else {
+                setSourceMarkdown('');
+            }
 
-        fetch(`/api/media/${fileHash}/translation-${targetLang}.md`)
-            .then((res) => res.ok ? res.text() : '')
-            .then(setTargetMarkdown)
-            .catch(() => setTargetMarkdown(''));
+            const translationCandidates = [
+                translationArtifact ? `${translationArtifact}.md` : null,
+                `translation-${targetLang}.md`,
+            ].filter((value): value is string => Boolean(value));
+
+            for (const candidate of translationCandidates) {
+                const signedUrl = await resolveMediaUrl(fileHash, candidate);
+                if (!signedUrl) continue;
+
+                try {
+                    const response = await fetch(signedUrl);
+                    if (!response.ok) continue;
+                    setTargetMarkdown(await response.text());
+                    return;
+                } catch {
+                    // Try next candidate.
+                }
+            }
+
+            setTargetMarkdown('');
+        })();
 
         void listAnnotationsForDocument(fileHash).then(setAnnotations);
-    }, [fileHash, targetLang]);
+    }, [fileHash, targetLang, translationArtifact]);
 
     const notesMarkdown = useMemo(() => annotationToMarkdown(annotations), [annotations]);
     const renderedSourceMarkdown = useMemo(() => normalizeMarkdownMathForDisplay(sourceMarkdown), [sourceMarkdown]);

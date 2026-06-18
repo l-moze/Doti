@@ -13,6 +13,10 @@ export interface PreservedMarkdownFragment {
     kind: PreservedMarkdownFragmentKind;
 }
 
+export interface ProtectMarkdownFragmentsOptions {
+    preserveInlineMath?: boolean;
+}
+
 const HTML_TABLE_PATTERN = /<table\b[\s\S]*?<\/table>/gi;
 const PRESERVE_MARKER_ROOT = "@@DOTI_";
 const PRESERVE_MARKER_SUFFIX = "@@";
@@ -569,21 +573,39 @@ function normalizeAdjacentInlineMathSpacing(markdown: string): string {
 export function protectMarkdownFragments(markdown: string): {
     text: string;
     fragments: PreservedMarkdownFragment[];
+}
+export function protectMarkdownFragments(
+    markdown: string,
+    options: ProtectMarkdownFragmentsOptions
+): {
+    text: string;
+    fragments: PreservedMarkdownFragment[];
+}
+export function protectMarkdownFragments(
+    markdown: string,
+    options: ProtectMarkdownFragmentsOptions = {}
+): {
+    text: string;
+    fragments: PreservedMarkdownFragment[];
 } {
     if (!markdown || !/[`$|\\]|<table/i.test(markdown)) {
         return { text: markdown, fragments: [] };
     }
 
     const fragments: PreservedMarkdownFragment[] = [];
+    const preserveInlineMath = options.preserveInlineMath ?? true;
     const fencedCodeProtected = protectFencedCodeBlocks(markdown, fragments);
     const htmlProtected = protectHtmlTables(fencedCodeProtected, fragments);
     const blockMathProtected = protectBlockMath(htmlProtected, fragments);
     const bareLatexProtected = protectBareLatexBlocks(blockMathProtected, fragments);
     const tableProtected = protectMarkdownPipeTables(bareLatexProtected, fragments);
     const inlineCodeProtected = protectInlineBacktickCode(tableProtected, fragments);
-    const inlineParenMathProtected = protectInlineParenMath(inlineCodeProtected, fragments);
-    const fullyProtected = protectInlineDollarMath(inlineParenMathProtected, fragments);
-    const normalizedProtected = separateAdjacentInlineMathMarkers(fullyProtected);
+    const inlineMathProtected = preserveInlineMath
+        ? protectInlineDollarMath(protectInlineParenMath(inlineCodeProtected, fragments), fragments)
+        : inlineCodeProtected;
+    const normalizedProtected = preserveInlineMath
+        ? separateAdjacentInlineMathMarkers(inlineMathProtected)
+        : inlineMathProtected;
 
     return {
         text: normalizedProtected,

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
 import path from 'path';
+import { buildRawMediaPrefix } from '@/lib/media-access';
 import { createLLMClient, type RuntimeProviderProfile } from '@/lib/llm/client';
 import type { Term } from '@/lib/agent/memory/terminology-store';
 import {
@@ -12,7 +12,13 @@ import {
     type PaperPolishIssueWindow,
     type PaperPolishMode,
 } from '@/lib/paper-polish';
-import { findPreferredRelativeFilePath } from '@/lib/upload-artifacts';
+import {
+    directoryExists,
+    findUploadArtifactPaths,
+    readJsonFileIfExists,
+    readTextFileIfExists,
+    resolveUploadDir,
+} from '@/lib/upload-artifacts';
 
 type PaperPolishRequest = {
     fileHash?: string;
@@ -33,64 +39,33 @@ type LoadedPaperPolishSources = {
     assetPathPrefix?: string;
 };
 
-function readJsonFile(filePath: string | null): unknown | undefined {
-    if (!filePath || !fs.existsSync(filePath)) return undefined;
-
-    try {
-        return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-    } catch (error) {
-        console.warn('[PaperPolish] Failed to parse JSON:', filePath, error);
-        return undefined;
-    }
-}
-
-function readTextFile(filePath: string | null): string {
-    if (!filePath || !fs.existsSync(filePath)) return '';
-
-    try {
-        return fs.readFileSync(filePath, 'utf-8');
-    } catch (error) {
-        console.warn('[PaperPolish] Failed to read text:', filePath, error);
-        return '';
-    }
-}
-
-function resolveUploadFile(rootDir: string, matcher: (relativePath: string, fileName: string) => boolean): string | null {
-    const relativePath = findPreferredRelativeFilePath(rootDir, matcher);
-    return relativePath ? path.join(rootDir, relativePath) : null;
-}
-
-function loadPaperPolishSources(fileHash: string | undefined, fallbackMarkdown: string): LoadedPaperPolishSources {
+async function loadPaperPolishSources(fileHash: string | undefined, fallbackMarkdown: string): Promise<LoadedPaperPolishSources> {
     if (!fileHash) {
         return { markdown: fallbackMarkdown.trim() };
     }
 
-    const uploadDir = path.join(process.cwd(), 'uploads', fileHash);
-    if (!fs.existsSync(uploadDir)) {
+    const uploadDir = resolveUploadDir(fileHash);
+    if (!uploadDir || !(await directoryExists(uploadDir))) {
         return {
             markdown: fallbackMarkdown.trim(),
-            assetPathPrefix: `/api/media/${fileHash}`,
+            assetPathPrefix: buildRawMediaPrefix(fileHash),
         };
     }
 
-    const contentListPath = resolveUploadFile(
-        uploadDir,
-        (relativePath, fileName) => fileName === 'content_list_v2.json' || relativePath.endsWith('/content_list_v2.json')
-    );
-    const layoutPath = resolveUploadFile(
-        uploadDir,
-        (relativePath, fileName) => fileName === 'layout.json' || relativePath.endsWith('/layout.json')
-    );
-    const markdownPath = resolveUploadFile(
-        uploadDir,
-        (relativePath, fileName) => fileName === 'full.md' || relativePath.endsWith('/full.md')
-    );
+    const { contentListRelativePath, layoutJsonRelativePath, markdownRelativePath } = await findUploadArtifactPaths(uploadDir);
+    const [contentList, layout, markdownFromDisk] = await Promise.all([
+        readJsonFileIfExists(contentListRelativePath ? path.join(uploadDir, contentListRelativePath) : null),
+        readJsonFileIfExists(layoutJsonRelativePath ? path.join(uploadDir, layoutJsonRelativePath) : null),
+        fallbackMarkdown.trim()
+            ? Promise.resolve('')
+            : readTextFileIfExists(markdownRelativePath ? path.join(uploadDir, markdownRelativePath) : null),
+    ]);
 
     return {
-        markdown: fallbackMarkdown.trim() || readTextFile(markdownPath).trim(),
-        contentList: readJsonFile(contentListPath),
-        layout: readJsonFile(layoutPath),
-        assetPathPrefix: `/api/media/${fileHash}`,
+        markdown: fallbackMarkdown.trim() || markdownFromDisk.trim(),
+        contentList: contentList ?? undefined,
+        layout: layout ?? undefined,
+        assetPathPrefix: buildRawMediaPrefix(fileHash),
     };
 }
 
@@ -126,7 +101,7 @@ export async function POST(request: NextRequest) {
         const body = await request.json() as PaperPolishRequest;
         const mode: PaperPolishMode = body.mode === 'deep' ? 'deep' : 'light';
         const fallbackMarkdown = typeof body.markdown === 'string' ? body.markdown : '';
-        const sources = loadPaperPolishSources(body.fileHash, fallbackMarkdown);
+        const sources = await loadPaperPolishSources(body.fileHash, fallbackMarkdown);
 
         if (!sources.markdown.trim()) {
             return NextResponse.json({ error: 'No markdown provided' }, { status: 400 });

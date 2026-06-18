@@ -26,6 +26,7 @@ export interface DeepLXTranslateOptions {
 }
 
 const DEEPLX_SPAM_REDIRECT = "https://linux.do/t/topic/111737";
+const DEFAULT_DEEPLX_TIMEOUT_MS = 45000;
 
 function normalizeBaseUrl(baseUrl: string): string {
     return baseUrl.replace(/\/+$/, "");
@@ -232,6 +233,15 @@ function isKnownSpamRedirect(value: string): boolean {
     return value.trim().startsWith(DEEPLX_SPAM_REDIRECT);
 }
 
+function resolveDeepLXTimeoutMs(): number {
+    const raw = Number.parseInt(process.env.DEEPLX_REQUEST_TIMEOUT_MS || "", 10);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return DEFAULT_DEEPLX_TIMEOUT_MS;
+    }
+
+    return raw;
+}
+
 export function supportsDeepLXOfficialGlossary(profile: RuntimeProviderProfile): boolean {
     try {
         return usesDeepLXOfficialEndpoint(profile) && Boolean(profile.glossaryId?.trim() && profile.sourceLang?.trim());
@@ -261,16 +271,23 @@ export class DeepLXClient {
         let lastError: Error | null = null;
 
         for (const candidate of candidates) {
+            const timeoutMs = resolveDeepLXTimeoutMs();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => {
+                controller.abort(`deeplx-timeout:${timeoutMs}`);
+            }, timeoutMs);
+
             try {
                 const requestBody = buildRequestBody(text, targetLang, candidate.mode, mergedOptions);
                 const response = await fetch(candidate.endpoint, {
                     method: "POST",
                     headers: candidate.headers,
                     body: requestBody,
+                    signal: controller.signal,
                 });
 
                 if (!response.ok) {
-                    throw new Error(`DeepLX request failed with ${response.status}`);
+                    throw new Error(`DeepLX request failed with ${response.status} at ${candidate.endpoint}`);
                 }
 
                 const data = await response.json();
@@ -286,7 +303,13 @@ export class DeepLXClient {
 
                 return translated;
             } catch (error) {
-                lastError = error instanceof Error ? error : new Error(String(error));
+                if (error instanceof Error && error.name === "AbortError") {
+                    lastError = new Error(`DeepLX request timed out after ${timeoutMs}ms`);
+                } else {
+                    lastError = error instanceof Error ? error : new Error(String(error));
+                }
+            } finally {
+                clearTimeout(timeout);
             }
         }
 

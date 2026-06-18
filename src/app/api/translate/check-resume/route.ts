@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProgressTracker } from "@/lib/progress-tracker";
+import { buildTranslationCacheKeyInputFromRuntime } from "@/lib/translation-cache-key";
 
 /**
  * GET /api/translate/check-resume
@@ -13,18 +14,35 @@ import { ProgressTracker } from "@/lib/progress-tracker";
  */
 export async function POST(request: NextRequest) {
     try {
-        const { fileHash, targetLang, sourceMarkdown } = await request.json();
+        const {
+            fileHash,
+            targetLang,
+            sourceMarkdown,
+            providerId,
+            model,
+            providerProfile,
+            extraTerms,
+        } = await request.json();
 
-        if (!fileHash || !targetLang || !sourceMarkdown) {
+        if (!fileHash || !targetLang || !sourceMarkdown || !providerId || !model) {
             return NextResponse.json({
                 error: "Missing required parameters"
             }, { status: 400 });
         }
 
-        const tracker = new ProgressTracker(fileHash, targetLang);
+        const tracker = new ProgressTracker(buildTranslationCacheKeyInputFromRuntime({
+            fileHash,
+            targetLang,
+            providerId,
+            model,
+            providerProfile: providerProfile?.providerType ? providerProfile : undefined,
+            glossaryTerms: Array.isArray(extraTerms) ? extraTerms : [],
+            translateMode: providerProfile?.providerType === "deeplx" ? "deeplx" : "default",
+            outputMode: "plain",
+        }));
 
         // Check if full translation exists
-        if (tracker.hasFullCache()) {
+        if (await tracker.hasFullCache()) {
             return NextResponse.json({
                 canResume: false,
                 reason: 'complete',
@@ -32,8 +50,24 @@ export async function POST(request: NextRequest) {
             });
         }
 
+        const activeJob = await tracker.readActiveJob();
+        if (activeJob) {
+            const progress = await tracker.readProgress();
+            return NextResponse.json({
+                canResume: false,
+                reason: 'active_job',
+                message: 'Another translation job is still active for this cache key',
+                activeJobId: activeJob.jobId,
+                completedChunks: progress?.completedChunks ?? 0,
+                totalChunks: progress?.totalChunks ?? 0,
+                percentage: progress && progress.totalChunks > 0
+                    ? Math.floor((progress.completedChunks / progress.totalChunks) * 100)
+                    : 0,
+            });
+        }
+
         // Check for partial cache
-        if (!tracker.hasPartialCache()) {
+        if (!await tracker.hasPartialCache()) {
             return NextResponse.json({
                 canResume: false,
                 reason: 'no_progress',
@@ -42,7 +76,7 @@ export async function POST(request: NextRequest) {
         }
 
         // Validate partial cache
-        if (!tracker.validatePartialCache(sourceMarkdown)) {
+        if (!await tracker.validatePartialCache(sourceMarkdown)) {
             return NextResponse.json({
                 canResume: false,
                 reason: 'invalid',
@@ -51,7 +85,7 @@ export async function POST(request: NextRequest) {
         }
 
         // Get progress info
-        const progress = tracker.readProgress();
+        const progress = await tracker.readProgress();
         if (!progress) {
             return NextResponse.json({
                 canResume: false,
@@ -62,6 +96,7 @@ export async function POST(request: NextRequest) {
 
         return NextResponse.json({
             canResume: true,
+            jobId: progress.jobId ?? null,
             completedChunks: progress.completedChunks,
             totalChunks: progress.totalChunks,
             percentage: Math.floor((progress.completedChunks / progress.totalChunks) * 100),

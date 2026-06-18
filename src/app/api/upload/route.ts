@@ -2,13 +2,24 @@ import { NextRequest, NextResponse } from "next/server";
 import {
     buildMinerUFileEntry,
     getMinerUBatchUploadOptionsFromEnv,
+    isMinerUUpstreamError,
     MinerUClient,
 } from "@/lib/mineru-client";
 import { computeFileHash } from "@/lib/cache";
 import { normalizeMarkdownMathForDisplay } from "@/lib/markdown-normalizer";
-import { findPreferredRelativeFilePath } from "@/lib/upload-artifacts";
-import fs from "fs";
+import { buildMediaDeliveryUrl, signInternalMediaUrlsInMarkdown } from "@/lib/media-access";
+import { grantFileHashAccess } from "@/lib/media-session";
+import { findUploadArtifactPaths } from "@/lib/upload-artifacts";
+import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
+
+const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+function getMaxPdfUploadBytes(): number {
+    const parsed = Number.parseInt(process.env.MAX_PDF_UPLOAD_BYTES || "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
+}
 
 export async function POST(request: NextRequest) {
     try {
@@ -19,69 +30,81 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
         }
 
+        if (file.type && file.type !== "application/pdf") {
+            return NextResponse.json({ error: "Only PDF files are supported" }, { status: 400 });
+        }
+
+        const maxUploadBytes = getMaxPdfUploadBytes();
+        if (file.size > maxUploadBytes) {
+            return NextResponse.json({
+                error: `PDF is too large. Maximum allowed size is ${Math.floor(maxUploadBytes / (1024 * 1024))}MB.`,
+                errorCode: "FILE_TOO_LARGE",
+                maxUploadBytes,
+                actualBytes: file.size,
+            }, { status: 413 });
+        }
+
         // 读取文件内容并计算哈希
         const arrayBuffer = await file.arrayBuffer();
         const fileHash = computeFileHash(arrayBuffer);
 
-        console.log(`File: ${file.name}, Hash: ${fileHash} `);
-
         // Check for existing files in uploads/[hash]
-        const uploadsRoot = path.join(process.cwd(), 'uploads');
+        const uploadsRoot = getUploadsRoot();
         // Need to calculate hash earlier to check cache (already done above)
 
         const uploadDir = path.join(uploadsRoot, fileHash);
 
         // Ensure directory exists
-        if (!fs.existsSync(uploadDir)) {
-            fs.mkdirSync(uploadDir, { recursive: true });
-        }
+        await mkdir(uploadDir, { recursive: true });
 
         // 1. IMPROVEMENT: Immediate Persistence
         // Save original file immediately as 'original.pdf'
         // This ensures frontend can access /api/media/[hash]/original.pdf right away
         const originalPdfPath = path.join(uploadDir, 'original.pdf');
-        if (!fs.existsSync(originalPdfPath)) {
+        try {
             const buffer = Buffer.from(arrayBuffer);
-            fs.writeFileSync(originalPdfPath, buffer);
-            console.log(`Saved original.pdf to ${originalPdfPath}`);
+            await writeFile(originalPdfPath, buffer, { flag: "wx" });
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+                throw error;
+            }
         }
 
         const mdPath = path.join(uploadDir, 'full.md');
 
-        if (fs.existsSync(mdPath)) {
-            console.log(`Cache hit (filesystem) for ${file.name} (${fileHash})`);
-            const cachedMarkdown = normalizeMarkdownMathForDisplay(fs.readFileSync(mdPath, 'utf-8'));
+        try {
+            const cachedMarkdown = signInternalMediaUrlsInMarkdown(
+                normalizeMarkdownMathForDisplay(await readFile(mdPath, "utf-8")),
+                fileHash
+            );
 
             // Check for layout.json in filesystem (preferred for client-side rendering)
             let layoutJsonUrl = null;
             let layoutUrl = null;
 
-            const layoutJsonPath = findPreferredRelativeFilePath(
-                uploadDir,
-                (relativePath, fileName) => fileName === "layout.json" || relativePath.endsWith("/layout.json")
-            );
-            if (layoutJsonPath) {
-                layoutJsonUrl = `/api/media/${fileHash}/${layoutJsonPath}`;
+            const { layoutJsonRelativePath, layoutPdfRelativePath } = await findUploadArtifactPaths(uploadDir);
+            if (layoutJsonRelativePath) {
+                layoutJsonUrl = buildMediaDeliveryUrl(fileHash, layoutJsonRelativePath);
             }
 
-            const layoutPdfPath = findPreferredRelativeFilePath(
-                uploadDir,
-                (relativePath, fileName) => fileName === "layout.pdf" || fileName.endsWith("_layout.pdf") || relativePath.endsWith("/layout.pdf")
-            );
-            if (layoutPdfPath) {
-                layoutUrl = `/api/media/${fileHash}/${layoutPdfPath}`;
+            if (layoutPdfRelativePath) {
+                layoutUrl = buildMediaDeliveryUrl(fileHash, layoutPdfRelativePath);
             }
 
-            return NextResponse.json({
+            const response = NextResponse.json({
                 status: "cached",
                 fileHash,
                 markdown: cachedMarkdown,
                 layoutUrl,
                 layoutJsonUrl
             });
+            grantFileHashAccess(request, response, fileHash);
+            return response;
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+                throw error;
+            }
         }
-
-        console.log(`Cache miss for ${file.name}, uploading to MinerU...`);
 
         // 无缓存，执行 MinerU 上传流程
         const apiKey = process.env.MINERU_API_KEY;
@@ -97,8 +120,6 @@ export async function POST(request: NextRequest) {
             getMinerUBatchUploadOptionsFromEnv()
         );
 
-        console.log("MinerU applyBatchUpload response:", JSON.stringify(batchResult, null, 2));
-
         const { batch_id, file_urls } = batchResult;
 
         if (!file_urls || file_urls.length === 0) {
@@ -106,21 +127,33 @@ export async function POST(request: NextRequest) {
         }
 
         const uploadUrl = file_urls[0];
-        console.log("Upload URL:", uploadUrl);
 
         // Step 2: Upload file to signed URL
         await client.uploadFileToUrl(uploadUrl, arrayBuffer);
 
         // Return batch_id and fileHash for polling and caching
-        return NextResponse.json({
+        const response = NextResponse.json({
             batchId: batch_id,
             fileHash,
             fileName: file.name,
             status: "uploaded"
         });
+        grantFileHashAccess(request, response, fileHash);
+        return response;
 
     } catch (error: unknown) {
-        console.error("Upload handler error:", error);
+        console.error("Upload handler error:", error instanceof Error ? error.message : error);
+
+        if (isMinerUUpstreamError(error)) {
+            return NextResponse.json(
+                {
+                    error: error.message,
+                    retryable: error.retryable,
+                },
+                { status: error.retryable ? 502 : (error.statusCode || 500) }
+            );
+        }
+
         return NextResponse.json(
             { error: error instanceof Error ? error.message : "Internal Server Error" },
             { status: 500 }

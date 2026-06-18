@@ -1,3 +1,8 @@
+// 模块级 LRU 缓存：避免对同一文本重复执行开销较大的数学表达式正规化。
+// streaming 阶段文本频繁追加，finalize 后文本稳定，缓存可完全命中。
+const _normalizeMathCache = new Map<string, string>();
+const _NORMALIZE_MATH_CACHE_MAX = 512;
+
 const DISPLAY_MATH_ENVIRONMENTS = new Set([
     'aligned',
     'align',
@@ -124,7 +129,7 @@ function looksLikeBareLatexContinuationLine(line: string): boolean {
     return (startsLikeContinuation && (hasLatexCommands || hasMathStructure)) || (hasLatexCommands && hasMathStructure);
 }
 
-export function normalizeMarkdownMathForDisplay(markdown: string): string {
+function _normalizeMarkdownMathForDisplayCore(markdown: string): string {
     if (!/[\\$]/.test(markdown)) {
         return markdown;
     }
@@ -217,4 +222,29 @@ export function normalizeMarkdownMathForDisplay(markdown: string): string {
     }
 
     return output.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+export function normalizeMarkdownMathForDisplay(markdown: string): string {
+    // 快速路径：不含 LaTeX 标记，直接返回原字符串（与内部实现保持一致）。
+    if (!/[\\$]/.test(markdown)) {
+        return markdown;
+    }
+
+    const cached = _normalizeMathCache.get(markdown);
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    const result = _normalizeMarkdownMathForDisplayCore(markdown);
+
+    // LRU 淘汰：超出容量时删除最早插入的条目。
+    _normalizeMathCache.set(markdown, result);
+    if (_normalizeMathCache.size > _NORMALIZE_MATH_CACHE_MAX) {
+        const oldestKey = _normalizeMathCache.keys().next().value as string | undefined;
+        if (oldestKey !== undefined) {
+            _normalizeMathCache.delete(oldestKey);
+        }
+    }
+
+    return result;
 }

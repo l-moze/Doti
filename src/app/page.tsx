@@ -34,6 +34,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 
 interface TocItem {
   level: number;
@@ -121,34 +122,97 @@ function getServerOnlineSnapshot() {
   return true;
 }
 
+function renderProgressiveStatus(itemStatus: string, itemProgress: number) {
+  const activeIndex =
+    itemStatus === 'uploading' ? 0 :
+      ['parsing', 'parsed'].includes(itemStatus) ? 1 :
+        ['translating', 'completed'].includes(itemStatus) ? 2 :
+          -1;
+
+  return (
+    <div className="mt-2 space-y-1">
+      <div className="flex items-center gap-1 text-[10px]">
+        <span className={itemStatus !== 'idle' ? 'text-emerald-600' : 'text-slate-400'}>
+          {itemStatus !== 'idle' ? '●' : '○'} 上传
+        </span>
+        <span className="text-slate-300">/</span>
+        <span className={activeIndex >= 1 ? (itemStatus === 'parsing' ? 'text-sky-600' : 'text-emerald-600') : 'text-slate-400'}>
+          {itemStatus === 'parsing' ? '◐' : activeIndex >= 1 ? '●' : '○'} 解析
+        </span>
+        <span className="text-slate-300">/</span>
+        <span className={activeIndex >= 2 ? (itemStatus === 'translating' ? 'text-sky-600' : 'text-emerald-600') : 'text-slate-400'}>
+          {itemStatus === 'translating' ? '◐' : itemStatus === 'completed' ? '●' : '○'} 翻译
+        </span>
+      </div>
+      <div className="text-[10px] text-slate-500">
+        {itemStatus === 'uploading' && '文件进入服务端队列'}
+        {itemStatus === 'parsing' && `MinerU 处理中 (${Math.round(itemProgress)}%)`}
+        {itemStatus === 'parsed' && '已生成 Markdown，等待翻译'}
+        {itemStatus === 'translating' && '翻译任务进行中'}
+        {itemStatus === 'completed' && '阅读稿已就绪'}
+        {itemStatus === 'error' && '任务异常'}
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const {
     file,
     status,
     progress,
-    setFile,
-    startUpload,
-    startTranslation,
-    reset,
     sourceMarkdown,
-    targetMarkdown,
-    setHighlightedBlock,
     history,
-    loadFromHistory,
-    hydrateStore,
     fileHash,
+    batchId,
     resumableTranslation,
-    resumeTranslation,
-    restartTranslation,
     isZenMode,
-    toggleZenMode,
-    importFromArxiv,
     activeFileName,
     targetLang,
-    setTargetLang,
     translationStatus,
     error,
-  } = useTranslationStore();
+  } = useTranslationStore(useShallow((state) => ({
+    file: state.file,
+    status: state.status,
+    progress: state.progress,
+    sourceMarkdown: state.sourceMarkdown,
+    history: state.history,
+    fileHash: state.fileHash,
+    batchId: state.batchId,
+    resumableTranslation: state.resumableTranslation,
+    isZenMode: state.isZenMode,
+    activeFileName: state.activeFileName,
+    targetLang: state.targetLang,
+    translationStatus: state.translationStatus,
+    error: state.error,
+  })));
+  const {
+    setFile,
+    retryParsing,
+    startTranslation,
+    reset,
+    setHighlightedBlock,
+    loadFromHistory,
+    hydrateStore,
+    resumeTranslation,
+    restartTranslation,
+    toggleZenMode,
+    importFromArxiv,
+    setTargetLang,
+  } = useTranslationStore(useShallow((state) => ({
+    setFile: state.setFile,
+    retryParsing: state.retryParsing,
+    startTranslation: state.startTranslation,
+    reset: state.reset,
+    setHighlightedBlock: state.setHighlightedBlock,
+    loadFromHistory: state.loadFromHistory,
+    hydrateStore: state.hydrateStore,
+    resumeTranslation: state.resumeTranslation,
+    restartTranslation: state.restartTranslation,
+    toggleZenMode: state.toggleZenMode,
+    importFromArxiv: state.importFromArxiv,
+    setTargetLang: state.setTargetLang,
+  })));
 
   const [sidebarTab, setSidebarTab] = useState<'files' | 'outline'>('outline');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -166,7 +230,18 @@ export default function Home() {
     getOnlineSnapshot,
     getServerOnlineSnapshot
   );
-  const { projection: sourceProjection } = useDocumentSemanticProjection(fileHash, sourceMarkdown);
+  const hasSourceSnapshot = Boolean(sourceMarkdown.trim());
+  const isRecoverableParseTask = Boolean(
+    batchId &&
+    fileHash &&
+    (status === 'parsing' || (status === 'error' && !hasSourceSnapshot))
+  );
+  const effectiveSourceMarkdown = isRecoverableParseTask ? '' : sourceMarkdown;
+  const { projection: sourceProjection } = useDocumentSemanticProjection(fileHash, effectiveSourceMarkdown);
+  const hasCurrentFileInHistory = useMemo(
+    () => (file ? history.some((item) => item.fileName === file.name) : false),
+    [file, history]
+  );
 
   useEffect(() => {
     if (didRehydrateStoreRef.current) return;
@@ -191,24 +266,31 @@ export default function Home() {
     if (sourceProjection?.toc.length) {
       return sourceProjection.toc;
     }
-    return extractToc(sourceMarkdown);
-  }, [sourceMarkdown, sourceProjection]);
-  const hasParsedDocument = Boolean(sourceMarkdown.trim());
-  const hasFinishedTranslation = Boolean(targetMarkdown.trim());
+    return extractToc(effectiveSourceMarkdown);
+  }, [effectiveSourceMarkdown, sourceProjection]);
+  const hasParsedDocument = Boolean(effectiveSourceMarkdown.trim());
+  const canRetryPendingParse = Boolean(batchId && fileHash);
   const translationControlState = useMemo<TranslationControlState>(() => {
     if (!hasParsedDocument) return 'unparsed';
     if (status === 'translating') return 'active';
-    if (hasFinishedTranslation) return 'completed';
     if (resumableTranslation?.canResume) return 'resumable';
+    if (status === 'completed') return 'completed';
     return 'untranslated';
-  }, [hasFinishedTranslation, hasParsedDocument, resumableTranslation?.canResume, status]);
+  }, [hasParsedDocument, resumableTranslation?.canResume, status]);
+
+  const displayedProgress = useMemo(() => {
+    if (status === 'error') {
+      return Math.min(Math.max(progress, 0), 99);
+    }
+    return Math.min(Math.max(progress, 0), 100);
+  }, [progress, status]);
   const showRestartControl = (translationControlState === 'resumable' || translationControlState === 'completed') && status !== 'translating';
   const translationControlMeta = useMemo<TranslationControlMeta>(() => {
     if (translationControlState === 'unparsed') {
       if (status === 'uploading' || status === 'parsing') {
         return {
           title: '解析中',
-          detail: `${Math.round(progress)}%`,
+          detail: `${Math.round(displayedProgress)}%`,
           tone: 'slate' as const,
           actionable: false,
           disabled: true,
@@ -217,13 +299,15 @@ export default function Home() {
       }
 
       return {
-        title: status === 'error' ? '重新解析' : '解析',
-        detail: file ? undefined : '等待文件',
+        title: status === 'error' ? (canRetryPendingParse ? '继续解析' : '重新解析') : '解析',
+        detail: status === 'error'
+          ? (canRetryPendingParse ? '恢复当前解析任务' : file ? undefined : '等待文件')
+          : file ? undefined : '等待文件',
         tone: 'slate' as const,
         actionable: true,
-        disabled: !file || !isOnline,
+        disabled: (!file && !canRetryPendingParse) || !isOnline,
         icon: status === 'error' ? 'refresh' as const : 'play' as const,
-        onClick: () => void startUpload(),
+        onClick: () => void retryParsing(),
       };
     }
 
@@ -242,7 +326,7 @@ export default function Home() {
     if (translationControlState === 'active') {
       return {
         title: '翻译中',
-        detail: `${Math.round(progress)}%`,
+        detail: `${Math.round(displayedProgress)}%`,
         tone: 'amber' as const,
         actionable: false,
         disabled: true,
@@ -263,21 +347,22 @@ export default function Home() {
 
     return {
       title: '翻译',
-      detail: targetLang,
+      detail: status === 'error' ? '可重试' : targetLang,
       tone: 'emerald' as const,
       actionable: true,
       disabled: !isOnline,
-      icon: 'play' as const,
+      icon: status === 'error' ? 'refresh' as const : 'play' as const,
       onClick: () => void startTranslation(),
     };
   }, [
     file,
+    canRetryPendingParse,
+    displayedProgress,
     isOnline,
     resumeTranslation,
     resumableTranslation?.percentage,
     startTranslation,
-    startUpload,
-    progress,
+    retryParsing,
     status,
     targetLang,
     translationControlState,
@@ -290,6 +375,21 @@ export default function Home() {
       setFile(droppedFile);
     }
   }, [setFile]);
+
+  const handleFileInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = event.target.files?.[0];
+    if (selectedFile) {
+      setFile(selectedFile);
+    }
+  }, [setFile]);
+
+  const handleTocItemClick = useCallback((semanticId: string) => {
+    if (useTranslationStore.getState().highlightedBlockId === semanticId) {
+      return;
+    }
+
+    setHighlightedBlock(semanticId);
+  }, [setHighlightedBlock]);
 
   const openTranslationContextMenu = useCallback((event: React.MouseEvent<HTMLElement | HTMLDivElement>) => {
     event.preventDefault();
@@ -307,8 +407,8 @@ export default function Home() {
 
   const handleStartParsing = useCallback(() => {
     setTranslationContextMenu(null);
-    void startUpload();
-  }, [startUpload]);
+    void retryParsing();
+  }, [retryParsing]);
 
   const handleStartFreshTranslation = useCallback(() => {
     setTranslationContextMenu(null);
@@ -336,8 +436,8 @@ export default function Home() {
       return [
         {
           key: 'parse',
-          label: status === 'error' ? '重新解析' : '解析',
-          disabled: !file || !isOnline || status === 'uploading' || status === 'parsing',
+          label: status === 'error' ? (canRetryPendingParse ? '继续解析' : '重新解析') : '解析',
+          disabled: ((!file && !canRetryPendingParse) || !isOnline || status === 'uploading' || status === 'parsing'),
           tone: 'default' as const,
           onSelect: handleStartParsing,
         },
@@ -398,6 +498,7 @@ export default function Home() {
     ];
   }, [
     file,
+    canRetryPendingParse,
     handleOpenRestartConfirm,
     handleResumeExistingTranslation,
     handleStartFreshTranslation,
@@ -444,40 +545,6 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [fileHash, status, targetLang]);
 
-  const renderProgressiveStatus = (itemStatus: string, itemProgress: number) => {
-    const activeIndex =
-      itemStatus === 'uploading' ? 0 :
-        ['parsing', 'parsed'].includes(itemStatus) ? 1 :
-          ['translating', 'completed'].includes(itemStatus) ? 2 :
-            -1;
-
-    return (
-      <div className="mt-2 space-y-1">
-        <div className="flex items-center gap-1 text-[10px]">
-          <span className={itemStatus !== 'idle' ? 'text-emerald-600' : 'text-slate-400'}>
-            {itemStatus !== 'idle' ? '●' : '○'} 上传
-          </span>
-          <span className="text-slate-300">/</span>
-          <span className={activeIndex >= 1 ? (itemStatus === 'parsing' ? 'text-sky-600' : 'text-emerald-600') : 'text-slate-400'}>
-            {itemStatus === 'parsing' ? '◐' : activeIndex >= 1 ? '●' : '○'} 解析
-          </span>
-          <span className="text-slate-300">/</span>
-          <span className={activeIndex >= 2 ? (itemStatus === 'translating' ? 'text-sky-600' : 'text-emerald-600') : 'text-slate-400'}>
-            {itemStatus === 'translating' ? '◐' : itemStatus === 'completed' ? '●' : '○'} 翻译
-          </span>
-        </div>
-        <div className="text-[10px] text-slate-500">
-          {itemStatus === 'uploading' && '文件进入服务端队列'}
-          {itemStatus === 'parsing' && `MinerU 处理中 (${Math.round(itemProgress)}%)`}
-          {itemStatus === 'parsed' && '已生成 Markdown，等待翻译'}
-          {itemStatus === 'translating' && '翻译任务进行中'}
-          {itemStatus === 'completed' && '阅读稿已就绪'}
-          {itemStatus === 'error' && '任务异常'}
-        </div>
-      </div>
-    );
-  };
-
   return (
     <>
       <main className="flex h-screen flex-col bg-[radial-gradient(circle_at_top_left,_#dbeafe,_transparent_24%),radial-gradient(circle_at_top_right,_#ffedd5,_transparent_22%),#f8fafc]">
@@ -504,11 +571,11 @@ export default function Home() {
               </div>
               {status !== 'idle' && (
                 <div className="inline-flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 shadow-sm">
-                  <span>{Math.round(progress)}%</span>
+                  <span>{Math.round(displayedProgress)}%</span>
                   <div className="h-2 w-24 overflow-hidden rounded-full bg-slate-100">
                     <div
                       className="h-full rounded-full bg-slate-900 transition-all duration-300"
-                      style={{ width: `${Math.min(100, Math.max(progress, 0))}%` }}
+                      style={{ width: `${displayedProgress}%` }}
                     />
                   </div>
                 </div>
@@ -546,7 +613,7 @@ export default function Home() {
                   accept=".pdf"
                   className="hidden"
                   id="file-upload"
-                  onChange={(event) => event.target.files?.[0] && setFile(event.target.files[0])}
+                  onChange={handleFileInputChange}
                 />
                 <Upload size={15} />
                 <label htmlFor="file-upload" className="cursor-pointer truncate">
@@ -733,7 +800,7 @@ export default function Home() {
                 <div className="min-h-0 flex-1 overflow-y-auto p-3">
                   {sidebarTab === 'files' ? (
                     <div className="space-y-3">
-                      {status === 'idle' && file && !history.some((item) => item.fileName === file.name) && (
+                      {status === 'idle' && file && !hasCurrentFileInHistory && (
                         <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
                           <div className="flex items-center gap-2">
                             <FileText size={14} className="text-slate-700" />
@@ -771,7 +838,7 @@ export default function Home() {
                           className="flex w-full items-start gap-2 rounded-2xl px-2 py-2 text-left text-xs transition hover:bg-slate-50"
                           style={{ paddingLeft: `${(item.level - 1) * 14 + 8}px` }}
                           title={item.text}
-                          onClick={() => setHighlightedBlock(item.semanticId)}
+                          onClick={() => handleTocItemClick(item.semanticId)}
                         >
                           <Hash size={11} className="mt-0.5 shrink-0 text-slate-400" />
                           <span className={item.level === 1 ? 'font-semibold text-slate-900' : 'text-slate-500'}>

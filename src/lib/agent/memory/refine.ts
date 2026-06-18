@@ -14,6 +14,11 @@ export interface RefinedContext {
     preservedFragments: PreservedMarkdownFragment[];
 }
 
+export interface RefineProcessOptions {
+    preserveInlineMath?: boolean;
+    includePreviousContext?: boolean;
+}
+
 export class RefineModule {
 
     /**
@@ -21,7 +26,12 @@ export class RefineModule {
      * @param chunk The identifying chunk.
      * @param previousTranslation The full or partial translated text of the previous chunk.
      */
-    async process(chunk: Chunk, previousTranslation: string, extraTerms: Term[] = []): Promise<RefinedContext> {
+    async process(
+        chunk: Chunk,
+        previousTranslation: string,
+        extraTerms: Term[] = [],
+        options: RefineProcessOptions = {}
+    ): Promise<RefinedContext> {
         // 1. Retrieve Terminology
         // We ensure terms are loaded (lazy load check)
         await terminologyStore.load();
@@ -30,14 +40,18 @@ export class RefineModule {
             chunk.content.toLowerCase().includes(term.source.toLowerCase())
         );
         const terms = dedupeTerms([...matchedExtraTerms, ...builtInTerms]);
-        const { text: protectedSourceText, fragments: preservedFragments } = protectMarkdownFragments(chunk.content);
+        const { text: protectedSourceText, fragments: preservedFragments } = protectMarkdownFragments(chunk.content, {
+            preserveInlineMath: options.preserveInlineMath ?? true,
+        });
 
         // 2. Extract Previous Context
         // Take the last 500 characters of the previous translation to help with flow
         const contextLength = 500;
-        const prevContextSnippet = previousTranslation
-            ? previousTranslation.slice(-contextLength)
-            : "";
+        const prevContextSnippet = options.includePreviousContext === false
+            ? ""
+            : previousTranslation
+                ? previousTranslation.slice(-contextLength)
+                : "";
 
         return {
             chunkId: chunk.id,

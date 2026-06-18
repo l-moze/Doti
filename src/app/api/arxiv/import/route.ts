@@ -2,12 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import {
     buildMinerUFileEntry,
     getMinerUBatchUploadOptionsFromEnv,
+    isMinerUUpstreamError,
     MinerUClient,
 } from "@/lib/mineru-client";
 import { computeFileHash } from "@/lib/cache";
+import { buildMediaDeliveryUrl, signInternalMediaUrlsInMarkdown } from "@/lib/media-access";
+import { grantFileHashAccess } from "@/lib/media-session";
 import { normalizeMarkdownMathForDisplay } from "@/lib/markdown-normalizer";
-import { findPreferredRelativeFilePath } from "@/lib/upload-artifacts";
-import fs from "fs";
+import { findUploadArtifactPaths, readTextFileIfExists } from "@/lib/upload-artifacts";
+import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 
 interface ArxivMetadata {
@@ -100,32 +104,33 @@ export async function POST(request: NextRequest) {
 
         const arrayBuffer = await pdfResponse.arrayBuffer();
         const fileHash = computeFileHash(arrayBuffer);
-        const uploadsRoot = path.join(process.cwd(), "uploads");
+        const uploadsRoot = getUploadsRoot();
         const uploadDir = path.join(uploadsRoot, fileHash);
-        fs.mkdirSync(uploadDir, { recursive: true });
+        await mkdir(uploadDir, { recursive: true });
 
         const originalPdfPath = path.join(uploadDir, "original.pdf");
-        if (!fs.existsSync(originalPdfPath)) {
-            fs.writeFileSync(originalPdfPath, Buffer.from(arrayBuffer));
+        try {
+            await writeFile(originalPdfPath, Buffer.from(arrayBuffer), { flag: "wx" });
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+                throw error;
+            }
         }
 
-        const mdPath = path.join(uploadDir, "full.md");
-        if (fs.existsSync(mdPath)) {
-            const cachedMarkdown = normalizeMarkdownMathForDisplay(fs.readFileSync(mdPath, "utf-8"));
-            const layoutJsonPath = findPreferredRelativeFilePath(
-                uploadDir,
-                (relativePath, fileName) => fileName === "layout.json" || relativePath.endsWith("/layout.json")
-            );
-            const layoutJsonUrl = layoutJsonPath ? `/api/media/${fileHash}/${layoutJsonPath}` : null;
+        const { markdownRelativePath, layoutJsonRelativePath, layoutPdfRelativePath } = await findUploadArtifactPaths(uploadDir);
+        const cachedMarkdownRaw = await readTextFileIfExists(
+            markdownRelativePath ? path.join(uploadDir, markdownRelativePath) : null
+        );
 
-            const layoutPdfPath = findPreferredRelativeFilePath(
-                uploadDir,
-                (relativePath, fileName) =>
-                    fileName === "layout.pdf" || fileName.endsWith("_layout.pdf") || relativePath.endsWith("/layout.pdf")
+        if (cachedMarkdownRaw.trim()) {
+            const cachedMarkdown = signInternalMediaUrlsInMarkdown(
+                normalizeMarkdownMathForDisplay(cachedMarkdownRaw),
+                fileHash
             );
-            const layoutUrl = layoutPdfPath ? `/api/media/${fileHash}/${layoutPdfPath}` : null;
+            const layoutJsonUrl = layoutJsonRelativePath ? buildMediaDeliveryUrl(fileHash, layoutJsonRelativePath) : null;
+            const layoutUrl = layoutPdfRelativePath ? buildMediaDeliveryUrl(fileHash, layoutPdfRelativePath) : null;
 
-            return NextResponse.json({
+            const response = NextResponse.json({
                 status: "cached",
                 fileHash,
                 fileName: safePdfFileName(metadata),
@@ -134,6 +139,8 @@ export async function POST(request: NextRequest) {
                 layoutJsonUrl,
                 metadata,
             });
+            grantFileHashAccess(request, response, fileHash);
+            return response;
         }
 
         const apiKey = process.env.MINERU_API_KEY;
@@ -155,14 +162,26 @@ export async function POST(request: NextRequest) {
 
         await client.uploadFileToUrl(uploadUrl, arrayBuffer);
 
-        return NextResponse.json({
+        const response = NextResponse.json({
             status: "uploaded",
             batchId: batchResult.batch_id,
             fileHash,
             fileName,
             metadata,
         });
+        grantFileHashAccess(request, response, fileHash);
+        return response;
     } catch (error) {
+        if (isMinerUUpstreamError(error)) {
+            return NextResponse.json(
+                {
+                    error: error.message,
+                    retryable: error.retryable,
+                },
+                { status: error.retryable ? 502 : (error.statusCode || 500) }
+            );
+        }
+
         const message = error instanceof Error ? error.message : "Internal Server Error";
         return NextResponse.json({ error: message }, { status: 500 });
     }

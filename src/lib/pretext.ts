@@ -5,7 +5,10 @@ import {
     measureLineStats,
     prepareWithSegments,
     type PreparedTextWithSegments,
+    clearCache as clearPretextEngineCache,
 } from "@chenglou/pretext";
+
+export { clearPretextEngineCache };
 
 export type PretextOptions = {
     whiteSpace?: "normal" | "pre-wrap";

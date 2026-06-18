@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { DocumentSemanticProjection } from '@/lib/document-semantic';
 
 type UseDocumentSemanticProjectionResult = {
@@ -16,13 +16,32 @@ export function useDocumentSemanticProjection(
     const [projection, setProjection] = useState<DocumentSemanticProjection | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const projectionCacheRef = useRef(new Map<string, {
+        projection: DocumentSemanticProjection;
+        markdownSignature: string | null;
+    }>());
 
     useEffect(() => {
-        if (!fileHash || !sourceMarkdown.trim()) {
+        const normalizedMarkdown = sourceMarkdown.trim();
+
+        if (!fileHash) {
             setProjection(null);
             setLoading(false);
             setError(null);
             return;
+        }
+
+        const cachedEntry = projectionCacheRef.current.get(fileHash);
+        if (cachedEntry) {
+            const isStructuredProjection = cachedEntry.projection.source !== 'markdown';
+            const sameMarkdown = cachedEntry.markdownSignature === normalizedMarkdown;
+
+            if (isStructuredProjection || sameMarkdown) {
+                setProjection((current) => current === cachedEntry.projection ? current : cachedEntry.projection);
+                setLoading(false);
+                setError(null);
+                return;
+            }
         }
 
         const controller = new AbortController();
@@ -33,15 +52,21 @@ export function useDocumentSemanticProjection(
             setError(null);
 
             try {
+                const requestBody: {
+                    fileHash: string;
+                    sourceMarkdown?: string;
+                } = { fileHash };
+
+                if (normalizedMarkdown && (!cachedEntry || cachedEntry.projection.source === 'markdown')) {
+                    requestBody.sourceMarkdown = normalizedMarkdown;
+                }
+
                 const response = await fetch('/api/document-semantic', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        fileHash,
-                        sourceMarkdown,
-                    }),
+                    body: JSON.stringify(requestBody),
                     signal: controller.signal,
                 });
 
@@ -52,6 +77,10 @@ export function useDocumentSemanticProjection(
                 const nextProjection = await response.json() as DocumentSemanticProjection;
                 if (cancelled) return;
 
+                projectionCacheRef.current.set(fileHash, {
+                    projection: nextProjection,
+                    markdownSignature: nextProjection.source === 'markdown' ? normalizedMarkdown : null,
+                });
                 setProjection(nextProjection);
                 setLoading(false);
             } catch (fetchError) {

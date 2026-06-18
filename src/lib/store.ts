@@ -18,12 +18,17 @@ import {
     type TranslationMarkdownBlock,
 } from './translation-runtime';
 import {
+    buildTranslationArtifactBaseName,
+    buildTranslationCacheKeyInputFromRuntime,
+} from './translation-cache-key';
+import {
     runPaperPolishRules,
     type PaperPolishIssue,
     type PaperPolishIssueWindow,
     type PaperPolishMode,
     type PaperPolishResidualIssue,
 } from './paper-polish';
+import { clearPretextEngineCache } from './pretext';
 
 export type TaskStatus = 'idle' | 'uploading' | 'parsing' | 'parsed' | 'translating' | 'completed' | 'error';
 export type TranslationPhase = 'idle' | 'preparing' | 'chunking' | 'refining' | 'streaming' | 'stalled' | 'finalizing' | 'completed' | 'error';
@@ -109,10 +114,13 @@ export interface TranslationState {
         completedChunks: number;
         totalChunks: number;
         percentage: number;
+        jobId?: string | null;
+        activeJobId?: string | null;
     } | null;
     checkResumable: () => Promise<void>;
     resumeTranslation: () => Promise<void>;
     restartTranslation: () => Promise<void>;
+    retryParsing: () => Promise<void>;
     clearResumable: () => void;
 
     // History
@@ -146,6 +154,12 @@ export interface TranslationState {
     setProvider: (providerId: string, model: string) => void;
     setAssistProvider: (providerId: string, model: string) => void;
 }
+
+type PendingChunkMutation = {
+    mode: 'append' | 'replace';
+    text: string;
+    title?: string;
+};
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : 'Unexpected error';
@@ -199,6 +213,14 @@ function sanitizePersistedHistoryItem(item: HistoryItem): HistoryItem {
         ...item,
         status: 'parsed',
     };
+}
+
+function createTranslationJobId(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+
+    return `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function deriveTranslationPhase(message: unknown): TranslationPhase {
@@ -256,6 +278,26 @@ function localizeTranslationStatus(message: unknown, concurrency: number): strin
     return message;
 }
 
+function isRateLimitErrorMessage(message: unknown): boolean {
+    if (typeof message !== 'string') return false;
+
+    const normalized = message.toLowerCase();
+    return (
+        normalized.includes('429') ||
+        normalized.includes('rate limit') ||
+        normalized.includes('too many requests') ||
+        normalized.includes('status_code=429') ||
+        normalized.includes('status code 429') ||
+        normalized.includes('try again in') ||
+        normalized.includes('retry after')
+    );
+}
+
+function clampErrorProgress(progress: number): number {
+    if (!Number.isFinite(progress)) return 0;
+    return Math.max(0, Math.min(Math.floor(progress), 99));
+}
+
 function deriveSourceMarkdownState(markdown: string, autoEnabled: boolean) {
     const normalized = markdown.trim();
     if (!normalized) {
@@ -285,6 +327,37 @@ function deriveSourceMarkdownState(markdown: string, autoEnabled: boolean) {
         polishedSourceMarkdown: result.markdown !== normalized ? result.markdown : '',
         summary: result.summary,
         issues: result.issues,
+    };
+}
+
+function createEmptyDocumentWorkspaceState() {
+    return {
+        sourceMarkdown: '',
+        rawSourceMarkdown: '',
+        polishedSourceMarkdown: '',
+        targetMarkdown: '',
+        translationBlocks: [] as TranslationMarkdownBlock[],
+        translationRunId: null,
+        layoutUrl: null,
+        layoutJsonUrl: null,
+        resumableTranslation: null as TranslationState['resumableTranslation'],
+        highlightedBlockId: null as string | null,
+        translationStatus: '',
+        translationPhase: 'idle' as TranslationPhase,
+        translationLastEventAt: null as number | null,
+        translationConcurrency: 1,
+        error: null as string | null,
+        paperPolishStatus: 'idle' as PaperPolishStatus,
+        paperPolishMode: null as PaperPolishMode | null,
+        paperPolishProgress: 0,
+        paperPolishMessage: '',
+        paperPolishSummary: [] as string[],
+        paperPolishIssues: [] as PaperPolishIssue[],
+        paperPolishResidualIssues: [] as PaperPolishResidualIssue[],
+        paperPolishIssueWindows: [] as PaperPolishIssueWindow[],
+        paperPolishCanUseAiFallback: false,
+        paperPolishUndoSnapshot: null as PaperPolishUndoSnapshot | null,
+        paperPolishUndoExpiresAt: null as number | null,
     };
 }
 
@@ -330,11 +403,110 @@ async function persistActiveDocumentSnapshot(input: {
     });
 }
 
-async function fetchStoredTranslationMarkdown(fileHash: string, targetLang: string): Promise<string> {
+async function resolveMediaUrl(fileHash: string, relativePath: string): Promise<string> {
+    const response = await fetch(
+        `/api/media/sign?fileHash=${encodeURIComponent(fileHash)}&path=${encodeURIComponent(relativePath)}`
+    );
+    if (!response.ok) {
+        throw new Error('Failed to resolve media URL');
+    }
+
+    const data = await response.json();
+    if (!data?.url || typeof data.url !== 'string') {
+        throw new Error('Media URL is missing');
+    }
+
+    return data.url;
+}
+
+async function resolveOptionalMediaUrl(fileHash: string | null, relativePath: string): Promise<string | null> {
+    if (!fileHash) return null;
+
     try {
-        const response = await fetch(`/api/media/${fileHash}/translation-${encodeURIComponent(targetLang)}.md`);
-        if (!response.ok) return '';
-        return await response.text();
+        return await resolveMediaUrl(fileHash, relativePath);
+    } catch (error) {
+        console.warn('[Media] Failed to resolve media URL:', error);
+        return null;
+    }
+}
+
+async function resolveTranslationRuntimeCacheState(input: {
+    fileHash: string;
+    targetLang: string;
+    providerId: string;
+    model: string;
+}): Promise<{
+    providerProfile: Awaited<ReturnType<typeof getProviderProfile>> | undefined;
+    glossaryTerms: Array<{
+        source: string;
+        target: string;
+        category?: string;
+    }>;
+    artifactBaseName: string;
+}> {
+    const providerProfile = input.providerId.startsWith('custom:')
+        ? await getProviderProfile(input.providerId.slice('custom:'.length))
+        : undefined;
+    const glossaryTerms = (await listUserGlossaryRecords())
+        .filter((term) => term.enabled)
+        .map((term) => ({
+            source: term.source,
+            target: term.target,
+            category: term.category,
+        }));
+    const cacheKeyInput = buildTranslationCacheKeyInputFromRuntime({
+        fileHash: input.fileHash,
+        targetLang: input.targetLang,
+        providerId: input.providerId,
+        model: input.model,
+        providerProfile,
+        glossaryTerms,
+        translateMode: providerProfile?.providerType === 'deeplx' ? 'deeplx' : 'default',
+        outputMode: 'plain',
+    });
+
+    return {
+        providerProfile,
+        glossaryTerms,
+        artifactBaseName: buildTranslationArtifactBaseName(cacheKeyInput),
+    };
+}
+
+async function fetchTranslationMarkdownByCandidates(fileHash: string, fileNames: string[]): Promise<string> {
+    let lastError: unknown;
+
+    for (const fileName of fileNames) {
+        try {
+            const mediaUrl = await resolveMediaUrl(fileHash, fileName);
+            const response = await fetch(mediaUrl);
+            if (!response.ok) {
+                continue;
+            }
+            return await response.text();
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    if (lastError) {
+        console.warn('[Translation] Failed to load cached translation:', lastError);
+    }
+
+    return '';
+}
+
+async function fetchStoredTranslationMarkdown(input: {
+    fileHash: string;
+    targetLang: string;
+    providerId: string;
+    model: string;
+}): Promise<string> {
+    try {
+        const { artifactBaseName } = await resolveTranslationRuntimeCacheState(input);
+        return await fetchTranslationMarkdownByCandidates(input.fileHash, [
+            `${artifactBaseName}.md`,
+            `translation-${input.targetLang}.md`,
+        ]);
     } catch (error) {
         console.warn('[Translation] Failed to load cached translation:', error);
         return '';
@@ -346,6 +518,7 @@ export const useTranslationStore = create<TranslationState>()(
         (set, get) => {
             let paperPolishAbortController: AbortController | null = null;
             let paperPolishProgressTimer: ReturnType<typeof setInterval> | null = null;
+            let activeTranslationRequestToken: string | null = null;
 
             const clearPaperPolishProgressTimer = () => {
                 if (!paperPolishProgressTimer) return;
@@ -435,10 +608,35 @@ export const useTranslationStore = create<TranslationState>()(
                 }
 
                 const nextTargetLang = options?.targetLang ?? snapshot.targetLang;
-                const translationMarkdown = await fetchStoredTranslationMarkdown(snapshot.fileHash, nextTargetLang);
+                const knownCompletedTranslation = snapshot.history.some((item) =>
+                    item.fileHash === snapshot.fileHash &&
+                    item.status === 'completed' &&
+                    item.targetLang === nextTargetLang
+                );
+                const shouldProbeStoredTranslation =
+                    (snapshot.targetLang === nextTargetLang && Boolean(snapshot.targetMarkdown.trim())) ||
+                    snapshot.status === 'completed' ||
+                    options?.fallbackStatus === 'completed' ||
+                    knownCompletedTranslation;
+                const translationMarkdown =
+                    snapshot.targetLang === nextTargetLang && snapshot.targetMarkdown.trim()
+                        ? snapshot.targetMarkdown
+                        : shouldProbeStoredTranslation
+                            ? await fetchStoredTranslationMarkdown({
+                                fileHash: snapshot.fileHash,
+                                targetLang: nextTargetLang,
+                                providerId: snapshot.providerId,
+                                model: snapshot.model,
+                            })
+                            : '';
                 const current = get();
 
-                if (current.fileHash !== snapshot.fileHash || current.targetLang !== nextTargetLang) {
+                if (
+                    current.fileHash !== snapshot.fileHash ||
+                    current.targetLang !== nextTargetLang ||
+                    current.providerId !== snapshot.providerId ||
+                    current.model !== snapshot.model
+                ) {
                     return;
                 }
 
@@ -832,6 +1030,7 @@ export const useTranslationStore = create<TranslationState>()(
             loadFromHistory: async (hash: string) => {
                 const item = get().history.find(h => h.fileHash === hash);
                 if (!item) return;
+                const originalPdfUrl = await resolveOptionalMediaUrl(hash, 'original.pdf');
 
                 // Reset state first to show loading
                 set({
@@ -845,7 +1044,7 @@ export const useTranslationStore = create<TranslationState>()(
                     translationConcurrency: 1,
                     highlightedBlockId: null,
                     activeFileName: item.fileName,
-                    fileUrl: `/api/media/${hash}/original.pdf`,
+                    fileUrl: originalPdfUrl,
                     sourceMarkdown: '',
                     rawSourceMarkdown: '',
                     polishedSourceMarkdown: '',
@@ -900,7 +1099,8 @@ export const useTranslationStore = create<TranslationState>()(
                     }
 
                     // Load source markdown (full.md)
-                    const sourceRes = await fetch(`/api/media/${hash}/full.md`);
+                    const sourceUrl = await resolveMediaUrl(hash, 'full.md');
+                    const sourceRes = await fetch(sourceUrl);
                     if (sourceRes.ok) {
                         const sourceText = await sourceRes.text();
                         const parsedState = getParsedMarkdownState(sourceText);
@@ -919,11 +1119,13 @@ export const useTranslationStore = create<TranslationState>()(
                     // Check if layout files exist
                     const knownLayoutJsonUrl = get().layoutJsonUrl;
                     if (!knownLayoutJsonUrl) {
-                        const layoutJsonRes = await fetch(`/api/media/${hash}/layout.json`, { method: 'HEAD' });
+                        const layoutJsonUrl = await resolveMediaUrl(hash, 'layout.json');
+                        const layoutPdfUrl = await resolveMediaUrl(hash, 'layout.pdf');
+                        const layoutJsonRes = await fetch(layoutJsonUrl, { method: 'HEAD' });
                         if (layoutJsonRes.ok) {
                             set({
-                                layoutUrl: `/api/media/${hash}/layout.pdf`,
-                                layoutJsonUrl: `/api/media/${hash}/layout.json`,
+                                layoutUrl: layoutPdfUrl,
+                                layoutJsonUrl: layoutJsonUrl,
                             });
                         }
                     }
@@ -1088,7 +1290,27 @@ export const useTranslationStore = create<TranslationState>()(
             },
 
             setProvider: (providerId, model) => {
-                set({ providerId, model });
+                const previous = get();
+                const fallbackStatus = previous.sourceMarkdown.trim() ? 'parsed' : previous.status;
+                const fallbackProgress = previous.sourceMarkdown.trim() ? 60 : previous.progress;
+
+                set((state) => ({
+                    providerId,
+                    model,
+                    ...(state.status === 'translating'
+                        ? {}
+                        : {
+                            targetMarkdown: '',
+                            translationBlocks: [],
+                            resumableTranslation: null,
+                            error: null,
+                            translationStatus: '',
+                            translationPhase: 'idle' as const,
+                            translationLastEventAt: null,
+                            status: fallbackStatus,
+                            progress: fallbackProgress,
+                        }),
+                }));
                 const current = get();
                 if (!current.fileHash) return;
 
@@ -1115,6 +1337,14 @@ export const useTranslationStore = create<TranslationState>()(
                     targetMarkdown: current.targetMarkdown,
                     layoutJsonUrl: current.layoutJsonUrl,
                 });
+
+                if (current.status !== 'translating') {
+                    void syncTargetLanguageView({
+                        fallbackStatus,
+                        fallbackProgress,
+                        clearError: true,
+                    });
+                }
             },
 
             setAssistProvider: (providerId, model) => {
@@ -1223,7 +1453,16 @@ export const useTranslationStore = create<TranslationState>()(
             },
 
             importFromArxiv: async (input: string) => {
-                set({ status: 'uploading', progress: 5, error: null });
+                set({
+                    ...createEmptyDocumentWorkspaceState(),
+                    file: null,
+                    fileUrl: null,
+                    activeFileName: null,
+                    fileHash: null,
+                    batchId: null,
+                    status: 'uploading',
+                    progress: 5,
+                });
 
                 try {
                     const response = await fetch('/api/arxiv/import', {
@@ -1238,6 +1477,7 @@ export const useTranslationStore = create<TranslationState>()(
                     }
 
                     const importedFileName = data.fileName || `${data.metadata?.arxivId || 'arxiv-paper'}.pdf`;
+                    const originalPdfUrl = await resolveOptionalMediaUrl(data.fileHash, 'original.pdf');
 
                     if (data.status === 'cached') {
                         const parsedState = getParsedMarkdownState(data.markdown || '');
@@ -1256,10 +1496,10 @@ export const useTranslationStore = create<TranslationState>()(
                             translationBlocks: [],
                             translationRunId: null,
                             fileHash: data.fileHash,
-                            fileUrl: `/api/media/${data.fileHash}/original.pdf`,
+                            fileUrl: originalPdfUrl,
                             progress: 60,
                             layoutUrl: data.layoutUrl || null,
-                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
+                            layoutJsonUrl: data.layoutJsonUrl || null,
                             paperPolishStatus: 'idle',
                             paperPolishMode: null,
                             paperPolishProgress: 0,
@@ -1282,7 +1522,7 @@ export const useTranslationStore = create<TranslationState>()(
                             rawSourceMarkdown: parsedState.rawSourceMarkdown,
                             polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
-                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
+                            layoutJsonUrl: data.layoutJsonUrl || null,
                         });
 
                         get().addToHistory({
@@ -1300,32 +1540,14 @@ export const useTranslationStore = create<TranslationState>()(
                     }
 
                     set({
+                        ...createEmptyDocumentWorkspaceState(),
                         file: null,
                         activeFileName: importedFileName,
                         status: 'parsing',
-                        translationStatus: '',
-                        translationPhase: 'idle',
-                        translationLastEventAt: null,
-                        translationConcurrency: 1,
-                        translationBlocks: [],
-                        translationRunId: null,
                         batchId: data.batchId,
                         fileHash: data.fileHash,
-                        fileUrl: `/api/media/${data.fileHash}/original.pdf`,
+                        fileUrl: originalPdfUrl,
                         progress: 30,
-                        rawSourceMarkdown: '',
-                        polishedSourceMarkdown: '',
-                        paperPolishStatus: 'idle',
-                        paperPolishMode: null,
-                        paperPolishProgress: 0,
-                        paperPolishMessage: '',
-                        paperPolishSummary: [],
-                        paperPolishIssues: [],
-                        paperPolishResidualIssues: [],
-                        paperPolishIssueWindows: [],
-                        paperPolishCanUseAiFallback: false,
-                        paperPolishUndoSnapshot: null,
-                        paperPolishUndoExpiresAt: null,
                     });
                     void persistActiveDocumentSnapshot({
                         fileHash: data.fileHash,
@@ -1359,7 +1581,16 @@ export const useTranslationStore = create<TranslationState>()(
                 const { file } = get();
                 if (!file) return;
 
-                set({ status: 'uploading', progress: 10, error: null });
+                set({
+                    ...createEmptyDocumentWorkspaceState(),
+                    file,
+                    fileUrl: get().fileUrl,
+                    activeFileName: file.name,
+                    status: 'uploading',
+                    progress: 10,
+                    fileHash: null,
+                    batchId: null,
+                });
 
                 try {
                     const formData = new FormData();
@@ -1373,6 +1604,7 @@ export const useTranslationStore = create<TranslationState>()(
                     const data = await res.json();
 
                     if (!res.ok) throw new Error(data.error || 'Upload failed');
+                    const originalPdfUrl = await resolveOptionalMediaUrl(data.fileHash || null, 'original.pdf');
 
                     // Handle Cache Hit
                     if (data.status === 'cached') {
@@ -1392,10 +1624,10 @@ export const useTranslationStore = create<TranslationState>()(
                             translationBlocks: [],
                             translationRunId: null,
                             fileHash: data.fileHash,
-                            fileUrl: `/api/media/${data.fileHash}/original.pdf`, // Switch to server URL
+                            fileUrl: originalPdfUrl,
                             progress: 60,
                             layoutUrl: data.layoutUrl || null,
-                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
+                            layoutJsonUrl: data.layoutJsonUrl || null,
                             paperPolishStatus: 'idle',
                             paperPolishMode: null,
                             paperPolishProgress: 0,
@@ -1418,7 +1650,7 @@ export const useTranslationStore = create<TranslationState>()(
                             rawSourceMarkdown: parsedState.rawSourceMarkdown,
                             polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                             targetMarkdown: '',
-                            layoutJsonUrl: data.layoutJsonUrl || `/api/media/${data.fileHash}/layout.json`,
+                            layoutJsonUrl: data.layoutJsonUrl || null,
                         });
 
                         get().addToHistory({
@@ -1437,31 +1669,14 @@ export const useTranslationStore = create<TranslationState>()(
 
                     // Handle New Upload
                     set({
+                        ...createEmptyDocumentWorkspaceState(),
+                        file,
                         status: 'parsing',
                         activeFileName: file.name,
-                        translationStatus: '',
-                        translationPhase: 'idle',
-                        translationLastEventAt: null,
-                        translationConcurrency: 1,
-                        translationBlocks: [],
-                        translationRunId: null,
                         batchId: data.batchId,
                         fileHash: data.fileHash,
-                        fileUrl: `/api/media/${data.fileHash}/original.pdf`, // Switch to server URL immediately
+                        fileUrl: originalPdfUrl,
                         progress: 30,
-                        rawSourceMarkdown: '',
-                        polishedSourceMarkdown: '',
-                        paperPolishStatus: 'idle',
-                        paperPolishMode: null,
-                        paperPolishProgress: 0,
-                        paperPolishMessage: '',
-                        paperPolishSummary: [],
-                        paperPolishIssues: [],
-                        paperPolishResidualIssues: [],
-                        paperPolishIssueWindows: [],
-                        paperPolishCanUseAiFallback: false,
-                        paperPolishUndoSnapshot: null,
-                        paperPolishUndoExpiresAt: null,
                     });
                     void persistActiveDocumentSnapshot({
                         fileHash: data.fileHash,
@@ -1497,6 +1712,7 @@ export const useTranslationStore = create<TranslationState>()(
 
                 const interval = setInterval(async () => {
                     try {
+                        const originalPdfUrl = await resolveOptionalMediaUrl(fileHash, 'original.pdf');
                         const params = new URLSearchParams({
                             batchId,
                             fileName: activeFileName || file?.name || 'unknown.pdf',
@@ -1535,12 +1751,13 @@ export const useTranslationStore = create<TranslationState>()(
                             const parsedState = getParsedMarkdownState(data.markdown || '');
                             set({
                                 status: 'parsed',
+                                batchId: null,
                                 sourceMarkdown: parsedState.sourceMarkdown,
                                 rawSourceMarkdown: parsedState.rawSourceMarkdown,
                                 polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                                 progress: 60,
                                 layoutUrl: data.layoutUrl || null,
-                                layoutJsonUrl: data.layoutJsonUrl || `/api/media/${fileHash}/layout.json`,
+                                layoutJsonUrl: data.layoutJsonUrl || null,
                                 paperPolishStatus: 'idle',
                                 paperPolishMode: null,
                                 paperPolishProgress: 0,
@@ -1564,7 +1781,7 @@ export const useTranslationStore = create<TranslationState>()(
                                 rawSourceMarkdown: parsedState.rawSourceMarkdown,
                                 polishedSourceMarkdown: parsedState.polishedSourceMarkdown,
                                 targetMarkdown: current.targetMarkdown,
-                                layoutJsonUrl: data.layoutJsonUrl || `/api/media/${fileHash}/layout.json`,
+                                layoutJsonUrl: data.layoutJsonUrl || null,
                             });
                             if (fileHash) {
                                 get().addToHistory({
@@ -1581,7 +1798,17 @@ export const useTranslationStore = create<TranslationState>()(
                             });
                         } else if (data.state === 'failed') {
                             clearInterval(interval);
-                            set({ status: 'error', error: data.error || 'Parsing failed' });
+                            set({
+                                ...createEmptyDocumentWorkspaceState(),
+                                file,
+                                fileHash,
+                                batchId,
+                                fileUrl: originalPdfUrl || get().fileUrl,
+                                activeFileName: activeFileName || file?.name || null,
+                                status: 'error',
+                                error: data.error || 'Parsing failed',
+                                progress: 0,
+                            });
                             const current = get();
                             void persistActiveDocumentSnapshot({
                                 fileHash: current.fileHash,
@@ -1606,26 +1833,47 @@ export const useTranslationStore = create<TranslationState>()(
                         }
                     } catch (e: unknown) {
                         clearInterval(interval);
-                        set({ status: 'error', error: getErrorMessage(e) });
+                        const current = get();
+                        set({
+                            ...createEmptyDocumentWorkspaceState(),
+                            file: current.file,
+                            fileHash: current.fileHash,
+                            batchId: current.batchId,
+                            fileUrl: await resolveOptionalMediaUrl(current.fileHash, 'original.pdf') || current.fileUrl,
+                            activeFileName: current.activeFileName,
+                            status: 'error',
+                            error: getErrorMessage(e),
+                            progress: 0,
+                        });
                     }
                 }, 3000); // 3 seconds polling
             },
 
             checkResumable: async () => {
-                const { sourceMarkdown, targetLang, fileHash } = get();
+                const { sourceMarkdown, targetLang, fileHash, providerId, model } = get();
                 if (!fileHash || !sourceMarkdown) {
                     set({ resumableTranslation: null });
                     return;
                 }
 
                 try {
+                    const { providerProfile, glossaryTerms } = await resolveTranslationRuntimeCacheState({
+                        fileHash,
+                        targetLang,
+                        providerId,
+                        model,
+                    });
                     const response = await fetch('/api/translate/check-resume', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             fileHash,
                             targetLang,
-                            sourceMarkdown
+                            sourceMarkdown,
+                            providerId,
+                            model,
+                            providerProfile,
+                            extraTerms: glossaryTerms,
                         })
                     });
 
@@ -1637,11 +1885,22 @@ export const useTranslationStore = create<TranslationState>()(
                                 canResume: true,
                                 completedChunks: data.completedChunks,
                                 totalChunks: data.totalChunks,
-                                percentage: data.percentage
+                                percentage: data.percentage,
+                                jobId: typeof data.jobId === 'string' ? data.jobId : null,
                             }
                         });
                     } else {
-                        set({ resumableTranslation: null });
+                        set({
+                            resumableTranslation: data.reason === 'active_job'
+                                ? {
+                                    canResume: false,
+                                    completedChunks: typeof data.completedChunks === 'number' ? data.completedChunks : 0,
+                                    totalChunks: typeof data.totalChunks === 'number' ? data.totalChunks : 0,
+                                    percentage: typeof data.percentage === 'number' ? data.percentage : 0,
+                                    activeJobId: typeof data.activeJobId === 'string' ? data.activeJobId : null,
+                                }
+                                : null
+                        });
                     }
                 } catch (e) {
                     console.error('[CheckResumable] Error:', e);
@@ -1659,6 +1918,48 @@ export const useTranslationStore = create<TranslationState>()(
                 await get().performTranslation(false, true);
             },
 
+            retryParsing: async () => {
+                const current = get();
+
+                if (current.batchId && current.fileHash) {
+                    const originalPdfUrl = await resolveOptionalMediaUrl(current.fileHash, 'original.pdf');
+                    set({
+                        ...createEmptyDocumentWorkspaceState(),
+                        file: current.file,
+                        activeFileName: current.activeFileName,
+                        fileHash: current.fileHash,
+                        batchId: current.batchId,
+                        fileUrl: originalPdfUrl,
+                        status: 'parsing',
+                        progress: Math.max(30, current.progress || 30),
+                    });
+                    void persistActiveDocumentSnapshot({
+                        fileHash: current.fileHash,
+                        fileName: current.activeFileName || current.file?.name || 'unknown.pdf',
+                        status: 'parsing',
+                        progress: Math.max(30, current.progress || 30),
+                        targetLang: current.targetLang,
+                        sourceMarkdown: '',
+                        rawSourceMarkdown: '',
+                        polishedSourceMarkdown: '',
+                        targetMarkdown: '',
+                        layoutJsonUrl: null,
+                    });
+                    get().pollStatus();
+                    return;
+                }
+
+                if (current.file) {
+                    await get().startUpload();
+                    return;
+                }
+
+                set({
+                    status: 'error',
+                    error: '当前任务没有可恢复的解析批次，请重新上传 PDF 或重新导入 arXiv。',
+                });
+            },
+
             clearResumable: () => {
                 set({ resumableTranslation: null });
             },
@@ -1668,8 +1969,29 @@ export const useTranslationStore = create<TranslationState>()(
             },
 
             performTranslation: async (resume: boolean, forceFresh: boolean = false) => {
-                const { sourceMarkdown, targetLang, providerId, model, fileHash, file, activeFileName } = get();
+                const currentSnapshot = get();
+                if (currentSnapshot.status === 'translating') {
+                    console.warn('[Translation] Ignoring duplicate start while a translation stream is already active');
+                    return;
+                }
+
+                const {
+                    sourceMarkdown,
+                    targetLang,
+                    providerId,
+                    model,
+                    fileHash,
+                    file,
+                    activeFileName,
+                    resumableTranslation,
+                } = currentSnapshot;
                 if (!sourceMarkdown) return;
+                const requestedJobId = resume && resumableTranslation?.jobId
+                    ? resumableTranslation.jobId
+                    : createTranslationJobId();
+                const requestToken = `${requestedJobId}:${Date.now()}`;
+                activeTranslationRequestToken = requestToken;
+                const isActiveRequest = () => activeTranslationRequestToken === requestToken;
 
                 const userTerms = await listUserGlossaryRecords();
                 const enabledUserTerms = userTerms
@@ -1688,8 +2010,10 @@ export const useTranslationStore = create<TranslationState>()(
                     progress: 0,
                     targetMarkdown: '',
                     translationBlocks: [],
-                    translationRunId: null,
-                    translationStatus: forceFresh ? '正在清理旧译文并重新翻译...' : '准备翻译任务...',
+                    translationRunId: requestedJobId,
+                    translationStatus: resume
+                        ? '正在恢复翻译任务...'
+                        : (forceFresh ? '正在清理旧译文并重新翻译...' : '准备翻译任务...'),
                     translationPhase: 'preparing',
                     translationLastEventAt: Date.now(),
                     translationConcurrency: 1,
@@ -1722,8 +2046,11 @@ export const useTranslationStore = create<TranslationState>()(
                 let hardTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
                 let markdownFlushTimer: ReturnType<typeof setTimeout> | null = null;
                 let snapshotPersistTimer: ReturnType<typeof setTimeout> | null = null;
+                let chunkStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
                 let sawTerminalEvent = false;
                 let hardTimeoutTriggered = false;
+                let lastTranslationHeartbeatAt = Date.now();
+                const pendingChunkMutations = new Map<string, PendingChunkMutation>();
 
                 const clearStreamTimers = () => {
                     if (stallWarningTimer) {
@@ -1744,6 +2071,10 @@ export const useTranslationStore = create<TranslationState>()(
                     if (snapshotPersistTimer) {
                         clearTimeout(snapshotPersistTimer);
                         snapshotPersistTimer = null;
+                    }
+                    if (chunkStateFlushTimer) {
+                        clearTimeout(chunkStateFlushTimer);
+                        chunkStateFlushTimer = null;
                     }
                 };
 
@@ -1793,7 +2124,98 @@ export const useTranslationStore = create<TranslationState>()(
                     }, 2000);
                 };
 
+                const flushPendingChunkMutations = () => {
+                    if (chunkStateFlushTimer) {
+                        clearTimeout(chunkStateFlushTimer);
+                        chunkStateFlushTimer = null;
+                    }
+
+                    if (pendingChunkMutations.size === 0) return;
+
+                    const pendingEntries = Array.from(pendingChunkMutations.entries());
+                    pendingChunkMutations.clear();
+
+                    set((state) => {
+                        let nextBlocks = state.translationBlocks;
+                        let changed = false;
+
+                        for (const [chunkId, mutation] of pendingEntries) {
+                            const blockIndex = nextBlocks.findIndex((block) => block.id === chunkId);
+
+                            if (blockIndex >= 0) {
+                                const currentBlock = nextBlocks[blockIndex];
+                                const nextText = mutation.mode === 'replace'
+                                    ? mutation.text
+                                    : currentBlock.text + mutation.text;
+
+                                if (
+                                    nextText === currentBlock.text &&
+                                    currentBlock.state === 'streaming'
+                                ) {
+                                    continue;
+                                }
+
+                                if (!changed) {
+                                    nextBlocks = [...nextBlocks];
+                                    changed = true;
+                                }
+
+                                nextBlocks[blockIndex] = {
+                                    ...currentBlock,
+                                    text: nextText,
+                                    state: currentBlock.state === 'cached' ? 'cached' : 'streaming',
+                                };
+                                continue;
+                            }
+
+                            const nextBlock: TranslationMarkdownBlock = {
+                                id: chunkId,
+                                index: nextBlocks.length,
+                                title: mutation.title || `Chunk ${nextBlocks.length + 1}`,
+                                kind: 'text',
+                                text: mutation.text,
+                                state: 'streaming',
+                            };
+
+                            nextBlocks = [...nextBlocks, nextBlock];
+                            changed = true;
+                        }
+
+                        if (!changed) {
+                            // blocks 无实质变化，整个 set 回调返回原 state 对象，
+                            // Zustand 会跳过通知，下游订阅者完全不重渲染。
+                            return state;
+                        }
+
+                        return {
+                            translationBlocks: nextBlocks,
+                            translationPhase: 'streaming' as const,
+                            // 仅在 blocks 真正变化时才更新心跳时间戳，
+                            // 避免无意义的 translationLastEventAt 写入触发额外订阅。
+                            translationLastEventAt: lastTranslationHeartbeatAt,
+                        };
+                    });
+
+                    scheduleTargetMarkdownFlush();
+                    scheduleTranslationSnapshotPersist();
+                };
+
+                const scheduleChunkStateFlush = () => {
+                    if (chunkStateFlushTimer) return;
+
+                    chunkStateFlushTimer = setTimeout(() => {
+                        chunkStateFlushTimer = null;
+                        flushPendingChunkMutations();
+                        // Clear the pretext layout engine cache every 120ms tick.
+                        // During live streaming, non-spaced languages (like CJK or code) will force word segmenters
+                        // to continuously allocate new segment width measurements. Over thousands of stream ticks,
+                        // this causes massive memory leaks (GBs) if left unbounded.
+                        clearPretextEngineCache();
+                    }, 120);
+                };
+
                 const flushTranslationArtifacts = (snapshotStatus: TaskStatus, snapshotProgress: number) => {
+                    flushPendingChunkMutations();
                     clearTranslationFlushTimers();
                     const nextTargetMarkdown = flushTargetMarkdownFromBlocks();
                     persistTranslationSnapshot(snapshotStatus, snapshotProgress, nextTargetMarkdown);
@@ -1818,12 +2240,17 @@ export const useTranslationStore = create<TranslationState>()(
 
                 const markTranslationActivity = (updates?: Partial<Pick<TranslationState, 'translationStatus' | 'translationPhase' | 'translationConcurrency'>>) => {
                     const timestamp = Date.now();
-                    set((state) => ({
-                        translationLastEventAt: timestamp,
-                        translationStatus: updates?.translationStatus ?? state.translationStatus,
-                        translationPhase: updates?.translationPhase ?? state.translationPhase,
-                        translationConcurrency: updates?.translationConcurrency ?? state.translationConcurrency,
-                    }));
+                    lastTranslationHeartbeatAt = timestamp;
+
+                    if (updates) {
+                        set((state) => ({
+                            translationLastEventAt: timestamp,
+                            translationStatus: updates.translationStatus ?? state.translationStatus,
+                            translationPhase: updates.translationPhase ?? state.translationPhase,
+                            translationConcurrency: updates.translationConcurrency ?? state.translationConcurrency,
+                        }));
+                    }
+
                     scheduleStreamTimers();
                 };
 
@@ -1842,6 +2269,7 @@ export const useTranslationStore = create<TranslationState>()(
                             resume,
                             forceFresh,
                             extraTerms: enabledUserTerms,
+                            jobId: requestedJobId,
                         }),
                     });
 
@@ -1865,10 +2293,16 @@ export const useTranslationStore = create<TranslationState>()(
                     scheduleStreamTimers();
 
                     while (true) {
+                        if (!isActiveRequest()) {
+                            await reader.cancel();
+                            break;
+                        }
+
                         const { done, value } = await reader.read();
                         if (done) break;
 
-                        markTranslationActivity();
+                        scheduleStreamTimers();
+                        lastTranslationHeartbeatAt = Date.now();
                         buffer += decoder.decode(value, { stream: true });
                         const events = buffer.split('\n\n');
                         buffer = events.pop() || "";
@@ -1877,6 +2311,9 @@ export const useTranslationStore = create<TranslationState>()(
                             if (!event.startsWith('data: ')) continue;
                             const jsonStr = event.substring(6);
                             try {
+                                if (!isActiveRequest()) {
+                                    break;
+                                }
                                 const data = JSON.parse(jsonStr);
                                 switch (data.type) {
                                     case 'run_started': {
@@ -1951,29 +2388,27 @@ export const useTranslationStore = create<TranslationState>()(
                                         set({ progress: data.percentage });
                                         break;
                                     case 'chunk':
+                                        {
+                                            const chunkId = typeof data.chunkId === 'string' ? data.chunkId : 'streaming-translation';
+                                            const existing = pendingChunkMutations.get(chunkId);
+                                            pendingChunkMutations.set(chunkId, {
+                                                mode: existing?.mode === 'replace' ? 'replace' : 'append',
+                                                text: existing
+                                                    ? existing.mode === 'replace'
+                                                        ? existing.text + (data.text || '')
+                                                        : existing.text + (data.text || '')
+                                                    : (data.text || ''),
+                                                title: typeof data.title === 'string' ? data.title : existing?.title,
+                                            });
+                                            scheduleChunkStateFlush();
+                                        }
+                                        break;
+                                    case 'chunk_reset':
+                                        flushPendingChunkMutations();
                                         set((state) => {
                                             const chunkId = typeof data.chunkId === 'string' ? data.chunkId : null;
                                             if (!chunkId) {
                                                 return {
-                                                    translationBlocks: state.translationBlocks.length > 0
-                                                        ? state.translationBlocks.map((block, index) => (
-                                                            index === state.translationBlocks.length - 1
-                                                                ? {
-                                                                    ...block,
-                                                                    text: block.text + (data.text || ''),
-                                                                    state: block.state === 'cached' ? 'cached' as const : 'streaming' as const,
-                                                                }
-                                                                : block
-                                                        ))
-                                                        : [{
-                                                            id: 'streaming-translation',
-                                                            index: 0,
-                                                            title: 'Streaming Translation',
-                                                            kind: 'text',
-                                                            text: data.text || '',
-                                                            state: 'streaming' as const,
-                                                        }],
-                                                    translationPhase: 'streaming',
                                                     translationLastEventAt: Date.now(),
                                                 };
                                             }
@@ -1984,25 +2419,19 @@ export const useTranslationStore = create<TranslationState>()(
                                                     block.id === chunkId
                                                         ? {
                                                             ...block,
-                                                            text: block.text + (data.text || ''),
+                                                            text: typeof data.text === 'string' ? data.text : block.text,
                                                             state: block.state === 'cached' ? 'cached' as const : 'streaming' as const,
                                                         }
                                                         : block
                                                 ))
-                                                : [
-                                                    ...state.translationBlocks,
-                                                    {
-                                                        id: chunkId,
-                                                        index: state.translationBlocks.length,
-                                                        title: typeof data.title === 'string' ? data.title : `Chunk ${state.translationBlocks.length + 1}`,
-                                                        kind: 'text',
-                                                        text: data.text || '',
-                                                        state: 'streaming' as const,
-                                                    },
-                                                ];
+                                                : state.translationBlocks;
+                                            const issueCount = Array.isArray(data.issues) ? data.issues.length : 0;
 
                                             return {
                                                 translationBlocks: nextBlocks,
+                                                translationStatus: issueCount > 0
+                                                    ? `已自动修复当前分块的 ${issueCount} 处结构问题`
+                                                    : state.translationStatus,
                                                 translationPhase: 'streaming',
                                                 translationLastEventAt: Date.now(),
                                             };
@@ -2011,6 +2440,7 @@ export const useTranslationStore = create<TranslationState>()(
                                         scheduleTranslationSnapshotPersist();
                                         break;
                                     case 'chunk_completed':
+                                        flushPendingChunkMutations();
                                         set((state) => {
                                             const nextBlocks: TranslationMarkdownBlock[] = state.translationBlocks.map((block) => (
                                                 block.id === data.chunkId
@@ -2049,19 +2479,67 @@ export const useTranslationStore = create<TranslationState>()(
                                             });
                                         }
                                         break;
+                                    case 'job_conflict':
+                                        {
+                                        sawTerminalEvent = true;
+                                        clearStreamTimers();
+                                        clearTranslationFlushTimers();
+                                        const conflictMessage = typeof data.message === 'string' && data.message.trim()
+                                            ? data.message
+                                            : '相同配置的翻译任务已在其他标签页运行，请等待当前任务结束后再试。';
+                                        const conflictJobId = typeof data.activeJob?.jobId === 'string'
+                                            ? data.activeJob.jobId
+                                            : null;
+                                        const errorProgress = clampErrorProgress(get().progress);
+
+                                        set({
+                                            status: 'error',
+                                            error: conflictMessage,
+                                            progress: errorProgress,
+                                            translationRunId: conflictJobId,
+                                            translationStatus: '已有同配置翻译任务正在运行',
+                                            translationPhase: 'stalled',
+                                            translationLastEventAt: Date.now(),
+                                        });
+                                        flushTranslationArtifacts('error', errorProgress);
+                                        await get().checkResumable();
+                                        break;
+                                        }
                                     case 'error':
+                                        {
+                                        const rawMessage = typeof data.message === 'string' && data.message.trim()
+                                            ? data.message
+                                            : '翻译失败';
+                                        const isRateLimited = isRateLimitErrorMessage(rawMessage);
+                                        const errorProgress = clampErrorProgress(get().progress);
                                         sawTerminalEvent = true;
                                         clearStreamTimers();
                                         clearTranslationFlushTimers();
                                         set({
                                             status: 'error',
-                                            error: data.message,
-                                            translationStatus: '翻译失败',
-                                            translationPhase: 'error',
+                                            error: rawMessage,
+                                            progress: errorProgress,
+                                            translationStatus: isRateLimited
+                                                ? '触发速率限制，翻译已暂停，可点击继续翻译'
+                                                : '翻译失败',
+                                            translationPhase: isRateLimited ? 'stalled' : 'error',
                                             translationLastEventAt: Date.now(),
                                         });
-                                        flushTranslationArtifacts('error', get().progress);
+                                        flushTranslationArtifacts('error', errorProgress);
+                                        await get().checkResumable();
+                                        const canResume = Boolean(get().resumableTranslation?.canResume);
+                                        if (isRateLimited && canResume) {
+                                            set((state) => (
+                                                state.status === 'error'
+                                                    ? {
+                                                        translationStatus: `速率受限（429），已暂停在 ${state.resumableTranslation?.percentage ?? errorProgress}%`,
+                                                        translationPhase: 'stalled' as const,
+                                                    }
+                                                    : state
+                                            ));
+                                        }
                                         break;
+                                        }
                                 }
                             } catch (e) {
                                 console.error('Error parsing SSE event:', e);
@@ -2076,21 +2554,27 @@ export const useTranslationStore = create<TranslationState>()(
                         const message = hardTimeoutTriggered
                             ? `翻译流长时间未返回数据（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已自动终止，请重试。`
                             : '翻译流意外中断，未收到完成信号，请重试。';
+                        const errorProgress = clampErrorProgress(get().progress);
+                        const isRateLimited = isRateLimitErrorMessage(message);
 
                         set({
                             status: 'error',
                             error: message,
-                            translationStatus: hardTimeoutTriggered ? '翻译流超时' : '翻译连接已断开',
-                            translationPhase: hardTimeoutTriggered ? 'stalled' : 'error',
+                            progress: errorProgress,
+                            translationStatus: hardTimeoutTriggered
+                                ? '翻译流超时'
+                                : (isRateLimited ? '触发速率限制，翻译已暂停' : '翻译连接已断开'),
+                            translationPhase: hardTimeoutTriggered || isRateLimited ? 'stalled' : 'error',
                             translationLastEventAt: Date.now(),
                         });
-                        flushTranslationArtifacts('error', get().progress);
+                        flushTranslationArtifacts('error', errorProgress);
+                        await get().checkResumable();
                         if (fileHash) {
                             get().addToHistory({
                                 fileHash,
                                 fileName: activeFileName || file?.name || 'unknown.pdf',
                                 status: 'error',
-                                progress: get().progress
+                                progress: errorProgress
                             });
                         }
                     }
@@ -2101,22 +2585,43 @@ export const useTranslationStore = create<TranslationState>()(
                     const message = hardTimeoutTriggered
                         ? `翻译流长时间未返回数据（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已自动终止，请重试。`
                         : (isAbort ? '翻译请求已中止。' : getErrorMessage(e));
+                    const isRateLimited = isRateLimitErrorMessage(message);
+                    const errorProgress = clampErrorProgress(get().progress);
 
                     set({
                         status: 'error',
                         error: message,
-                        translationStatus: hardTimeoutTriggered ? '翻译流超时' : '翻译失败',
-                        translationPhase: hardTimeoutTriggered ? 'stalled' : 'error',
+                        progress: errorProgress,
+                        translationStatus: hardTimeoutTriggered
+                            ? '翻译流超时'
+                            : (isRateLimited ? '触发速率限制，翻译已暂停' : '翻译失败'),
+                        translationPhase: hardTimeoutTriggered || isRateLimited ? 'stalled' : 'error',
                         translationLastEventAt: Date.now(),
                     });
-                    flushTranslationArtifacts('error', get().progress);
+                    flushTranslationArtifacts('error', errorProgress);
+                    await get().checkResumable();
+                    const canResume = Boolean(get().resumableTranslation?.canResume);
+                    if (isRateLimited && canResume) {
+                        set((state) => (
+                            state.status === 'error'
+                                ? {
+                                    translationStatus: `速率受限（429），已暂停在 ${state.resumableTranslation?.percentage ?? errorProgress}%`,
+                                    translationPhase: 'stalled' as const,
+                                }
+                                : state
+                        ));
+                    }
                     if (fileHash) {
                         get().addToHistory({
                             fileHash,
                             fileName: activeFileName || file?.name || 'unknown.pdf',
                             status: 'error',
-                            progress: 0
+                            progress: errorProgress
                         });
+                    }
+                } finally {
+                    if (isActiveRequest()) {
+                        activeTranslationRequestToken = null;
                     }
                 }
             },
@@ -2181,6 +2686,7 @@ export const useTranslationStore = create<TranslationState>()(
                     googleApiKey: state.googleApiKey,
                     history: state.history.map(sanitizePersistedHistoryItem),
                     fileHash: state.fileHash,
+                    batchId: state.batchId,
                     activeFileName: state.activeFileName,
                     status: persistedStatus,
                     progress: state.progress,
@@ -2197,7 +2703,7 @@ export const useTranslationStore = create<TranslationState>()(
                     paperPolishAutoEnabled: state.paperPolishAutoEnabled,
                     paperPolishSummary: state.paperPolishSummary,
                     paperPolishIssues: state.paperPolishIssues,
-                    // fileUrl and batchId are not persisted or handled separately
+                    // fileUrl is reconstructed separately when needed
                     layoutUrl: state.layoutUrl,
                     layoutJsonUrl: state.layoutJsonUrl
                 };

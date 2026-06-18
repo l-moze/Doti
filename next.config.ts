@@ -1,10 +1,8 @@
 import type { NextConfig } from "next";
-import { PHASE_DEVELOPMENT_SERVER } from "next/constants";
 
-const createNextConfig = (phase: string): NextConfig => ({
-  distDir: phase === PHASE_DEVELOPMENT_SERVER
-    ? ".next-dev"
-    : (process.env.NEXT_DIST_DIR || ".next-build-check"),
-});
+const nextConfig: NextConfig = {
+  distDir: process.env.NEXT_DIST_DIR || ".next-build",
+  output: "standalone",
+};
 
-export default createNextConfig;
+export default nextConfig;

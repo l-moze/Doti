@@ -1,90 +1,185 @@
 import { NextRequest, NextResponse } from "next/server";
-import fs from "fs";
+import { access, open, readdir, readFile } from "fs/promises";
 import path from "path";
 import mime from "mime";
+import {
+    normalizeMediaRelativePath,
+    requiresSignedMediaAccess,
+    signInternalMediaUrlsInMarkdown,
+    verifyMediaAccessToken,
+} from "@/lib/media-access";
+import { hasFileHashAccess } from "@/lib/media-session";
 import { normalizeMarkdownMathForDisplay } from "@/lib/markdown-normalizer";
+import { getUploadsRoot } from "@/lib/server/runtime-paths";
+
+async function pathExists(filePath: string): Promise<boolean> {
+    try {
+        await access(filePath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function isWithinRoot(rootDir: string, candidatePath: string): boolean {
+    return candidatePath === rootDir || candidatePath.startsWith(`${rootDir}${path.sep}`);
+}
+
+function getRelativePathFromSegments(pathSegments: string[]): string {
+    return normalizeMediaRelativePath(pathSegments.slice(1).join("/"));
+}
+
+function assertMediaAccess(request: NextRequest, fileHash: string, relativePath: string): NextResponse | null {
+    if (!requiresSignedMediaAccess()) {
+        return null;
+    }
+
+    if (!hasFileHashAccess(request, fileHash)) {
+        return new NextResponse("Forbidden", { status: 403 });
+    }
+
+    const token = request.nextUrl.searchParams.get("token");
+    const expiresAt = request.nextUrl.searchParams.get("expires");
+
+    if (!verifyMediaAccessToken({
+        fileHash,
+        relativePath,
+        token,
+        expiresAt,
+    })) {
+        return new NextResponse("Invalid or expired media token", { status: 403 });
+    }
+
+    return null;
+}
+
+async function streamFile(filePath: string, contentType: string): Promise<NextResponse> {
+    const handle = await open(filePath, "r");
+    const stat = await handle.stat();
+    const stream = handle.readableWebStream({ type: "bytes" });
+
+    return new NextResponse(stream as unknown as BodyInit, {
+        headers: {
+            "Content-Type": contentType,
+            "Content-Length": stat.size.toString(),
+            "Cache-Control": "private, max-age=300",
+        },
+    });
+}
+
+async function resolveMediaFilePath(fileHash: string, relativePath: string): Promise<string | null> {
+    const uploadsRoot = path.resolve(getUploadsRoot());
+    let filePath = path.resolve(uploadsRoot, fileHash, relativePath);
+
+    if (!isWithinRoot(uploadsRoot, filePath)) {
+        return null;
+    }
+
+    if (await pathExists(filePath)) {
+        return filePath;
+    }
+
+    if (relativePath === "original.pdf") {
+        const dir = path.dirname(filePath);
+        if (await pathExists(dir)) {
+            const files = await readdir(dir);
+            const legacyOrigin = files.find((fileName) => fileName.endsWith("_origin.pdf"));
+            if (legacyOrigin) {
+                return path.join(dir, legacyOrigin);
+            }
+        }
+    }
+
+    return null;
+}
 
 export async function GET(
     request: NextRequest,
     { params }: { params: Promise<{ path: string[] }> }
 ) {
     try {
-        // Await params correctly in Next.js 15+
         const { path: pathSegments } = await params;
 
-        if (!pathSegments || pathSegments.length === 0) {
+        if (!pathSegments || pathSegments.length < 2) {
             return new NextResponse("Invalid path", { status: 400 });
         }
 
-        // pathSegments will be like ['fileHash', 'layout.pdf'] or ['fileHash', 'images', '001.jpg']
-        // We map this to <repo>/uploads/fileHash/layout.pdf
-        const uploadsRoot = path.join(process.cwd(), "uploads");
-        let filePath = path.join(uploadsRoot, ...pathSegments);
-
-        console.log(`[Media API] Request: ${pathSegments.join('/')}`);
-
-        // Use resolve to normalize path
-        const resolvedPath = path.resolve(filePath);
-        if (!resolvedPath.startsWith(uploadsRoot)) {
-            return new NextResponse("Access denied", { status: 403 });
+        const fileHash = pathSegments[0]?.trim();
+        if (!fileHash) {
+            return new NextResponse("Invalid file hash", { status: 400 });
         }
 
-        if (!fs.existsSync(filePath)) {
-            // Minimal Legacy Support: If original.pdf missing, try _origin.pdf
-            // This handles files from before the Unified Strategy was deployed
-            if (pathSegments[pathSegments.length - 1] === 'original.pdf') {
-                const dir = path.dirname(filePath);
-                if (fs.existsSync(dir)) {
-                    const files = fs.readdirSync(dir);
-                    const legacyOrigin = files.find(f => f.endsWith('_origin.pdf'));
-                    if (legacyOrigin) {
-                        filePath = path.join(dir, legacyOrigin);
-                        console.log(`[Media API] Serving legacy origin: ${filePath}`);
-                    } else {
-                        return new NextResponse("File not found", { status: 404 });
-                    }
-                } else {
-                    return new NextResponse("File not found", { status: 404 });
-                }
-            } else {
-                return new NextResponse("File not found", { status: 404 });
-            }
+        const relativePath = getRelativePathFromSegments(pathSegments);
+        const accessError = assertMediaAccess(request, fileHash, relativePath);
+        if (accessError) {
+            return accessError;
         }
 
-        const stats = fs.statSync(filePath);
+        const filePath = await resolveMediaFilePath(fileHash, relativePath);
+        if (!filePath) {
+            return new NextResponse("File not found", { status: 404 });
+        }
+
         const contentType = mime.getType(filePath) || "application/octet-stream";
 
-        if (filePath.endsWith('.md')) {
-            const markdown = fs.readFileSync(filePath, 'utf-8');
-            const normalizedMarkdown = normalizeMarkdownMathForDisplay(markdown);
+        if (filePath.endsWith(".md")) {
+            const markdown = await readFile(filePath, "utf-8");
+            const normalizedMarkdown = signInternalMediaUrlsInMarkdown(
+                normalizeMarkdownMathForDisplay(markdown),
+                fileHash
+            );
 
             return new NextResponse(normalizedMarkdown, {
                 headers: {
                     "Content-Type": "text/markdown; charset=utf-8",
-                    "Content-Length": Buffer.byteLength(normalizedMarkdown, 'utf-8').toString(),
-                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "Content-Length": Buffer.byteLength(normalizedMarkdown, "utf-8").toString(),
+                    "Cache-Control": "private, max-age=300",
                 },
             });
         }
 
-        // Use fs.createReadStream for better performance with large files (like PDFs)
-        // But Next.js NextResponse body expects a BodyInit, which can be a stream.
-        // Node.js readable streams need to be converted to Web Streams for NextResponse
+        return await streamFile(filePath, contentType);
+    } catch (error: unknown) {
+        console.error("Media handler error:", error instanceof Error ? error.message : error);
+        return new NextResponse("Internal Server Error", { status: 500 });
+    }
+}
 
-        // Simpler approach for now: read file. For very large files, might want stream.
-        const fileBuffer = fs.readFileSync(filePath);
+export async function HEAD(
+    request: NextRequest,
+    { params }: { params: Promise<{ path: string[] }> }
+) {
+    try {
+        const { path: pathSegments } = await params;
 
-        return new NextResponse(fileBuffer, {
+        if (!pathSegments || pathSegments.length < 2) {
+            return new NextResponse(null, { status: 400 });
+        }
+
+        const fileHash = pathSegments[0]?.trim();
+        if (!fileHash) {
+            return new NextResponse(null, { status: 400 });
+        }
+
+        const relativePath = getRelativePathFromSegments(pathSegments);
+        const accessError = assertMediaAccess(request, fileHash, relativePath);
+        if (accessError) {
+            return accessError;
+        }
+
+        const filePath = await resolveMediaFilePath(fileHash, relativePath);
+        if (!filePath) {
+            return new NextResponse(null, { status: 404 });
+        }
+
+        const contentType = mime.getType(filePath) || "application/octet-stream";
+        return new NextResponse(null, {
             headers: {
                 "Content-Type": contentType,
-                "Content-Length": stats.size.toString(),
-                // Cache control - cache effective for a while since hash-based paths are immutable-ish
-                "Cache-Control": "public, max-age=31536000, immutable",
+                "Cache-Control": "private, max-age=300",
             },
         });
-
-    } catch (error: unknown) {
-        console.error("Media handler error:", error);
-        return new NextResponse("Internal Server Error", { status: 500 });
+    } catch {
+        return new NextResponse(null, { status: 500 });
     }
 }

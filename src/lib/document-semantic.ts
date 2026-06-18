@@ -26,6 +26,7 @@ export type DocumentSemanticBBox = [number, number, number, number];
 
 export type DocumentSemanticChild = {
     id: string;
+    semanticId?: string;
     pageIndex: number;
     bbox: DocumentSemanticBBox | null;
     assetPath?: string | null;
@@ -131,10 +132,11 @@ type MarkdownFallbackBlock = {
 const BLOCK_BOUNDARY_PATTERN = /^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s+|!\[|<table\b|<\/?(?:figure|figcaption|table|thead|tbody|tfoot|tr|td|th|div|img)\b|```|~~~|\$\$|\\\[|\\begin\{|(?:Figure|Fig\.?|Table|图|表)\s*[\dA-Za-z]+(?:\s*[:：.-]|\s*$)|\([a-z]\)\s+)/i;
 const SENTENCE_END_PATTERN = /[。！？!?;；:：.)\]）】"'`]\s*$/;
 const CONTINUATION_START_PATTERN = /^(?:[a-z(（\[【"'`]|[0-9]+(?:[.)]|%|×)|et al\.|i\.e\.|e\.g\.|vs\.|[,:;)\]）】])/i;
-const FIGURE_CAPTION_PATTERN = /^(?:Figure|Fig\.?|图)\s*[\dA-Za-z]+(?:\s*[\(:：.-]\s*[a-z]\)?)?/i;
+const FIGURE_CAPTION_PATTERN = /^(?:Figure|Fig\.?|图)\s*[\dA-Za-z]+(?:\s*[:：.-]|\s*$)/i;
 const TABLE_CAPTION_PATTERN = /^(?:Table|TABLE|表)\s*[\dA-Za-z]+(?:\s*[:：.-]|\s*$)/i;
 const SUBFIGURE_CAPTION_PATTERN = /^\([a-z]\)\s+/i;
 const MARKDOWN_IMAGE_LINE_PATTERN = /^!\[(.*?)\]\((\S+?)(?:\s+["'](.*?)["'])?\)\s*$/;
+const FIGURE_REFERENCE_LEAD_PATTERN = /^(?:Figure|Fig\.?|图)\s*[\dA-Za-z]+\s+(?:shows?|showing|illustrates?|depicts?|presents?|describes?|compares?|demonstrates?|plots?|reports?)\b/i;
 
 function asArray<T = unknown>(value: unknown): T[] {
     return Array.isArray(value) ? value as T[] : [];
@@ -222,11 +224,25 @@ function splitFigureCaption(captionText: string): { subfigureCaption: string; gr
         return { subfigureCaption: normalized, groupCaption: '' };
     }
 
-    if (FIGURE_CAPTION_PATTERN.test(normalized)) {
+    if (looksLikeStandaloneFigureCaption(normalized)) {
         return { subfigureCaption: '', groupCaption: normalized };
     }
 
     return { subfigureCaption: normalized, groupCaption: '' };
+}
+
+function looksLikeStandaloneFigureCaption(text: string): boolean {
+    const normalized = normalizeWhitespace(text);
+    if (!normalized) return false;
+    if (!FIGURE_CAPTION_PATTERN.test(normalized)) return false;
+    if (FIGURE_REFERENCE_LEAD_PATTERN.test(normalized)) return false;
+    return true;
+}
+
+function looksLikeStandaloneTableCaption(text: string): boolean {
+    const normalized = normalizeWhitespace(text);
+    if (!normalized) return false;
+    return TABLE_CAPTION_PATTERN.test(normalized);
 }
 
 function semanticTypeForKind(kind: DocumentSemanticKind): DocumentSemanticContentType {
@@ -271,8 +287,12 @@ function classifyMarkdownFallbackBlock(text: string): MarkdownFallbackBlockKind 
     if (/^\s*(```|~~~)/.test(trimmed)) return 'code';
     if (/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(trimmed)) return 'list';
     if (/^\s*>\s+/.test(trimmed)) return 'quote';
-    if (MARKDOWN_IMAGE_LINE_PATTERN.test(trimmed) || FIGURE_CAPTION_PATTERN.test(trimmed) || SUBFIGURE_CAPTION_PATTERN.test(trimmed)) return 'figure';
-    if (TABLE_CAPTION_PATTERN.test(trimmed) || /^\s*<table\b/i.test(trimmed) || /^\s*\|/.test(trimmed)) return 'table';
+    if (
+        MARKDOWN_IMAGE_LINE_PATTERN.test(trimmed) ||
+        looksLikeStandaloneFigureCaption(trimmed) ||
+        SUBFIGURE_CAPTION_PATTERN.test(trimmed)
+    ) return 'figure';
+    if (looksLikeStandaloneTableCaption(trimmed) || /^\s*<table\b/i.test(trimmed) || /^\s*\|/.test(trimmed)) return 'table';
     if (/^\s*<\/?(?:figure|figcaption|img)\b/i.test(trimmed)) return 'figure';
     if (/^\s*<\/?(?:table|thead|tbody|tfoot|tr|td|th|caption|colgroup|col)\b/i.test(trimmed)) return 'table';
     if (/^\s*(?:\$\$|\\\[|\\begin\{)/.test(trimmed)) return 'math';
@@ -524,7 +544,13 @@ function buildRawBlocksFromContentList(contentList: unknown, assetPathPrefix?: s
             const sourceId = `cl-${pageIndex}-${order}`;
             const anchors = bbox ? [{ pageIndex, bbox, rawType, sourceRefs: [sourceId] }] : [];
 
-            if (rawType === 'page_number' || rawType === 'page_footer' || rawType === 'header' || rawType === 'footer') {
+            if (
+                rawType === 'page_number' ||
+                rawType === 'page_footer' ||
+                rawType === 'page_header' ||
+                rawType === 'header' ||
+                rawType === 'footer'
+            ) {
                 order += 1;
                 continue;
             }
@@ -937,7 +963,7 @@ function buildRawBlocksFromLayout(layout: unknown, assetPathPrefix?: string): Ra
                     continue;
                 }
                 const captionLike = normalizeWhitespace(text);
-                if (FIGURE_CAPTION_PATTERN.test(captionLike)) {
+                if (looksLikeStandaloneFigureCaption(captionLike)) {
                     blocks.push({
                         id: sourceId,
                         kind: 'figure',
@@ -952,7 +978,7 @@ function buildRawBlocksFromLayout(layout: unknown, assetPathPrefix?: string): Ra
                         sourceRefs: [sourceId],
                         anchors,
                     });
-                } else if (TABLE_CAPTION_PATTERN.test(captionLike)) {
+                } else if (looksLikeStandaloneTableCaption(captionLike)) {
                     blocks.push({
                         id: sourceId,
                         kind: 'table',
@@ -1006,6 +1032,282 @@ function buildRawBlocksFromLayout(layout: unknown, assetPathPrefix?: string): Ra
     return mergeMediaInterruptedParagraphs(mergeFigureGroups(blocks));
 }
 
+function dedupeStrings(values: Array<string | null | undefined>): string[] {
+    return Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
+}
+
+function extractAssetFileName(assetPath: string | null | undefined): string {
+    if (!assetPath) return '';
+    const normalized = assetPath.replace(/\\/g, '/').trim();
+    if (!normalized) return '';
+    const segments = normalized.split('/');
+    return segments[segments.length - 1]?.toLowerCase() || '';
+}
+
+function normalizeComparableText(value: string | null | undefined): string {
+    if (!value) return '';
+    return value
+        .toLowerCase()
+        .replace(/[`'"“”‘’]/g, '')
+        .replace(/[.,;:!?()[\]{}<>/\\|*_#~=+-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function compactComparableText(value: string | null | undefined): string {
+    return normalizeComparableText(value).replace(/\s+/g, '');
+}
+
+function sharedPrefixLength(a: string, b: string): number {
+    const limit = Math.min(a.length, b.length);
+    let index = 0;
+    while (index < limit && a[index] === b[index]) {
+        index += 1;
+    }
+    return index;
+}
+
+function sharedSuffixLength(a: string, b: string): number {
+    const limit = Math.min(a.length, b.length);
+    let index = 0;
+    while (index < limit && a[a.length - 1 - index] === b[b.length - 1 - index]) {
+        index += 1;
+    }
+    return index;
+}
+
+function compareTextSimilarity(left: string | null | undefined, right: string | null | undefined): number {
+    const a = compactComparableText(left);
+    const b = compactComparableText(right);
+
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+
+    const shorter = a.length <= b.length ? a : b;
+    const longer = shorter === a ? b : a;
+
+    if (longer.includes(shorter)) {
+        return shorter.length / longer.length;
+    }
+
+    const prefixScore = sharedPrefixLength(a, b) / Math.min(a.length, b.length);
+    const suffixScore = sharedSuffixLength(a, b) / Math.min(a.length, b.length);
+
+    const tokenSetA = new Set(normalizeComparableText(left).split(' ').filter(Boolean));
+    const tokenSetB = new Set(normalizeComparableText(right).split(' ').filter(Boolean));
+    let intersection = 0;
+    for (const token of tokenSetA) {
+        if (tokenSetB.has(token)) {
+            intersection += 1;
+        }
+    }
+    const tokenScore = intersection / Math.max(Math.min(tokenSetA.size, tokenSetB.size), 1);
+
+    return Math.max(prefixScore, suffixScore, tokenScore * 0.85);
+}
+
+type RawBlockMatch = {
+    score: number;
+    confident: boolean;
+};
+
+function hasKnownGeometry(block: RawSemanticBlock): boolean {
+    if (block.bbox || block.anchors.length > 0) {
+        return true;
+    }
+
+    return block.children.some((child) => Boolean(child.bbox));
+}
+
+function evaluateRawBlockMatch(
+    contentBlock: RawSemanticBlock,
+    layoutBlock: RawSemanticBlock,
+    contentIndex: number,
+    layoutIndex: number,
+    layoutCursor: number
+): RawBlockMatch {
+    if (contentBlock.kind !== layoutBlock.kind) {
+        return { score: Number.NEGATIVE_INFINITY, confident: false };
+    }
+
+    const contentHasKnownGeometry = hasKnownGeometry(contentBlock);
+    const pageDistance = contentHasKnownGeometry
+        ? Math.abs(contentBlock.pageIndex - layoutBlock.pageIndex)
+        : 0;
+    if (contentHasKnownGeometry && pageDistance > 1) {
+        return { score: Number.NEGATIVE_INFINITY, confident: false };
+    }
+
+    const orderDistance = Math.abs(contentIndex - layoutIndex);
+    let score = contentHasKnownGeometry
+        ? (pageDistance === 0 ? 6 : 2)
+        : 4;
+    score += orderDistance === 0 ? 2 : orderDistance <= 2 ? 1 : 0;
+    score -= Math.min(4, Math.max(0, layoutIndex - layoutCursor) * 0.15);
+
+    if (contentBlock.kind === 'figure' || contentBlock.kind === 'table') {
+        const captionScore = compareTextSimilarity(
+            contentBlock.captionText || contentBlock.groupCaption || contentBlock.text,
+            layoutBlock.captionText || layoutBlock.groupCaption || layoutBlock.text
+        );
+        const assetFileMatches = extractAssetFileName(contentBlock.assetPath) !== ''
+            && extractAssetFileName(contentBlock.assetPath) === extractAssetFileName(layoutBlock.assetPath);
+        const childCountMatches = contentBlock.children.length > 0
+            && contentBlock.children.length === layoutBlock.children.length;
+        const hasSignal = assetFileMatches || captionScore >= 0.45 || childCountMatches;
+
+        if (!hasSignal) {
+            return { score: Number.NEGATIVE_INFINITY, confident: false };
+        }
+
+        score += captionScore * 8;
+        if (assetFileMatches) score += 7;
+        if (childCountMatches) score += 2.5;
+
+        return {
+            score,
+            confident: assetFileMatches || captionScore >= 0.5 || (childCountMatches && pageDistance === 0),
+        };
+    }
+
+    const textScore = compareTextSimilarity(contentBlock.text, layoutBlock.text);
+    if (textScore < 0.32) {
+        return { score: Number.NEGATIVE_INFINITY, confident: false };
+    }
+
+    score += textScore * 8;
+    return {
+        score,
+        confident: textScore >= 0.52 || (pageDistance === 0 && orderDistance <= 1 && textScore >= 0.4),
+    };
+}
+
+function mergeAnchorsWithLayoutGeometry(contentBlock: RawSemanticBlock, layoutBlock: RawSemanticBlock): RawSemanticAnchor[] {
+    const fallbackAnchors = contentBlock.anchors.length > 0 ? contentBlock.anchors : layoutBlock.anchors;
+    const geometryAnchors = layoutBlock.anchors.length > 0 ? layoutBlock.anchors : fallbackAnchors;
+    const mergedSourceRefs = dedupeStrings([...contentBlock.sourceRefs, ...layoutBlock.sourceRefs]);
+
+    return geometryAnchors.map((anchor) => ({
+        ...anchor,
+        sourceRefs: dedupeStrings([...anchor.sourceRefs, ...mergedSourceRefs]),
+    }));
+}
+
+function mergeChildrenWithLayoutGeometry(
+    contentBlock: RawSemanticBlock,
+    layoutBlock: RawSemanticBlock
+): DocumentSemanticChild[] {
+    if (contentBlock.children.length === 0 || layoutBlock.children.length === 0) {
+        return contentBlock.children;
+    }
+
+    const matchedLayoutChildren = layoutBlock.children;
+    const useIndexPairing = contentBlock.children.length === matchedLayoutChildren.length;
+
+    return contentBlock.children.map((child, childIndex) => {
+        let matchedChild: DocumentSemanticChild | null = null;
+
+        if (useIndexPairing) {
+            matchedChild = matchedLayoutChildren[childIndex] || null;
+        } else {
+            let bestScore = Number.NEGATIVE_INFINITY;
+            for (const candidate of matchedLayoutChildren) {
+                const assetMatch = extractAssetFileName(child.assetPath) !== ''
+                    && extractAssetFileName(child.assetPath) === extractAssetFileName(candidate.assetPath);
+                const captionScore = compareTextSimilarity(
+                    child.subfigureCaption || child.captionText,
+                    candidate.subfigureCaption || candidate.captionText
+                );
+                const score = (assetMatch ? 5 : 0) + (captionScore * 4);
+                if (score > bestScore) {
+                    bestScore = score;
+                    matchedChild = candidate;
+                }
+            }
+        }
+
+        if (!matchedChild) {
+            return child;
+        }
+
+        return {
+            ...child,
+            pageIndex: matchedChild.pageIndex,
+            bbox: matchedChild.bbox || child.bbox,
+            assetPath: child.assetPath || matchedChild.assetPath || null,
+            captionText: child.captionText || matchedChild.captionText,
+            subfigureCaption: child.subfigureCaption || matchedChild.subfigureCaption,
+            groupCaption: child.groupCaption || matchedChild.groupCaption,
+            markdown: child.markdown || matchedChild.markdown,
+            sourceRefs: dedupeStrings([
+                ...child.sourceRefs,
+                ...matchedChild.sourceRefs,
+                ...contentBlock.sourceRefs,
+                ...layoutBlock.sourceRefs,
+            ]),
+        };
+    });
+}
+
+function mergeContentBlocksWithLayoutGeometry(
+    contentBlocks: RawSemanticBlock[],
+    layoutBlocks: RawSemanticBlock[]
+): RawSemanticBlock[] {
+    if (contentBlocks.length === 0 || layoutBlocks.length === 0) {
+        return contentBlocks;
+    }
+
+    const mergedBlocks: RawSemanticBlock[] = [];
+    let layoutCursor = 0;
+
+    for (const [contentIndex, contentBlock] of contentBlocks.entries()) {
+        const contentHasKnownGeometry = hasKnownGeometry(contentBlock);
+        let bestMatchIndex = -1;
+        let bestMatchScore = Number.NEGATIVE_INFINITY;
+
+        for (let layoutIndex = layoutCursor; layoutIndex < layoutBlocks.length; layoutIndex += 1) {
+            const layoutBlock = layoutBlocks[layoutIndex];
+            if (contentHasKnownGeometry && layoutBlock.pageIndex > contentBlock.pageIndex + 1) {
+                break;
+            }
+            if (layoutIndex - layoutCursor > 40) {
+                break;
+            }
+
+            const match = evaluateRawBlockMatch(contentBlock, layoutBlock, contentIndex, layoutIndex, layoutCursor);
+            if (!match.confident || match.score <= bestMatchScore) {
+                continue;
+            }
+
+            bestMatchIndex = layoutIndex;
+            bestMatchScore = match.score;
+        }
+
+        if (bestMatchIndex === -1) {
+            mergedBlocks.push(contentBlock);
+            continue;
+        }
+
+        const matchedLayoutBlock = layoutBlocks[bestMatchIndex];
+        const mergedChildren = mergeChildrenWithLayoutGeometry(contentBlock, matchedLayoutBlock);
+        const mergedBBox = matchedLayoutBlock.bbox
+            || unionBBox(mergedChildren.map((child) => child.bbox))
+            || contentBlock.bbox;
+
+        mergedBlocks.push({
+            ...contentBlock,
+            pageIndex: matchedLayoutBlock.pageIndex,
+            bbox: mergedBBox,
+            children: mergedChildren,
+            sourceRefs: dedupeStrings([...contentBlock.sourceRefs, ...matchedLayoutBlock.sourceRefs]),
+            anchors: mergeAnchorsWithLayoutGeometry(contentBlock, matchedLayoutBlock),
+        });
+        layoutCursor = bestMatchIndex + 1;
+    }
+
+    return mergedBlocks;
+}
+
 function mergeFigureGroups(blocks: RawSemanticBlock[]): RawSemanticBlock[] {
     const merged: RawSemanticBlock[] = [];
 
@@ -1025,12 +1327,24 @@ function mergeFigureGroups(blocks: RawSemanticBlock[]): RawSemanticBlock[] {
             cursor += 1;
         }
 
-        const totalCaption = cluster.map((block) => block.groupCaption || '').find(Boolean) || '';
-        const subfigureCount = cluster.filter((block) => Boolean(block.subfigureCaption)).length;
+        const assetBlocks = cluster.filter((block) => Boolean(block.assetPath));
+        const captionOnlyBlocks = cluster.filter((block) => !block.assetPath);
+        const totalCaption = cluster.map((block) => block.groupCaption || '').find(Boolean)
+            || captionOnlyBlocks
+                .map((block) => block.captionText || block.text)
+                .find((text) => looksLikeStandaloneFigureCaption(text || ''))
+            || '';
+        const subfigureCount = assetBlocks.filter((block) => Boolean(block.subfigureCaption)).length;
+        const shouldMergeCluster = assetBlocks.length > 0 && (
+            assetBlocks.length >= 2 ||
+            captionOnlyBlocks.length > 0 ||
+            Boolean(totalCaption) ||
+            subfigureCount >= 2
+        );
 
-        if (cluster.length >= 2 && (Boolean(totalCaption) || subfigureCount >= 2)) {
-            const first = cluster[0];
-            const children: DocumentSemanticChild[] = cluster.map((block) => ({
+        if (shouldMergeCluster) {
+            const primaryBlock = assetBlocks[0] || cluster[0];
+            const children: DocumentSemanticChild[] = assetBlocks.map((block) => ({
                 id: `${block.id}:child`,
                 pageIndex: block.pageIndex,
                 bbox: block.bbox,
@@ -1041,17 +1355,23 @@ function mergeFigureGroups(blocks: RawSemanticBlock[]): RawSemanticBlock[] {
                 markdown: block.markdown,
                 sourceRefs: [...block.sourceRefs],
             }));
+            const isFigureGroup = assetBlocks.length >= 2;
+            const mergedCaption = totalCaption
+                || primaryBlock.groupCaption
+                || primaryBlock.captionText
+                || captionOnlyBlocks.map((block) => block.captionText || block.text).find(Boolean)
+                || '';
             merged.push({
-                ...first,
-                id: `${first.id}-group`,
-                rawType: 'figure_group',
-                text: totalCaption || cluster.map((block) => block.subfigureCaption || block.captionText || '').join(' ').trim(),
+                ...primaryBlock,
+                id: `${primaryBlock.id}-group`,
+                rawType: isFigureGroup ? 'figure_group' : 'figure_caption',
+                text: mergedCaption || cluster.map((block) => block.subfigureCaption || block.captionText || '').join(' ').trim(),
                 markdown: cluster.map((block) => block.markdown).filter(Boolean).join('\n\n'),
                 bbox: unionBBox(cluster.map((block) => block.bbox)),
-                captionText: totalCaption,
-                groupCaption: totalCaption,
-                assetPath: null,
-                children,
+                captionText: mergedCaption,
+                groupCaption: mergedCaption,
+                assetPath: isFigureGroup ? null : primaryBlock.assetPath,
+                children: isFigureGroup ? children : [],
                 sourceRefs: cluster.flatMap((block) => block.sourceRefs),
                 anchors: cluster.flatMap((block) => block.anchors),
             });
@@ -1091,8 +1411,12 @@ function mergeMediaInterruptedParagraphs(blocks: RawSemanticBlock[]): RawSemanti
             clusterEnd += 1;
         }
 
+        const mediaCluster = blocks.slice(clusterStart, clusterEnd + 1);
         const nextParagraph = blocks[clusterEnd + 1];
-        if (nextParagraph?.kind !== 'paragraph' || !looksLikeParagraphContinuation(current.text, nextParagraph.text)) {
+        const samePageCluster = nextParagraph?.kind === 'paragraph'
+            && current.pageIndex === nextParagraph.pageIndex
+            && mediaCluster.every((block) => block.pageIndex === current.pageIndex);
+        if (!samePageCluster || !looksLikeParagraphContinuation(current.text, nextParagraph.text)) {
             merged.push(current);
             continue;
         }
@@ -1196,6 +1520,27 @@ function assignSemanticMetadata(blocks: RawSemanticBlock[]): DocumentSemanticPro
             });
             return [anchorId];
         });
+        const semanticChildren = block.children.map((child, childIndex) => {
+            const childSemanticId = `${semanticId}-child-${childIndex}`;
+
+            if (child.bbox) {
+                anchors.push({
+                    id: `${block.id}:child:${childIndex}:anchor`,
+                    semanticId: childSemanticId,
+                    blockId: child.id,
+                    pageIndex: child.pageIndex,
+                    bbox: child.bbox,
+                    kind: block.kind,
+                    rawType: `${block.rawType}:child`,
+                    sourceRefs: [...child.sourceRefs],
+                });
+            }
+
+            return {
+                ...child,
+                semanticId: childSemanticId,
+            };
+        });
 
         semanticBlocks.push({
             id: block.id,
@@ -1213,7 +1558,7 @@ function assignSemanticMetadata(blocks: RawSemanticBlock[]): DocumentSemanticPro
             groupCaption: block.groupCaption,
             assetPath: block.assetPath,
             tableHtml: block.tableHtml,
-            children: block.children,
+            children: semanticChildren,
             sourceRefs: [...block.sourceRefs],
             anchorIds,
         });
@@ -1274,11 +1619,35 @@ export function buildDocumentSemanticProjection(input: {
 }): DocumentSemanticProjection {
     const pageSizes = input.layout ? extractPageSizes(input.layout) : {};
 
+    if (input.contentList && input.layout) {
+        const contentBlocks = buildRawBlocksFromContentList(input.contentList, input.assetPathPrefix);
+        const layoutBlocks = buildRawBlocksFromLayout(input.layout, input.assetPathPrefix);
+        const base = assignSemanticMetadata(mergeContentBlocksWithLayoutGeometry(contentBlocks, layoutBlocks));
+        return {
+            ...base,
+            source: 'content-list-v2',
+            lowFidelity: false,
+            pageSizes: Object.keys(pageSizes).length > 0 ? pageSizes : inferPageSizesFromAnchors(base.anchors),
+        };
+    }
+
     if (input.contentList) {
         const base = assignSemanticMetadata(buildRawBlocksFromContentList(input.contentList, input.assetPathPrefix));
         return {
             ...base,
             source: 'content-list-v2',
+            lowFidelity: false,
+            pageSizes: Object.keys(pageSizes).length > 0 ? pageSizes : inferPageSizesFromAnchors(base.anchors),
+        };
+    }
+
+    if (input.layout && input.markdown) {
+        const markdownBlocks = buildRawBlocksFromMarkdown(input.markdown);
+        const layoutBlocks = buildRawBlocksFromLayout(input.layout, input.assetPathPrefix);
+        const base = assignSemanticMetadata(mergeContentBlocksWithLayoutGeometry(markdownBlocks, layoutBlocks));
+        return {
+            ...base,
+            source: 'layout',
             lowFidelity: false,
             pageSizes: Object.keys(pageSizes).length > 0 ? pageSizes : inferPageSizesFromAnchors(base.anchors),
         };

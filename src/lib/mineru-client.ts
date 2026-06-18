@@ -1,4 +1,4 @@
-import axios, { type AxiosInstance } from "axios";
+import axios, { type AxiosError, type AxiosInstance } from "axios";
 import { Agent } from "node:https";
 
 const DEFAULT_EXTRA_FORMATS = ["html", "latex"];
@@ -45,6 +45,107 @@ export interface ExtractStatusResult {
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+export class MinerUUpstreamError extends Error {
+    statusCode?: number;
+    retryable: boolean;
+
+    constructor(message: string, options?: { statusCode?: number; retryable?: boolean; cause?: unknown }) {
+        super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+        this.name = "MinerUUpstreamError";
+        this.statusCode = options?.statusCode;
+        this.retryable = options?.retryable ?? false;
+    }
+}
+
+export function isMinerUUpstreamError(error: unknown): error is MinerUUpstreamError {
+    return error instanceof MinerUUpstreamError;
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatusCode(statusCode?: number): boolean {
+    if (!statusCode) return true;
+    return statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500;
+}
+
+function extractAxiosErrorMessage(error: AxiosError): string {
+    const responseData = error.response?.data;
+
+    if (typeof responseData === "string" && responseData.trim()) {
+        return responseData.trim();
+    }
+
+    if (responseData && typeof responseData === "object") {
+        const maybeMessage = (responseData as Record<string, unknown>).msg
+            ?? (responseData as Record<string, unknown>).message
+            ?? (responseData as Record<string, unknown>).error;
+
+        if (typeof maybeMessage === "string" && maybeMessage.trim()) {
+            return maybeMessage.trim();
+        }
+    }
+
+    return error.message;
+}
+
+function normalizeMinerUError(context: string, error: unknown): MinerUUpstreamError {
+    if (error instanceof MinerUUpstreamError) {
+        return error;
+    }
+
+    if (axios.isAxiosError(error)) {
+        const statusCode = error.response?.status;
+        const retryable = isRetryableStatusCode(statusCode)
+            || ["ECONNABORTED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(error.code || "");
+        const detail = extractAxiosErrorMessage(error);
+        return new MinerUUpstreamError(`${context}: ${detail}`, {
+            statusCode,
+            retryable,
+            cause: error,
+        });
+    }
+
+    const fallbackMessage = getErrorMessage(error);
+    const retryable = /timeout|network|socket|connect|upstream error|request failed/i.test(fallbackMessage);
+    return new MinerUUpstreamError(`${context}: ${fallbackMessage}`, {
+        retryable,
+        cause: error,
+    });
+}
+
+async function withMinerURetry<T>(
+    context: string,
+    request: () => Promise<T>,
+    options?: { attempts?: number; baseDelayMs?: number }
+): Promise<T> {
+    const attempts = options?.attempts ?? 3;
+    const baseDelayMs = options?.baseDelayMs ?? 1200;
+    let lastError: MinerUUpstreamError | null = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            return await request();
+        } catch (error) {
+            const normalizedError = normalizeMinerUError(context, error);
+            lastError = normalizedError;
+
+            if (!normalizedError.retryable || attempt === attempts) {
+                throw normalizedError;
+            }
+
+            console.warn(
+                `[MinerU] ${context} failed (attempt ${attempt}/${attempts}), retrying...`,
+                normalizedError.message
+            );
+            await sleep(baseDelayMs * attempt);
+        }
+    }
+
+    throw lastError ?? new MinerUUpstreamError(`${context}: Unknown error`, { retryable: false });
 }
 
 function readOptionalStringEnv(name: string): string | undefined {
@@ -160,17 +261,17 @@ export class MinerUClient {
             payload.extra_formats = resolvedOptions.extraFormats;
         }
 
-        try {
+        return withMinerURetry("Failed to apply batch upload", async () => {
             const { data } = await this.client.post("/file-urls/batch", payload);
 
             if (data.code !== 0) {
-                throw new Error(`MinerU API Error [${data.code}]: ${data.msg}`);
+                throw new MinerUUpstreamError(`Failed to apply batch upload: MinerU API Error [${data.code}]: ${data.msg}`, {
+                    retryable: false,
+                });
             }
 
             return data.data;
-        } catch (error: unknown) {
-            throw new Error(`Failed to apply batch upload: ${getErrorMessage(error)}`);
-        }
+        });
     }
 
     /**
@@ -179,14 +280,15 @@ export class MinerUClient {
      * 使用原生 fetch 以精确控制请求头，避免 axios 自动添加额外头部
      */
     async uploadFileToUrl(url: string, fileBuffer: Buffer | ArrayBuffer | Blob): Promise<void> {
-        try {
-            const body = fileBuffer instanceof Blob
-                ? fileBuffer
-                : new Uint8Array(fileBuffer instanceof ArrayBuffer ? fileBuffer : fileBuffer.buffer);
+        const body = fileBuffer instanceof Blob
+            ? fileBuffer
+            : new Uint8Array(fileBuffer instanceof ArrayBuffer ? fileBuffer : fileBuffer.buffer);
 
+        await withMinerURetry("Failed to upload file to signed URL", async () => {
             const response = await fetch(url, {
                 method: "PUT",
                 body: body as BodyInit,
+                signal: AbortSignal.timeout(60_000),
             });
 
             if (!response.ok) {
@@ -194,38 +296,34 @@ export class MinerUClient {
                 console.error("Upload failed with response:", {
                     status: response.status,
                     statusText: response.statusText,
-                    body: errorText,
+                    bodyPreview: errorText ? errorText.slice(0, 200) : "",
                 });
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+                throw new MinerUUpstreamError(
+                    `Failed to upload file to signed URL: HTTP ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ""}`,
+                    {
+                        statusCode: response.status,
+                        retryable: isRetryableStatusCode(response.status),
+                    }
+                );
             }
-        } catch (error: unknown) {
-            throw new Error(`Failed to upload file to signed URL: ${getErrorMessage(error)}`);
-        }
+        }, { attempts: 3, baseDelayMs: 1500 });
     }
 
     /**
      * Step 3: 查询批量任务状态
      */
     async getBatchStatus(batchId: string): Promise<ExtractStatusResult> {
-        let retries = 3;
-        while (retries > 0) {
-            try {
-                const { data } = await this.client.get(`/extract-results/batch/${batchId}`);
+        return withMinerURetry("Failed to get batch status", async () => {
+            const { data } = await this.client.get(`/extract-results/batch/${batchId}`);
 
-                if (data.code !== 0) {
-                    throw new Error(`MinerU API Error [${data.code}]: ${data.msg}`);
-                }
-
-                return data.data;
-            } catch (error: unknown) {
-                retries--;
-                if (retries === 0) {
-                    throw new Error(`Failed to get batch status after 3 attempts: ${getErrorMessage(error)}`);
-                }
-                console.warn(`[MinerU] Status check failed, retrying... (${retries} attempts left)`);
-                await new Promise((resolve) => setTimeout(resolve, 2000));
+            if (data.code !== 0) {
+                throw new MinerUUpstreamError(`Failed to get batch status: MinerU API Error [${data.code}]: ${data.msg}`, {
+                    retryable: false,
+                });
             }
-        }
-        throw new Error("Failed to get batch status: Unknown error");
+
+            return data.data;
+        }, { attempts: 3, baseDelayMs: 2000 });
     }
 }

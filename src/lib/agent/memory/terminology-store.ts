@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { parse } from 'csv-parse/sync';
+import { getTermsRoot } from '@/lib/server/runtime-paths';
 
 export interface Term {
     source: string;
@@ -110,5 +111,5 @@ export class TerminologyStore {
 }
 
 // Singleton instance for the application
-const TERMS_DIR = path.join(process.cwd(), 'terms');
+const TERMS_DIR = getTermsRoot();
 export const terminologyStore = new TerminologyStore(TERMS_DIR);

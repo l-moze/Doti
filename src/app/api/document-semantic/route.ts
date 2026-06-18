@@ -1,69 +1,67 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
 import path from 'path';
+import { buildRawMediaPrefix } from '@/lib/media-access';
 import { buildDocumentSemanticProjection } from '@/lib/document-semantic';
-import { findPreferredRelativeFilePath } from '@/lib/upload-artifacts';
+import {
+    directoryExists,
+    findUploadArtifactPaths,
+    readJsonFileIfExists,
+    readTextFileIfExists,
+    resolveUploadDir,
+} from '@/lib/upload-artifacts';
 
 type DocumentSemanticRequest = {
     fileHash?: string;
     sourceMarkdown?: string;
 };
 
-function readJsonFile(filePath: string | null): unknown {
-    if (!filePath || !fs.existsSync(filePath)) return null;
-
-    try {
-        return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-    } catch (error) {
-        console.warn('[document-semantic] Failed to parse JSON:', filePath, error);
-        return null;
-    }
-}
-
-function readTextFile(filePath: string | null): string {
-    if (!filePath || !fs.existsSync(filePath)) return '';
-
-    try {
-        return fs.readFileSync(filePath, 'utf-8');
-    } catch (error) {
-        console.warn('[document-semantic] Failed to read text:', filePath, error);
-        return '';
-    }
-}
+const projectionCache = new Map<string, {
+    projection: ReturnType<typeof buildDocumentSemanticProjection>;
+    markdownSignature: string | null;
+}>();
 
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json() as DocumentSemanticRequest;
         const fileHash = body.fileHash?.trim();
-        const uploadsRoot = path.join(process.cwd(), 'uploads');
-        const uploadDir = fileHash ? path.join(uploadsRoot, fileHash) : null;
+        const markdownSignature = body.sourceMarkdown?.trim() || '';
+        const uploadDir = fileHash ? resolveUploadDir(fileHash) : null;
 
-        if (!fileHash || !uploadDir || !fs.existsSync(uploadDir)) {
+        if (!fileHash || !uploadDir || !(await directoryExists(uploadDir))) {
             return NextResponse.json({ error: 'Document not found.' }, { status: 404 });
         }
 
-        const contentListRelativePath = findPreferredRelativeFilePath(
-            uploadDir,
-            (relativePath, fileName) => fileName === 'content_list_v2.json' || relativePath.endsWith('/content_list_v2.json')
-        );
-        const layoutRelativePath = findPreferredRelativeFilePath(
-            uploadDir,
-            (relativePath, fileName) => fileName === 'layout.json' || relativePath.endsWith('/layout.json')
-        );
-        const markdownRelativePath = findPreferredRelativeFilePath(
-            uploadDir,
-            (relativePath, fileName) => fileName === 'full.md' || relativePath.endsWith('/full.md')
-        );
+        const cachedEntry = projectionCache.get(fileHash);
+        if (cachedEntry) {
+            const isStructuredProjection = cachedEntry.projection.source !== 'markdown';
+            if (isStructuredProjection || cachedEntry.markdownSignature === markdownSignature) {
+                return NextResponse.json(cachedEntry.projection, {
+                    headers: {
+                        'Cache-Control': 'no-store',
+                    },
+                });
+            }
+        }
 
-        const contentList = readJsonFile(contentListRelativePath ? path.join(uploadDir, contentListRelativePath) : null);
-        const layout = readJsonFile(layoutRelativePath ? path.join(uploadDir, layoutRelativePath) : null);
-        const markdown = body.sourceMarkdown || readTextFile(markdownRelativePath ? path.join(uploadDir, markdownRelativePath) : null);
+        const { contentListRelativePath, layoutJsonRelativePath, markdownRelativePath } =
+            await findUploadArtifactPaths(uploadDir);
+
+        const [contentList, layout, markdownFromDisk] = await Promise.all([
+            readJsonFileIfExists(contentListRelativePath ? path.join(uploadDir, contentListRelativePath) : null),
+            readJsonFileIfExists(layoutJsonRelativePath ? path.join(uploadDir, layoutJsonRelativePath) : null),
+            readTextFileIfExists(markdownRelativePath ? path.join(uploadDir, markdownRelativePath) : null),
+        ]);
+        const markdown = body.sourceMarkdown || markdownFromDisk;
 
         const projection = buildDocumentSemanticProjection({
             contentList,
             layout,
             markdown,
-            assetPathPrefix: `/api/media/${fileHash}`,
+            assetPathPrefix: buildRawMediaPrefix(fileHash),
+        });
+        projectionCache.set(fileHash, {
+            projection,
+            markdownSignature: projection.source === 'markdown' ? markdown.trim() : null,
         });
 
         return NextResponse.json(projection, {

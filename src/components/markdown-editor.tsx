@@ -38,6 +38,7 @@ import { StreamingTranslationPane } from '@/components/streaming-translation-pan
 import type { TranslationStreamFrame } from '@/components/translation-stream';
 import { CheckCircle2, Loader2, MessageSquarePlus, NotebookPen, RotateCcw, Search, Sparkles, Trash2, Wand2, X } from 'lucide-react';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 
 type SidePanelTab = 'notes' | 'ai';
 type AssistAction = 'explain' | 'summarize' | 'rewrite' | 'extract' | 'qa';
@@ -243,45 +244,91 @@ interface MarkdownEditorProps {
 }
 
 export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjection = null }: MarkdownEditorProps) {
-    const sourceMarkdown = useTranslationStore((state) => state.sourceMarkdown);
-    const status = useTranslationStore((state) => state.status);
-    const progress = useTranslationStore((state) => state.progress);
-    const highlightedBlockId = useTranslationStore((state) => state.highlightedBlockId);
-    const setHighlightedBlock = useTranslationStore((state) => state.setHighlightedBlock);
-    const fileHash = useTranslationStore((state) => state.fileHash);
-    const targetLang = useTranslationStore((state) => state.targetLang);
-    const assistProviderId = useTranslationStore((state) => state.assistProviderId);
-    const assistModel = useTranslationStore((state) => state.assistModel);
-    const paperPolishStatus = useTranslationStore((state) => state.paperPolishStatus);
-    const paperPolishMode = useTranslationStore((state) => state.paperPolishMode);
-    const paperPolishProgress = useTranslationStore((state) => state.paperPolishProgress);
-    const paperPolishMessage = useTranslationStore((state) => state.paperPolishMessage);
-    const paperPolishSummary = useTranslationStore((state) => state.paperPolishSummary);
-    const paperPolishResidualCount = useTranslationStore((state) => state.paperPolishIssueWindows.length);
-    const paperPolishCanUseAiFallback = useTranslationStore((state) => state.paperPolishCanUseAiFallback);
-    const paperPolishAutoEnabled = useTranslationStore((state) => state.paperPolishAutoEnabled);
-    const paperPolishUndoExpiresAt = useTranslationStore((state) => state.paperPolishUndoExpiresAt);
-    const paperPolishRevealKey = useTranslationStore((state) => state.paperPolishRevealKey);
-    const setPaperPolishAutoEnabled = useTranslationStore((state) => state.setPaperPolishAutoEnabled);
-    const runPaperPolish = useTranslationStore((state) => state.runPaperPolish);
-    const runPaperPolishAiFallback = useTranslationStore((state) => state.runPaperPolishAiFallback);
-    const cancelPaperPolish = useTranslationStore((state) => state.cancelPaperPolish);
-    const undoPaperPolish = useTranslationStore((state) => state.undoPaperPolish);
-    const translationStatus = useTranslationStore((state) => state.translationStatus);
-    const translationPhase = useTranslationStore((state) => state.translationPhase);
-    const translationConcurrency = useTranslationStore((state) => state.translationConcurrency);
-    const error = useTranslationStore((state) => state.error);
-    const hasTranslationContent = useTranslationStore((state) =>
-        state.translationBlocks.length > 0 || Boolean(state.targetMarkdown.trim())
-    );
-    const translationDecorationVersion = useTranslationStore((state) => {
+    const {
+        sourceMarkdown,
+        batchId,
+        status,
+        progress,
+        highlightedBlockId,
+        fileHash,
+        targetLang,
+        assistProviderId,
+        assistModel,
+        paperPolishStatus,
+        paperPolishMode,
+        paperPolishProgress,
+        paperPolishMessage,
+        paperPolishSummary,
+        paperPolishResidualCount,
+        paperPolishCanUseAiFallback,
+        paperPolishAutoEnabled,
+        paperPolishUndoExpiresAt,
+        paperPolishRevealKey,
+        translationStatus,
+        translationPhase,
+        translationConcurrency,
+        error,
+        hasTranslationContent,
+        translationDecorationVersion,
+    } = useTranslationStore(useShallow((state) => {
         const completedBlockCount = state.translationBlocks.reduce((count, block) => (
             block.state === 'completed' || block.state === 'cached'
                 ? count + 1
                 : count
         ), 0);
-        return `${completedBlockCount}:${state.targetMarkdown.trim().length > 0 ? 1 : 0}`;
-    });
+        const isRecoverableParseTask = Boolean(
+            state.batchId &&
+            state.fileHash &&
+            (state.status === 'parsing' || (state.status === 'error' && !state.sourceMarkdown.trim()))
+        );
+
+        return {
+            sourceMarkdown: state.sourceMarkdown,
+            batchId: state.batchId,
+            status: state.status,
+            progress: state.progress,
+            highlightedBlockId: state.highlightedBlockId,
+            fileHash: state.fileHash,
+            targetLang: state.targetLang,
+            assistProviderId: state.assistProviderId,
+            assistModel: state.assistModel,
+            paperPolishStatus: state.paperPolishStatus,
+            paperPolishMode: state.paperPolishMode,
+            paperPolishProgress: state.paperPolishProgress,
+            paperPolishMessage: state.paperPolishMessage,
+            paperPolishSummary: state.paperPolishSummary,
+            paperPolishResidualCount: state.paperPolishIssueWindows.length,
+            paperPolishCanUseAiFallback: state.paperPolishCanUseAiFallback,
+            paperPolishAutoEnabled: state.paperPolishAutoEnabled,
+            paperPolishUndoExpiresAt: state.paperPolishUndoExpiresAt,
+            paperPolishRevealKey: state.paperPolishRevealKey,
+            translationStatus: state.translationStatus,
+            translationPhase: state.translationPhase,
+            translationConcurrency: state.translationConcurrency,
+            error: state.error,
+            hasTranslationContent: isRecoverableParseTask
+                ? false
+                : state.translationBlocks.length > 0 || Boolean(state.targetMarkdown.trim()),
+            translationDecorationVersion: isRecoverableParseTask
+                ? `${completedBlockCount}:0`
+                : `${completedBlockCount}:${state.targetMarkdown.trim().length > 0 ? 1 : 0}`,
+        };
+    }));
+    const {
+        setHighlightedBlock,
+        setPaperPolishAutoEnabled,
+        runPaperPolish,
+        runPaperPolishAiFallback,
+        cancelPaperPolish,
+        undoPaperPolish,
+    } = useTranslationStore(useShallow((state) => ({
+        setHighlightedBlock: state.setHighlightedBlock,
+        setPaperPolishAutoEnabled: state.setPaperPolishAutoEnabled,
+        runPaperPolish: state.runPaperPolish,
+        runPaperPolishAiFallback: state.runPaperPolishAiFallback,
+        cancelPaperPolish: state.cancelPaperPolish,
+        undoPaperPolish: state.undoPaperPolish,
+    })));
 
     const vlookLoaded = useVlookStyle();
     const [manualTab, setManualTab] = useState<EditorTab | null>(null);
@@ -325,7 +372,13 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     const pointerSelectionCommitRef = useRef<number | null>(null);
     const paperPolishTimersRef = useRef<number[]>([]);
 
-    const renderedSourceMarkdown = useMemo(() => normalizeMarkdownMathForDisplay(sourceMarkdown), [sourceMarkdown]);
+    const isRecoverableParseTask = Boolean(
+        batchId &&
+        fileHash &&
+        (status === 'parsing' || (status === 'error' && !sourceMarkdown.trim()))
+    );
+    const effectiveSourceMarkdown = isRecoverableParseTask ? '' : sourceMarkdown;
+    const renderedSourceMarkdown = useMemo(() => normalizeMarkdownMathForDisplay(effectiveSourceMarkdown), [effectiveSourceMarkdown]);
     const activeTab: EditorTab = manualTab ?? (status === 'parsed' && !hasTranslationContent ? 'source' : 'translation');
     const activeDocumentId = fileHash ? getDocumentId(fileHash, targetLang, activeTab) : null;
     const translationHeaderLabel = translationConcurrency > 1 ? `并发翻译中 · ${translationConcurrency} 路` : '翻译进行中';
@@ -750,18 +803,24 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         if (previousHighlightedBlockIdRef.current === highlightedBlockId) return;
         previousHighlightedBlockIdRef.current = highlightedBlockId;
 
+        const parentSemanticId = highlightedBlockId.match(/^(sec-\d+-[a-z]+-\d+)-child-\d+$/)?.[1] || null;
+        const semanticSelectors = highlightedBlockId.startsWith('sec-')
+            ? [
+                `[data-semantic-block-id="${highlightedBlockId}"]`,
+                ...(parentSemanticId ? [`[data-semantic-block-id="${parentSemanticId}"]`] : []),
+            ]
+            : [`[data-heading-index="${highlightedBlockId}"]`];
+
         const findTarget = (tab: EditorTab) => {
             const bodies = getMarkdownBodies(tab === 'translation' ? translationPaneRef.current : sourcePaneRef.current);
             if (bodies.length === 0) return null;
 
-            const selector = highlightedBlockId.startsWith('sec-')
-                ? `[data-semantic-block-id="${highlightedBlockId}"]`
-                : `[data-heading-index="${highlightedBlockId}"]`;
-
             for (const body of bodies) {
-                const element = body.querySelector<HTMLElement>(selector);
-                if (element) {
-                    return { tab, element };
+                for (const selector of semanticSelectors) {
+                    const element = body.querySelector<HTMLElement>(selector);
+                    if (element) {
+                        return { tab, element };
+                    }
                 }
             }
 
@@ -1158,7 +1217,12 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         void runAssist('qa');
     };
 
-    const canRunPaperPolish = Boolean(sourceMarkdown.trim()) && status !== 'uploading' && status !== 'parsing' && status !== 'translating';
+    const canRunPaperPolish =
+        Boolean(effectiveSourceMarkdown.trim()) &&
+        !isRecoverableParseTask &&
+        status !== 'uploading' &&
+        status !== 'parsing' &&
+        status !== 'translating';
     const paperPolishProcessing = paperPolishStatus === 'processing';
     const handleRunPaperPolish = () => {
         if (!canRunPaperPolish) return;
@@ -1540,7 +1604,11 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                         </>
                     )}
                     {status === 'completed' && <span className="font-medium text-emerald-600">译文已完成</span>}
-                    {status === 'error' && <span className="font-medium text-red-600">翻译异常</span>}
+                    {status === 'error' && (
+                        <span className="font-medium text-red-600">
+                            {isRecoverableParseTask ? '解析异常' : '翻译异常'}
+                        </span>
+                    )}
                 </div>
             </div>
 
@@ -1585,7 +1653,10 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                     >
                         <div className={sourcePanePolishClass}>
                             {sourceProjection ? (
-                                <StructuredSourceView projection={sourceProjection} />
+                                <StructuredSourceView
+                                    projection={sourceProjection}
+                                    highlightedBlockId={highlightedBlockId}
+                                />
                             ) : (
                                 <MarkdownView value={displayedSourceMarkdown || renderedSourceMarkdown || '_No source content available_'} />
                             )}

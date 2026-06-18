@@ -2,11 +2,19 @@
   "name": "doti",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "postbuild": "node scripts/prepare-standalone.cjs",
     "start": "next start",
-    "lint": "eslint"
+    "electron": "electron .",
+    "desktop:stage": "node scripts/prepare-electron-app.cjs",
+    "desktop:dir": "node scripts/desktop-build.cjs --dir",
+    "desktop:build": "node scripts/desktop-build.cjs --win",
+    "lint": "eslint src public next.config.ts eslint.config.mjs tailwind.config.ts --cache --cache-location .cache/eslint",
+    "typecheck": "tsc --noEmit",
+    "test:desktop": "node --test tests/desktop-auth.test.mjs tests/runtime-paths.test.mjs tests/electron-runtime.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
@@ -51,9 +59,47 @@
     "@types/node": "^20.19.27",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
     "eslint": "^9",
     "eslint-config-next": "16.1.0",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "build": {
+    "appId": "cn.doti.pdf",
+    "productName": "Doti",
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".next-rel/standalone",
+        "to": ".next/standalone",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "terms",
+        "to": "terms",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "afterPack": "scripts/after-pack.cjs",
+    "asar": true,
+    "win": {
+      "target": "nsis",
+      "signtoolOptions": {
+        "sign": "./scripts/no-op-sign.cjs"
+      }
+    },
+    "directories": {
+      "app": ".desktop-app",
+      "output": "dist-electron"
+    }
   }
 }

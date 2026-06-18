@@ -1,16 +1,16 @@
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
+import { getPdfParseCacheDir } from "@/lib/server/runtime-paths";
 
-// 缓存目录（项目根目录下的 .cache 文件夹）
-const CACHE_DIR = path.join(process.cwd(), ".cache", "pdf-parse");
+const getCacheDir = () => getPdfParseCacheDir();
 
 /**
  * 确保缓存目录存在
  */
 async function ensureCacheDir(): Promise<void> {
     try {
-        await fs.mkdir(CACHE_DIR, { recursive: true });
+        await fs.mkdir(getCacheDir(), { recursive: true });
     } catch {
         // 目录已存在，忽略错误
     }
@@ -28,14 +28,14 @@ export function computeFileHash(buffer: ArrayBuffer | Buffer): string {
  * 获取缓存文件路径
  */
 function getCachePath(hash: string): string {
-    return path.join(CACHE_DIR, `${hash}.md`);
+    return path.join(getCacheDir(), `${hash}.md`);
 }
 
 /**
  * 获取缓存元数据文件路径
  */
 function getMetaPath(hash: string): string {
-    return path.join(CACHE_DIR, `${hash}.meta.json`);
+    return path.join(getCacheDir(), `${hash}.meta.json`);
 }
 
 /**
@@ -114,13 +114,14 @@ export async function getCacheMeta(hash: string): Promise<CacheMeta | null> {
 export async function listAllCaches(): Promise<CacheMeta[]> {
     try {
         await ensureCacheDir();
-        const files = await fs.readdir(CACHE_DIR);
+        const cacheDir = getCacheDir();
+        const files = await fs.readdir(cacheDir);
         const metaFiles = files.filter(f => f.endsWith(".meta.json"));
 
         const metas: CacheMeta[] = [];
         for (const file of metaFiles) {
             try {
-                const content = await fs.readFile(path.join(CACHE_DIR, file), "utf-8");
+                const content = await fs.readFile(path.join(cacheDir, file), "utf-8");
                 metas.push(JSON.parse(content));
             } catch {
                 // 跳过损坏的元数据文件
@@ -149,7 +150,7 @@ export async function deleteCache(hash: string): Promise<void> {
  */
 export async function clearAllCaches(): Promise<void> {
     try {
-        await fs.rm(CACHE_DIR, { recursive: true, force: true });
+        await fs.rm(getCacheDir(), { recursive: true, force: true });
         await ensureCacheDir();
     } catch {
         // 目录不存在或删除失败，忽略

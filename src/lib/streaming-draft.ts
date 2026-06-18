@@ -1,7 +1,7 @@
 import type { PreparedTextWithSegments } from "@chenglou/pretext";
 import {
     getPreparedPretextText,
-    getPretextStatsFromPrepared,
+    getPretextLayoutSnapshotFromPrepared,
     type PretextLayoutLineSnapshot,
     type PretextOptions,
 } from "@/lib/pretext";
@@ -60,6 +60,64 @@ const PRETEXT_OPTIONS: PretextOptions = {
     whiteSpace: "pre-wrap",
     wordBreak: "normal",
 };
+const streamingRenderBlockCache = new Map<string, {
+    signature: string;
+    block: StreamingRenderBlock;
+}>();
+const MAX_STREAMING_RENDER_BLOCK_CACHE_SIZE = 240;
+
+// 模块级引用稳定化：若本次结果与上次所有元素引用相同，则返回上次数组，
+// 避免 useMemo 因引用变化而触发下游 frames 的无谓重算。
+let _lastStableRenderBlocks: StreamingRenderBlock[] = [];
+
+// Paragraph-level cache: avoids recomputing layout for stabilized paragraphs
+// within a live block whose block-level cache is always invalid (text grows each tick).
+const streamingParagraphLayoutCache = new Map<string, StreamingParagraph>();
+const MAX_PARAGRAPH_LAYOUT_CACHE_SIZE = 1200;
+
+function computeTextHash(value: string): number {
+    let hash = 2166136261;
+
+    for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+
+    return hash >>> 0;
+}
+
+function buildStreamingRenderBlockSignature(
+    block: TranslationMarkdownBlock,
+    layoutProfile: DocumentLayoutProfile
+): string {
+    return [
+        layoutProfile.profileVersion,
+        layoutProfile.fontReady ? 1 : 0,
+        Math.round(layoutProfile.contentWidth),
+        block.index,
+        block.state,
+        computeTextHash(block.title || ""),
+        computeTextHash(block.text),
+        block.text.length,
+    ].join(":");
+}
+
+function rememberStreamingRenderBlock(
+    blockId: string,
+    signature: string,
+    block: StreamingRenderBlock
+): StreamingRenderBlock {
+    streamingRenderBlockCache.set(blockId, { signature, block });
+
+    if (streamingRenderBlockCache.size > MAX_STREAMING_RENDER_BLOCK_CACHE_SIZE) {
+        const oldestKey = streamingRenderBlockCache.keys().next().value as string | undefined;
+        if (oldestKey) {
+            streamingRenderBlockCache.delete(oldestKey);
+        }
+    }
+
+    return block;
+}
 
 function estimateFallbackLineCount(text: string): number {
     const physicalLineCount = text.split(/\r?\n/).length;
@@ -79,6 +137,7 @@ function splitDraftParagraphs(text: string): string[] {
     let current: string[] = [];
     let activeFence: "code" | "math" | null = null;
     let codeFenceMarker = "";
+    let currentLength = 0;
 
     const flushCurrent = () => {
         const paragraph = current.join("\n");
@@ -86,6 +145,7 @@ function splitDraftParagraphs(text: string): string[] {
             paragraphs.push(paragraph);
         }
         current = [];
+        currentLength = 0;
     };
 
     for (const line of lines) {
@@ -109,6 +169,7 @@ function splitDraftParagraphs(text: string): string[] {
             }
 
             current.push(line);
+            currentLength += line.length;
             continue;
         }
 
@@ -126,6 +187,7 @@ function splitDraftParagraphs(text: string): string[] {
             }
 
             current.push(line);
+            currentLength += line.length;
             continue;
         }
 
@@ -135,6 +197,12 @@ function splitDraftParagraphs(text: string): string[] {
         }
 
         current.push(line);
+        currentLength += line.length;
+
+        // Max String Length Sectioning: Prevent infinite accumulation of lines into a single paragraph
+        if (!activeFence && currentLength > 1000) {
+            flushCurrent();
+        }
     }
 
     flushCurrent();
@@ -153,6 +221,7 @@ function buildStreamingParagraph(
         layoutProfile.contentWidth - STREAM_DRAFT_BLOCK_HORIZONTAL_PADDING
     );
 
+    // Fallback: Skip expensive layout only if the font is not ready yet.
     if (!layoutProfile.fontReady) {
         const estimatedHeight = estimateFallbackHeight(text, layoutProfile.draftLineHeight);
         return {
@@ -168,41 +237,65 @@ function buildStreamingParagraph(
         };
     }
 
+    // For stabilized paragraphs, check the paragraph-level cache before doing layout.
+    const paragraphCacheKey = `${blockId}:${paragraphIndex}:${layoutProfile.profileVersion}:${Math.round(layoutProfile.contentWidth)}:${computeTextHash(text)}`;
+    const cachedParagraph = streamingParagraphLayoutCache.get(paragraphCacheKey);
+    if (cachedParagraph) {
+        return cachedParagraph;
+    }
+
     const prepared = getPreparedPretextText(text, layoutProfile.draftFont, PRETEXT_OPTIONS);
-    const stats = prepared
-        ? getPretextStatsFromPrepared(prepared, maxWidth)
+    const snapshot = prepared
+        ? getPretextLayoutSnapshotFromPrepared(
+            prepared,
+            maxWidth,
+            layoutProfile.draftLineHeight
+        )
         : null;
 
-    return {
+    const paragraph: StreamingParagraph = {
         id: `${blockId}:paragraph:${paragraphIndex}`,
         text,
         isLive,
-        stage: isLive ? "draft-stream" : "stabilized-block",
+        stage: "stabilized-block",
         prepared,
-        lines: [],
+        lines: snapshot?.lines ?? [],
         estimatedHeight:
-            stats
-                ? Math.max(layoutProfile.draftLineHeight, Math.ceil(stats.lineCount * layoutProfile.draftLineHeight))
+            snapshot
+                ? snapshot.estimatedHeight
                 : estimateFallbackHeight(text, layoutProfile.draftLineHeight),
         lineCount:
-            stats?.lineCount ??
+            snapshot?.lineCount ??
             Math.max(1, Math.ceil(estimateFallbackHeight(text, layoutProfile.draftLineHeight) / layoutProfile.draftLineHeight)),
-        maxLineWidth: stats?.maxLineWidth ?? maxWidth,
+        maxLineWidth: snapshot?.maxLineWidth ?? maxWidth,
     };
+
+    streamingParagraphLayoutCache.set(paragraphCacheKey, paragraph);
+    if (streamingParagraphLayoutCache.size > MAX_PARAGRAPH_LAYOUT_CACHE_SIZE) {
+        const oldestKey = streamingParagraphLayoutCache.keys().next().value as string | undefined;
+        if (oldestKey) streamingParagraphLayoutCache.delete(oldestKey);
+    }
+
+    return paragraph;
 }
 
 export function buildStreamingRenderBlocks(
     blocks: TranslationMarkdownBlock[],
     layoutProfile: DocumentLayoutProfile
 ): StreamingRenderBlock[] {
-    const textWidth = Math.max(
-        120,
-        layoutProfile.contentWidth - STREAM_DRAFT_BLOCK_HORIZONTAL_PADDING
-    );
-
-    return [...blocks]
+    const results = [...blocks]
         .sort((a, b) => a.index - b.index)
         .map((block) => {
+            const signature = buildStreamingRenderBlockSignature(block, layoutProfile);
+            const cached = streamingRenderBlockCache.get(block.id);
+            if (cached?.signature === signature) {
+                return cached.block;
+            }
+
+            const textWidth = Math.max(
+                120,
+                layoutProfile.contentWidth - STREAM_DRAFT_BLOCK_HORIZONTAL_PADDING
+            );
             const paragraphTexts = splitDraftParagraphs(block.text);
             const isFinal = block.state === "completed" || block.state === "cached";
             const liveParagraphIndex =
@@ -235,7 +328,7 @@ export function buildStreamingRenderBlocks(
                 0
             );
 
-            return {
+            return rememberStreamingRenderBlock(block.id, signature, {
                 id: block.id,
                 index: block.index,
                 title: block.title || `Chunk ${block.index + 1}`,
@@ -256,6 +349,19 @@ export function buildStreamingRenderBlocks(
                 ),
                 totalLineCount,
                 maxLineWidth,
-            } satisfies StreamingRenderBlock;
+            } satisfies StreamingRenderBlock);
         });
+
+    // 引用稳定化：若所有元素的对象引用与上次完全相同，返回上次数组。
+    // 这使得 translation-stream.tsx 内依赖 renderBlocks 的 useMemo 可识别出
+    // "内容没有实质变化"，跳过 frames 和 visibleFrames 的重算，减少无谓重渲染。
+    if (
+        results.length === _lastStableRenderBlocks.length &&
+        results.every((block, i) => block === _lastStableRenderBlocks[i])
+    ) {
+        return _lastStableRenderBlocks;
+    }
+
+    _lastStableRenderBlocks = results;
+    return results;
 }

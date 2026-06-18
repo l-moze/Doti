@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { Chunker } from "@/lib/agent/think/chunker";
 import { refineModule, type RefinedContext } from "@/lib/agent/memory/refine";
 import { ActModule } from "@/lib/agent/act/translate";
-import { ProgressTracker, type TranslationProgress } from "@/lib/progress-tracker";
+import {
+    ProgressTracker,
+    type ActiveTranslationJob,
+    type TranslationProgress,
+} from "@/lib/progress-tracker";
 import type { Term } from "@/lib/agent/memory/terminology-store";
 import type { Chunk } from "@/lib/agent/think/chunker";
 import { DeepLXClient, usesDeepLXOfficialEndpoint } from "@/lib/deeplx-client";
@@ -12,8 +16,9 @@ import {
     protectLockedGlossaryTerms,
     restorePreservedMarkdownFragments,
 } from "@/lib/markdown-table-utils";
-import { normalizeTranslationTypography } from "@/lib/translation-postprocess";
+import { runTranslationIntegrityPass } from "@/lib/translation-integrity";
 import type { TranslationChunkPlan, TranslationMarkdownBlock } from "@/lib/translation-runtime";
+import { buildTranslationCacheKeyInputFromRuntime } from "@/lib/translation-cache-key";
 import crypto from "node:crypto";
 
 type ChunkExecutionResult = {
@@ -51,6 +56,10 @@ function supportsIncrementalStreaming(runtimeProfile?: RuntimeProviderProfile): 
     }
 
     return runtimeProfile.providerType !== 'deeplx';
+}
+
+function shouldPreserveInlineMath(runtimeProfile?: RuntimeProviderProfile): boolean {
+    return runtimeProfile?.providerType === 'deeplx';
 }
 
 function serializeChunkPlan(chunks: Chunk[]): TranslationChunkPlan[] {
@@ -152,10 +161,18 @@ async function translateRefinedContextToCompletion(input: {
             input.refinedContext.preservedFragments
         );
 
-        return normalizeTranslationTypography(restoredMarkdown, input.targetLang);
+        return runTranslationIntegrityPass({
+            text: restoredMarkdown,
+            targetLang: input.targetLang,
+            preservedFragments: input.refinedContext.preservedFragments,
+        }).text;
     }
 
-    return input.actModule!.translate(input.refinedContext, input.targetLang);
+    return runTranslationIntegrityPass({
+        text: await input.actModule!.translate(input.refinedContext, input.targetLang),
+        targetLang: input.targetLang,
+        preservedFragments: input.refinedContext.preservedFragments,
+    }).text;
 }
 
 async function* translateRefinedContextStream(input: {
@@ -196,7 +213,8 @@ async function translateChunkToCompletion(input: {
     const refinedContext = await refineModule.process(
         input.chunk,
         input.previousTranslation,
-        input.extraTerms
+        input.extraTerms,
+        { preserveInlineMath: shouldPreserveInlineMath(input.runtimeProfile) }
     );
 
     const content = await translateRefinedContextToCompletion({
@@ -230,6 +248,25 @@ function buildConcurrentBatches(startIndex: number, totalChunks: number, concurr
     return batches;
 }
 
+async function waitForNextConcurrentResult<T>(input: {
+    pendingEntries: Array<Promise<{ slot: number; result: T }>>;
+    remainingSlots: Set<number>;
+}): Promise<{ slot: number; result: T }> {
+    return Promise.race(
+        Array.from(input.remainingSlots, (slot) => input.pendingEntries[slot])
+    );
+}
+
+class TranslationJobConflictError extends Error {
+    activeJob: ActiveTranslationJob;
+
+    constructor(activeJob: ActiveTranslationJob) {
+        super("A translation job is already active for this cache key");
+        this.name = "TranslationJobConflictError";
+        this.activeJob = activeJob;
+    }
+}
+
 // Create a ReadableStream from the Agent's async generator
 async function* agentTranslateGenerator(
     sourceMarkdown: string,
@@ -241,13 +278,14 @@ async function* agentTranslateGenerator(
     forceFresh: boolean = false,
     extraTerms: Term[] = [],
     requestedConcurrency?: number,
-    runtimeProfile?: RuntimeProviderProfile
+    runtimeProfile?: RuntimeProviderProfile,
+    requestedJobId?: string
 ) {
     const chunker = new Chunker();
     const actModule = runtimeProfile?.providerType === 'deeplx'
         ? undefined
         : new ActModule(providerId, model, runtimeProfile);
-    const runId = crypto.randomUUID();
+    const runId = requestedJobId || crypto.randomUUID();
     const prefersIncrementalStreaming = supportsIncrementalStreaming(runtimeProfile);
     const requestedResolvedConcurrency = resolveTranslationConcurrency(requestedConcurrency);
     const translationConcurrency = prefersIncrementalStreaming
@@ -276,19 +314,27 @@ async function* agentTranslateGenerator(
         );
     }
 
-    const tracker = new ProgressTracker(fileHash, targetLang);
+    const tracker = new ProgressTracker(buildTranslationCacheKeyInputFromRuntime({
+        fileHash,
+        targetLang,
+        providerId,
+        model,
+        providerProfile: runtimeProfile,
+        glossaryTerms: extraTerms,
+        translateMode: runtimeProfile?.providerType === "deeplx" ? "deeplx" : "default",
+        outputMode: "plain",
+    }), runId);
 
-    if (forceFresh) {
-        console.log('[Translation] Force fresh translation requested, clearing existing cache');
-        tracker.reset();
+    const existingActiveJob = await tracker.readActiveJob();
+    if (existingActiveJob) {
+        throw new TranslationJobConflictError(existingActiveJob);
     }
 
-    // Check full cache first
-    if (tracker.hasFullCache()) {
+    if (!forceFresh && await tracker.hasFullCache()) {
         console.log(`[Cache] Found complete translation`);
         yield sseEvent('status', { message: 'Loading from Cache...' });
 
-        const cachedContent = tracker.readFullCache();
+        const cachedContent = await tracker.readFullCache();
         yield sseEvent('run_started', {
             runId,
             source: 'cache',
@@ -314,193 +360,382 @@ async function* agentTranslateGenerator(
         return;
     }
 
-    // Step 1: Chunk the document
-    yield sseEvent('status', { message: 'Chunking document...' });
-    const chunks = chunker.split(sourceMarkdown);
-    const totalChunks = chunks.length;
-    const chunkPlan = serializeChunkPlan(chunks);
+    const activeJobAcquisition = await tracker.acquireActiveJob(runId);
+    if (!activeJobAcquisition.acquired) {
+        throw new TranslationJobConflictError(
+            activeJobAcquisition.activeJob || {
+                jobId: "unknown",
+                cacheKey: tracker.getCacheKey(),
+                targetLang,
+                status: "active",
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                heartbeatAt: new Date().toISOString(),
+            }
+        );
+    }
 
-    yield sseEvent('run_started', {
-        runId,
-        source: resume ? 'resume' : 'fresh',
-        totalChunks,
-        concurrency: translationConcurrency,
-        chunks: chunkPlan,
-    });
+    try {
+        if (forceFresh) {
+            console.log('[Translation] Force fresh translation requested, clearing existing cache');
+            await tracker.reset();
+            const reacquiredJob = await tracker.acquireActiveJob(runId);
+            if (!reacquiredJob.acquired) {
+                throw new TranslationJobConflictError(
+                    reacquiredJob.activeJob || {
+                        jobId: "unknown",
+                        cacheKey: tracker.getCacheKey(),
+                        targetLang,
+                        status: "active",
+                        createdAt: new Date().toISOString(),
+                        updatedAt: new Date().toISOString(),
+                        heartbeatAt: new Date().toISOString(),
+                    }
+                );
+            }
+        }
 
-    let startIndex = 0;
-    let previousTranslation = "";
+        // Step 1: Chunk the document
+        yield sseEvent('status', { message: 'Chunking document...' });
+        const chunks = chunker.split(sourceMarkdown);
+        const totalChunks = chunks.length;
+        const chunkPlan = serializeChunkPlan(chunks);
 
-    // Check for partial cache if resume is requested
-    if (resume && tracker.hasPartialCache()) {
-        if (tracker.validatePartialCache(sourceMarkdown)) {
-            const progress = tracker.readProgress();
-            if (progress) {
-                startIndex = progress.completedChunks;
-                console.log(`[Resume] Continuing from chunk ${startIndex}/${totalChunks}`);
+        yield sseEvent('run_started', {
+            runId,
+            source: resume ? 'resume' : 'fresh',
+            totalChunks,
+            concurrency: translationConcurrency,
+            chunks: chunkPlan,
+        });
 
-                // Load partial cache and send to client
-                const partialContent = tracker.readPartialCache();
-                if (partialContent) {
-                    const hydratedBlocks = rebuildCompletedBlocks(chunkPlan, progress, partialContent);
-                    yield sseEvent('status', { message: `Resuming from chunk ${startIndex}...` });
-                    yield sseEvent('hydrate_blocks', { runId, blocks: hydratedBlocks });
+        let startIndex = 0;
+        let previousTranslation = "";
 
-                    // Get last chunk's translation for context
-                    if (startIndex > 0) {
-                        previousTranslation = hydratedBlocks.at(-1)?.text || '';
+        // Check for partial cache if resume is requested
+        if (resume && await tracker.hasPartialCache()) {
+            if (await tracker.validatePartialCache(sourceMarkdown)) {
+                const progress = await tracker.readProgress();
+                if (progress) {
+                    startIndex = progress.completedChunks;
+                    console.log(`[Resume] Continuing from chunk ${startIndex}/${totalChunks}`);
+
+                    // Load partial cache and send to client
+                    const partialContent = await tracker.readPartialCache();
+                    if (partialContent) {
+                        const hydratedBlocks = rebuildCompletedBlocks(chunkPlan, progress, partialContent);
+                        yield sseEvent('status', { message: `Resuming from chunk ${startIndex}...` });
+                        yield sseEvent('hydrate_blocks', { runId, blocks: hydratedBlocks });
+
+                        // Get last chunk's translation for context
+                        if (startIndex > 0) {
+                            previousTranslation = hydratedBlocks.at(-1)?.text || '';
+                        }
                     }
                 }
+            } else {
+                console.log('[Resume] Partial cache invalid, starting fresh');
+                await tracker.cleanup();
+                const reacquiredJob = await tracker.acquireActiveJob(runId);
+                if (!reacquiredJob.acquired) {
+                    throw new TranslationJobConflictError(
+                        reacquiredJob.activeJob || {
+                            jobId: "unknown",
+                            cacheKey: tracker.getCacheKey(),
+                            targetLang,
+                            status: "active",
+                            createdAt: new Date().toISOString(),
+                            updatedAt: new Date().toISOString(),
+                            heartbeatAt: new Date().toISOString(),
+                        }
+                    );
+                }
+                tracker.bindJob(runId);
             }
-        } else {
-            console.log('[Resume] Partial cache invalid, starting fresh');
-            tracker.cleanup();
         }
-    }
 
-    // Initialize progress tracking if starting fresh
-    if (startIndex === 0) {
-        tracker.initProgress(totalChunks, sourceMarkdown);
-        yield sseEvent('progress', { percentage: 0 });
-    } else {
-        const percentage = Math.floor((startIndex / totalChunks) * 100);
-        yield sseEvent('progress', { percentage });
-    }
+        // Initialize progress tracking if starting fresh
+        if (startIndex === 0) {
+            await tracker.initProgress(totalChunks, sourceMarkdown);
+            yield sseEvent('progress', { percentage: 0 });
+        } else {
+            const percentage = Math.floor((startIndex / totalChunks) * 100);
+            yield sseEvent('progress', { percentage });
+        }
 
-    if (translationConcurrency > 1) {
-        const batches = buildConcurrentBatches(startIndex, totalChunks, translationConcurrency);
-        let previousTranslationForBatch = previousTranslation;
-        let nextPersistIndex = startIndex;
+        if (translationConcurrency > 1) {
+            const batches = buildConcurrentBatches(startIndex, totalChunks, translationConcurrency);
+            let previousTranslationForBatch = previousTranslation;
+            let nextPersistIndex = startIndex;
+            let completedChunkCount = startIndex;
+            const pendingPersistResults = new Map<number, ChunkExecutionResult>();
 
-        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-            const currentBatch = batches[batchIndex];
-            yield sseEvent('status', {
-                message: `Parallel batch ${batchIndex + 1}/${batches.length} · ${currentBatch.length} agents`,
+            for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+                const currentBatch = batches[batchIndex];
+                yield sseEvent('status', {
+                    message: `Parallel batch ${batchIndex + 1}/${batches.length} · ${currentBatch.length} agents`,
+                });
+
+                const batchPromises = currentBatch.map((chunkIndex) => {
+                    const chunk = chunks[chunkIndex];
+                    const planItem = chunkPlan[chunkIndex];
+                    const title = chunk.metadata.title || `chunk ${chunkIndex + 1}`;
+
+                    return translateChunkToCompletion({
+                        chunk,
+                        index: chunkIndex,
+                        title,
+                        chunkId: planItem?.id || chunk.id,
+                        previousTranslation: previousTranslationForBatch,
+                        targetLang,
+                        actModule,
+                        runtimeProfile,
+                        extraTerms,
+                    });
+                });
+
+                for (const chunkIndex of currentBatch) {
+                    const chunk = chunks[chunkIndex];
+                    const planItem = chunkPlan[chunkIndex];
+                    yield sseEvent('chunk_started', {
+                        runId,
+                        chunkId: planItem?.id || chunk.id,
+                        index: chunkIndex,
+                        title: chunk.metadata.title || `chunk ${chunkIndex + 1}`,
+                    });
+                }
+
+                const pendingEntries = batchPromises.map((promise, slot) => (
+                    promise.then((result) => ({ slot, result }))
+                ));
+                const remainingSlots = new Set<number>(pendingEntries.map((_, slot) => slot));
+                const batchResults: ChunkExecutionResult[] = [];
+
+                while (remainingSlots.size > 0) {
+                    const { slot, result } = await waitForNextConcurrentResult({
+                        pendingEntries,
+                        remainingSlots,
+                    });
+                    remainingSlots.delete(slot);
+                    batchResults.push(result);
+
+                    yield sseEvent('chunk', { chunkId: result.chunkId, text: result.content });
+                    pendingPersistResults.set(result.index, result);
+
+                    while (pendingPersistResults.has(nextPersistIndex)) {
+                        const persistableResult = pendingPersistResults.get(nextPersistIndex)!;
+                        pendingPersistResults.delete(nextPersistIndex);
+                        await tracker.appendChunk(
+                            persistableResult.index,
+                            persistableResult.content,
+                            nextPersistIndex === 0
+                        );
+                        nextPersistIndex += 1;
+                    }
+
+                    yield sseEvent('chunk_completed', {
+                        runId,
+                        chunkId: result.chunkId,
+                        index: result.index,
+                        state: result.state,
+                    });
+
+                    completedChunkCount += 1;
+                    const percentage = Math.floor((completedChunkCount / totalChunks) * 100);
+                    yield sseEvent('progress', { percentage });
+                }
+
+                batchResults.sort((a, b) => a.index - b.index);
+                previousTranslationForBatch = batchResults.at(-1)?.content || previousTranslationForBatch;
+            }
+
+            await tracker.finalize();
+            yield sseEvent('done', { message: 'Translation complete.' });
+            return;
+        }
+
+        // Translation loop
+        for (let i = startIndex; i < totalChunks; i++) {
+            const chunk = chunks[i];
+            const currentChunkIndex = i + 1;
+            const planItem = chunkPlan[i];
+
+            yield sseEvent('chunk_started', {
+                runId,
+                chunkId: planItem?.id || chunk.id,
+                index: i,
+                title: chunk.metadata.title || `chunk ${currentChunkIndex}`,
             });
 
-            const batchPromises = currentBatch.map((chunkIndex) => {
-                const chunk = chunks[chunkIndex];
-                const planItem = chunkPlan[chunkIndex];
-                const title = chunk.metadata.title || `chunk ${chunkIndex + 1}`;
+            // Step 2: Refine Context
+            yield sseEvent('status', { message: `Refining: ${chunk.metadata.title || 'chunk ' + currentChunkIndex}` });
+            const refinedContext = await refineModule.process(
+                chunk,
+                previousTranslation,
+                extraTerms,
+                { preserveInlineMath: shouldPreserveInlineMath(runtimeProfile) }
+            );
 
-                return translateChunkToCompletion({
-                    chunk,
-                    index: chunkIndex,
-                    title,
-                    chunkId: planItem?.id || chunk.id,
-                    previousTranslation: previousTranslationForBatch,
+            let chunkContent = "";
+
+            // Step 3: Act - Translate
+            if (refinedContext.isReference) {
+                yield sseEvent('status', { message: 'Skipping reference section' });
+                chunkContent = chunk.content;
+                yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: chunkContent });
+                previousTranslation = chunkContent;
+            } else {
+                yield sseEvent('status', { message: `Translating: ${chunk.metadata.title || 'chunk ' + currentChunkIndex}` });
+
+                // Stream the translated content
+                let chunkTranslation = "";
+
+                for await (const textPart of translateRefinedContextStream({
+                    refinedContext,
                     targetLang,
                     actModule,
                     runtimeProfile,
-                    extraTerms,
-                });
-            });
-
-            for (const chunkIndex of currentBatch) {
-                const chunk = chunks[chunkIndex];
-                const planItem = chunkPlan[chunkIndex];
-                yield sseEvent('chunk_started', {
-                    runId,
-                    chunkId: planItem?.id || chunk.id,
-                    index: chunkIndex,
-                    title: chunk.metadata.title || `chunk ${chunkIndex + 1}`,
-                });
-            }
-
-            const batchResults = await Promise.all(batchPromises);
-            batchResults.sort((a, b) => a.index - b.index);
-
-            for (const result of batchResults) {
-                yield sseEvent('chunk', { chunkId: result.chunkId, text: result.content });
-
-                if (result.index === nextPersistIndex) {
-                    tracker.appendChunk(result.index, result.content, nextPersistIndex === 0);
-                    nextPersistIndex += 1;
+                })) {
+                    yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
+                    chunkTranslation += textPart;
                 }
 
-                yield sseEvent('chunk_completed', {
-                    runId,
-                    chunkId: result.chunkId,
-                    index: result.index,
-                    state: result.state,
+                const integrityResult = runTranslationIntegrityPass({
+                    text: chunkTranslation,
+                    targetLang,
+                    preservedFragments: refinedContext.preservedFragments,
                 });
 
-                const percentage = Math.floor(((result.index + 1) / totalChunks) * 100);
-                yield sseEvent('progress', { percentage });
+                if (integrityResult.changed) {
+                    yield sseEvent('chunk_reset', {
+                        chunkId: planItem?.id || chunk.id,
+                        text: integrityResult.text,
+                        issues: integrityResult.issues.map((issue) => issue.kind),
+                    });
+                }
+
+                chunkContent = integrityResult.text;
+                previousTranslation = integrityResult.text;
             }
 
-            previousTranslationForBatch = batchResults.at(-1)?.content || previousTranslationForBatch;
+            // Save chunk immediately to partial cache
+            await tracker.appendChunk(i, chunkContent, i === 0);
+            yield sseEvent('chunk_completed', {
+                runId,
+                chunkId: planItem?.id || chunk.id,
+                index: i,
+                state: 'completed',
+            });
+
+            const percentage = Math.floor((currentChunkIndex / totalChunks) * 100);
+            yield sseEvent('progress', { percentage });
         }
 
-        tracker.finalize();
+        // Finalize: convert partial cache to final cache
+        await tracker.finalize();
+
         yield sseEvent('done', { message: 'Translation complete.' });
-        return;
+    } finally {
+        await tracker.releaseActiveJob();
     }
-
-    // Translation loop
-    for (let i = startIndex; i < totalChunks; i++) {
-        const chunk = chunks[i];
-        const currentChunkIndex = i + 1;
-        const planItem = chunkPlan[i];
-
-        yield sseEvent('chunk_started', {
-            runId,
-            chunkId: planItem?.id || chunk.id,
-            index: i,
-            title: chunk.metadata.title || `chunk ${currentChunkIndex}`,
-        });
-
-        // Step 2: Refine Context
-        yield sseEvent('status', { message: `Refining: ${chunk.metadata.title || 'chunk ' + currentChunkIndex}` });
-        const refinedContext = await refineModule.process(chunk, previousTranslation, extraTerms);
-
-        let chunkContent = "";
-
-        // Step 3: Act - Translate
-        if (refinedContext.isReference) {
-            yield sseEvent('status', { message: 'Skipping reference section' });
-            chunkContent = chunk.content;
-            yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: chunkContent });
-            previousTranslation = chunkContent;
-        } else {
-            yield sseEvent('status', { message: `Translating: ${chunk.metadata.title || 'chunk ' + currentChunkIndex}` });
-
-            // Stream the translated content
-            let chunkTranslation = "";
-
-            for await (const textPart of translateRefinedContextStream({
-                refinedContext,
-                targetLang,
-                actModule,
-                runtimeProfile,
-            })) {
-                yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
-                chunkTranslation += textPart;
-            }
-
-            chunkContent = chunkTranslation;
-            previousTranslation = chunkTranslation;
-        }
-
-        // Save chunk immediately to partial cache
-        tracker.appendChunk(i, chunkContent, i === 0);
-        yield sseEvent('chunk_completed', {
-            runId,
-            chunkId: planItem?.id || chunk.id,
-            index: i,
-            state: 'completed',
-        });
-
-        const percentage = Math.floor((currentChunkIndex / totalChunks) * 100);
-        yield sseEvent('progress', { percentage });
-    }
-
-    // Finalize: convert partial cache to final cache
-    tracker.finalize();
-
-    yield sseEvent('done', { message: 'Translation complete.' });
 }
 
+function agentIteratorToStream(iterator: AsyncGenerator<string, void, unknown>) {
+    return new ReadableStream({
+        async pull(controller) {
+            try {
+                const { value, done } = await iterator.next();
+                if (done) {
+                    controller.close();
+                } else {
+                    controller.enqueue(new TextEncoder().encode(value));
+                }
+            } catch (error) {
+                if (error instanceof TranslationJobConflictError) {
+                    controller.enqueue(new TextEncoder().encode(
+                        sseEvent('job_conflict', {
+                            message: '当前翻译任务已在进行中，请勿重复提交。',
+                            activeJob: error.activeJob,
+                        })
+                    ));
+                } else {
+                    controller.enqueue(new TextEncoder().encode(
+                        sseEvent('error', { message: getErrorMessage(error) })
+                    ));
+                }
+                controller.close();
+            }
+        },
+        async cancel() {
+            if (typeof iterator.return === "function") {
+                await iterator.return(undefined);
+            }
+        },
+    });
+}
+
+export async function POST(request: NextRequest) {
+    try {
+        const {
+            text,
+            targetLang,
+            providerId,
+            model,
+            providerProfile,
+            fileHash,
+            resume,
+            forceFresh,
+            extraTerms,
+            concurrency,
+            jobId,
+        } = await request.json();
+
+        if (!text) {
+            return NextResponse.json({ error: "No text provided" }, { status: 400 });
+        }
+
+        const providerIdToUse = providerId || 'gemini';
+        const modelToUse = model || 'gemini-2.5-flash';
+        const shouldResume = resume === true;
+        const shouldForceFresh = forceFresh === true;
+        const requestedJobId = typeof jobId === "string" && jobId.trim()
+            ? jobId.trim()
+            : crypto.randomUUID();
+
+        console.log(`[Agent Translation] Provider: ${providerIdToUse}, Model: ${modelToUse}, Resume: ${shouldResume}, ForceFresh: ${shouldForceFresh}, Job: ${requestedJobId}`);
+
+        const generator = agentTranslateGenerator(
+            text,
+            targetLang,
+            providerIdToUse,
+            modelToUse,
+            fileHash,
+            shouldResume,
+            shouldForceFresh,
+            Array.isArray(extraTerms) ? extraTerms : [],
+            typeof concurrency === 'number' ? concurrency : undefined,
+            providerProfile?.providerType ? providerProfile : undefined,
+            requestedJobId
+        );
+        const readableStream = agentIteratorToStream(generator);
+
+        return new NextResponse(readableStream, {
+            headers: {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Translation-Job-Id": requestedJobId,
+            },
+        });
+
+    } catch (error: unknown) {
+        console.error("[Agent Translation] Error:", error instanceof Error ? error.message : error);
+        // For SSE, we might want to send an error event instead of JSON if the stream is open
+        // But at this point, the stream hasn't started, so JSON is fine.
+        const message = error instanceof Error ? error.message : "Internal Server Error";
+        return NextResponse.json({ error: message }, { status: 500 });
+    }
+}
 // Fallback for non-cached translation
 async function* translateWithoutCache(
     sourceMarkdown: string,
@@ -528,6 +763,7 @@ async function* translateWithoutCache(
     if (translationConcurrency > 1) {
         const batches = buildConcurrentBatches(0, chunks.length, translationConcurrency);
         let previousTranslationForBatch = previousTranslation;
+        let completedChunkCount = 0;
 
         for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
             const currentBatch = batches[batchIndex];
@@ -564,10 +800,20 @@ async function* translateWithoutCache(
                 });
             }
 
-            const batchResults = await Promise.all(batchPromises);
-            batchResults.sort((a, b) => a.index - b.index);
+            const pendingEntries = batchPromises.map((promise, slot) => (
+                promise.then((result) => ({ slot, result }))
+            ));
+            const remainingSlots = new Set<number>(pendingEntries.map((_, slot) => slot));
+            const batchResults: ChunkExecutionResult[] = [];
 
-            for (const result of batchResults) {
+            while (remainingSlots.size > 0) {
+                const { slot, result } = await waitForNextConcurrentResult({
+                    pendingEntries,
+                    remainingSlots,
+                });
+                remainingSlots.delete(slot);
+                batchResults.push(result);
+
                 yield sseEvent('chunk', { chunkId: result.chunkId, text: result.content });
                 yield sseEvent('chunk_completed', {
                     runId,
@@ -576,10 +822,12 @@ async function* translateWithoutCache(
                     state: result.state,
                 });
 
-                const percentage = Math.floor(((result.index + 1) / chunks.length) * 100);
+                completedChunkCount += 1;
+                const percentage = Math.floor((completedChunkCount / chunks.length) * 100);
                 yield sseEvent('progress', { percentage });
             }
 
+            batchResults.sort((a, b) => a.index - b.index);
             previousTranslationForBatch = batchResults.at(-1)?.content || previousTranslationForBatch;
         }
 
@@ -600,7 +848,12 @@ async function* translateWithoutCache(
         });
 
         yield sseEvent('status', { message: `Translating: ${chunk.metadata.title || 'chunk ' + currentChunkIndex}` });
-        const refinedContext = await refineModule.process(chunk, previousTranslation, extraTerms);
+        const refinedContext = await refineModule.process(
+            chunk,
+            previousTranslation,
+            extraTerms,
+            { preserveInlineMath: shouldPreserveInlineMath(runtimeProfile) }
+        );
 
         if (refinedContext.isReference) {
             yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: chunk.content });
@@ -617,7 +870,22 @@ async function* translateWithoutCache(
                 yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: textPart });
                 chunkTranslation += textPart;
             }
-            previousTranslation = chunkTranslation;
+
+            const integrityResult = runTranslationIntegrityPass({
+                text: chunkTranslation,
+                targetLang,
+                preservedFragments: refinedContext.preservedFragments,
+            });
+
+            if (integrityResult.changed) {
+                yield sseEvent('chunk_reset', {
+                    chunkId: planItem?.id || chunk.id,
+                    text: integrityResult.text,
+                    issues: integrityResult.issues.map((issue) => issue.kind),
+                });
+            }
+
+            previousTranslation = integrityResult.text;
         }
 
         yield sseEvent('chunk_completed', {
@@ -632,70 +900,4 @@ async function* translateWithoutCache(
     }
 
     yield sseEvent('done', { message: 'Translation complete.' });
-}
-
-function agentIteratorToStream(iterator: AsyncGenerator<string, void, unknown>) {
-    return new ReadableStream({
-        async pull(controller) {
-            try {
-                const { value, done } = await iterator.next();
-                if (done) {
-                    controller.close();
-                } else {
-                    controller.enqueue(new TextEncoder().encode(value));
-                }
-            } catch (error) {
-                controller.enqueue(new TextEncoder().encode(
-                    sseEvent('error', { message: getErrorMessage(error) })
-                ));
-                controller.close();
-            }
-        },
-    });
-}
-
-export async function POST(request: NextRequest) {
-    try {
-        const { text, targetLang, providerId, model, providerProfile, fileHash, resume, forceFresh, extraTerms, concurrency } = await request.json();
-
-        if (!text) {
-            return NextResponse.json({ error: "No text provided" }, { status: 400 });
-        }
-
-        const providerIdToUse = providerId || 'gemini';
-        const modelToUse = model || 'gemini-2.5-flash';
-        const shouldResume = resume === true;
-        const shouldForceFresh = forceFresh === true;
-
-        console.log(`[Agent Translation] Provider: ${providerIdToUse}, Model: ${modelToUse}, Resume: ${shouldResume}, ForceFresh: ${shouldForceFresh}`);
-
-        const generator = agentTranslateGenerator(
-            text,
-            targetLang,
-            providerIdToUse,
-            modelToUse,
-            fileHash,
-            shouldResume,
-            shouldForceFresh,
-            Array.isArray(extraTerms) ? extraTerms : [],
-            typeof concurrency === 'number' ? concurrency : undefined,
-            providerProfile?.providerType ? providerProfile : undefined
-        );
-        const readableStream = agentIteratorToStream(generator);
-
-        return new NextResponse(readableStream, {
-            headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        });
-
-    } catch (error: unknown) {
-        console.error("[Agent Translation] Error:", error);
-        // For SSE, we might want to send an error event instead of JSON if the stream is open
-        // But at this point, the stream hasn't started, so JSON is fine.
-        const message = error instanceof Error ? error.message : "Internal Server Error";
-        return NextResponse.json({ error: message }, { status: 500 });
-    }
 }

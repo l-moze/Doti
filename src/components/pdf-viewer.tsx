@@ -1,10 +1,11 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { useState, useEffect, useMemo } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import { useTranslationStore } from '@/lib/store';
 import type { DocumentSemanticAnchor, DocumentSemanticProjection } from '@/lib/document-semantic';
 import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Loader2, Layers } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 
 // 动态导入 react-pdf 组件，禁用 SSR 以避免 DOMMatrix 错误
 const Document = dynamic(
@@ -18,14 +19,22 @@ const Page = dynamic(
 );
 
 // PDF Worker 配置组件（仅在客户端执行）
-function PDFWorkerConfig() {
-    if (typeof window !== 'undefined') {
-        import('react-pdf').then((pdfjs) => {
+const PDFWorkerConfig = memo(function PDFWorkerConfig() {
+    useEffect(() => {
+        let cancelled = false;
+
+        void import('react-pdf').then((pdfjs) => {
+            if (cancelled) return;
             pdfjs.pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.pdfjs.version}/build/pdf.worker.min.mjs`;
         });
-    }
+
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
     return null;
-}
+});
 
 // 布局块类型对应的颜色
 const BLOCK_TYPE_COLORS: Record<string, string> = {
@@ -44,19 +53,22 @@ function toOpaqueBorderColor(color: string): string {
     return color.replace(/rgba\(([^)]+),\s*(0?\.\d+)\)/i, 'rgba($1, 1)');
 }
 
+const DEFAULT_PDF_PAGE_SIZE: readonly [number, number] = [612, 792];
+
 // 布局叠加层组件
-function LayoutOverlay({
+const LayoutOverlay = memo(function LayoutOverlay({
     anchors,
     pdfWidth,
     pdfHeight,
-    pageIndex,
 }: {
     anchors: DocumentSemanticAnchor[];
     pdfWidth: number;
     pdfHeight: number;
-    pageIndex: number;
 }) {
-    const { setHighlightedBlock, highlightedBlockId } = useTranslationStore();
+    const { highlightedBlockId, setHighlightedBlock } = useTranslationStore(useShallow((state) => ({
+        highlightedBlockId: state.highlightedBlockId,
+        setHighlightedBlock: state.setHighlightedBlock,
+    })));
 
     return (
         <div
@@ -93,8 +105,9 @@ function LayoutOverlay({
                         }}
                         onClick={(e) => {
                             e.stopPropagation();
-                            setHighlightedBlock(semanticId);
-                            console.log('Clicked block:', semanticId, anchor.kind, 'page:', pageIndex);
+                            if (semanticId !== highlightedBlockId) {
+                                setHighlightedBlock(semanticId);
+                            }
                         }}
                     >
                         {/* 边框 Hover 效果 */}
@@ -122,14 +135,18 @@ function LayoutOverlay({
             })}
         </div>
     );
-}
+});
 
 export function PDFViewer({ projection = null }: { projection?: DocumentSemanticProjection | null }) {
-    const { fileUrl, highlightedBlockId } = useTranslationStore();
+    const { fileUrl, highlightedBlockId } = useTranslationStore(useShallow((state) => ({
+        fileUrl: state.fileUrl,
+        highlightedBlockId: state.highlightedBlockId,
+    })));
     const [numPages, setNumPages] = useState<number>(0);
     const [pageNumber, setPageNumber] = useState<number>(1);
     const [scale, setScale] = useState<number>(1.0);
     const [showLayout, setShowLayout] = useState(false);
+    const anchors = projection?.anchors;
 
     const semanticToPage = useMemo(() => {
         const nextSemanticToPage: Record<string, number> = {};
@@ -150,25 +167,35 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
         return nextSemanticToPage;
     }, [projection]);
 
+    const currentAnchors = useMemo(() => {
+        if (!anchors) return [];
+        return anchors.filter((anchor) => anchor.pageIndex === pageNumber - 1);
+    }, [anchors, pageNumber]);
+
     // 监听 highlightedBlockId 变化，自动跳转页面
     useEffect(() => {
-        if (highlightedBlockId && semanticToPage) {
-            const targetPage = semanticToPage[highlightedBlockId];
-            if (targetPage !== undefined) {
-                const frame = window.requestAnimationFrame(() => {
-                    setPageNumber(targetPage + 1);
-                });
-                return () => window.cancelAnimationFrame(frame);
-            }
-        }
+        if (!highlightedBlockId) return;
+
+        const targetPage = semanticToPage[highlightedBlockId];
+        if (targetPage === undefined) return;
+
+        const nextPageNumber = targetPage + 1;
+        const frame = window.requestAnimationFrame(() => {
+            // This is an intentional sync from external highlighted semantic state into local pagination UI state.
+            setPageNumber((currentPage) => currentPage === nextPageNumber ? currentPage : nextPageNumber);
+        });
+
+        return () => window.cancelAnimationFrame(frame);
     }, [highlightedBlockId, semanticToPage]);
 
     // 重置状态当文件改变时
     useEffect(() => {
         const frame = window.requestAnimationFrame(() => {
+            // This reset keeps pagination state aligned with the newly loaded document instance.
             setNumPages(0);
             setPageNumber(1);
         });
+
         return () => window.cancelAnimationFrame(frame);
     }, [fileUrl]);
 
@@ -184,9 +211,8 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
         );
     }
 
-    const currentAnchors = projection?.anchors.filter((anchor) => anchor.pageIndex === pageNumber - 1) || [];
-    const pdfPageSize = projection?.pageSizes?.[pageNumber - 1] || [612, 792];
-    const canShowLayout = currentAnchors.length > 0 || (projection?.anchors.length || 0) > 0;
+    const pdfPageSize = projection?.pageSizes?.[pageNumber - 1] || DEFAULT_PDF_PAGE_SIZE;
+    const canShowLayout = currentAnchors.length > 0 || Boolean(anchors?.length);
 
     return (
         <div className="flex flex-col h-full bg-slate-50 border rounded-lg overflow-hidden">
@@ -271,7 +297,6 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                                     anchors={currentAnchors}
                                     pdfWidth={pdfPageSize[0]}
                                     pdfHeight={pdfPageSize[1]}
-                                    pageIndex={pageNumber - 1}
                                 />
                             )}
                         </Page>

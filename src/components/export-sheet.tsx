@@ -1,6 +1,12 @@
 'use client';
 
 import { FileOutput, Languages, NotebookPen, ScrollText } from 'lucide-react';
+import { getProviderProfile, listUserGlossaryRecords } from '@/lib/db';
+import { useTranslationStore } from '@/lib/store';
+import {
+    buildTranslationArtifactBaseName,
+    buildTranslationCacheKeyInputFromRuntime,
+} from '@/lib/translation-cache-key';
 import { ModalShell } from './modal-shell';
 
 type ExportMode = 'translation' | 'bilingual' | 'notes' | 'bilingual-notes';
@@ -52,13 +58,63 @@ export function ExportSheet({
     targetLang,
     onClose,
 }: ExportSheetProps) {
+    const providerId = useTranslationStore((state) => state.providerId);
+    const model = useTranslationStore((state) => state.model);
     const canExport = Boolean(fileHash);
 
-    const openPrintPreview = (mode: ExportMode) => {
+    const openPrintPreview = async (mode: ExportMode) => {
         if (!fileHash) return;
 
-        const url = `/print?fileHash=${encodeURIComponent(fileHash)}&targetLang=${encodeURIComponent(targetLang)}&mode=${mode}`;
-        window.open(url, '_blank', 'noopener,noreferrer');
+        const previewWindow = window.open('about:blank', '_blank');
+        if (previewWindow) {
+            previewWindow.opener = null;
+        }
+
+        let translationArtifact = '';
+
+        try {
+            const providerProfile = providerId.startsWith('custom:')
+                ? await getProviderProfile(providerId.slice('custom:'.length))
+                : undefined;
+            const glossaryTerms = (await listUserGlossaryRecords())
+                .filter((term) => term.enabled)
+                .map((term) => ({
+                    source: term.source,
+                    target: term.target,
+                    category: term.category,
+                }));
+
+            translationArtifact = buildTranslationArtifactBaseName(
+                buildTranslationCacheKeyInputFromRuntime({
+                    fileHash,
+                    targetLang,
+                    providerId,
+                    model,
+                    providerProfile,
+                    glossaryTerms,
+                    translateMode: providerProfile?.providerType === 'deeplx' ? 'deeplx' : 'default',
+                    outputMode: 'plain',
+                })
+            );
+        } catch (error) {
+            console.warn('[Export] Failed to resolve translation artifact, falling back to legacy path:', error);
+        }
+
+        const params = new URLSearchParams({
+            fileHash,
+            targetLang,
+            mode,
+        });
+        if (translationArtifact) {
+            params.set('translationArtifact', translationArtifact);
+        }
+
+        const url = `/print?${params.toString()}`;
+        if (previewWindow) {
+            previewWindow.location.href = url;
+        } else {
+            window.open(url, '_blank', 'noopener,noreferrer');
+        }
         onClose();
     };
 
