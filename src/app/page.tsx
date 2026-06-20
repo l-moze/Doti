@@ -4,9 +4,8 @@ import { AppErrorBoundary } from '@/components/app-error-boundary';
 import { ArxivImportDialog } from '@/components/arxiv-import-dialog';
 import { ExportSheet } from '@/components/export-sheet';
 import { GlossaryManager } from '@/components/glossary-manager';
-import { MarkdownEditor } from '@/components/markdown-editor';
+import { MarkdownEditor, type ReaderView } from '@/components/markdown-editor';
 import { ModalShell } from '@/components/modal-shell';
-import { ModelSelector } from '@/components/model-selector';
 import { PDFViewer } from '@/components/pdf-viewer';
 import { ProviderProfileManager } from '@/components/provider-profile-manager';
 import { StoragePanel } from '@/components/storage-panel';
@@ -14,7 +13,6 @@ import { useDocumentSemanticProjection } from '@/hooks/use-document-semantic-pro
 import { useTranslationStore } from '@/lib/store';
 import {
   BookText,
-  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   CloudDownload,
@@ -26,15 +24,16 @@ import {
   List,
   Maximize2,
   Minimize2,
+  MoreHorizontal,
   Play,
   Printer,
   RefreshCw,
   Upload,
-  Wifi,
   WifiOff,
 } from 'lucide-react';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useShallow } from 'zustand/react/shallow';
+import type { TranslationQualityPreset } from '@/lib/store';
 
 interface TocItem {
   level: number;
@@ -53,15 +52,33 @@ type TranslationControlMeta = {
   onClick?: () => void;
 };
 
-const TARGET_LANG_OPTIONS = [
-  'Chinese',
-  'Japanese',
-  'Korean',
-  'French',
-  'German',
-  'Spanish',
-  'Italian',
-  'Portuguese',
+const TARGET_LANG_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'Chinese', label: '中文' },
+  { value: 'Japanese', label: '日文' },
+  { value: 'Korean', label: '韩文' },
+  { value: 'French', label: '法文' },
+  { value: 'German', label: '德文' },
+  { value: 'Spanish', label: '西班牙文' },
+  { value: 'Italian', label: '意大利文' },
+  { value: 'Portuguese', label: '葡萄牙文' },
+];
+
+function getTargetLangLabel(value: string): string {
+  return TARGET_LANG_OPTIONS.find((option) => option.value === value)?.label || value;
+}
+
+function isPdfFile(file: File): boolean {
+  return file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+}
+
+const TRANSLATION_QUALITY_OPTIONS: Array<{
+  id: TranslationQualityPreset;
+  label: string;
+  description: string;
+}> = [
+  { id: 'fast', label: '快速', description: '更快出稿' },
+  { id: 'balanced', label: '平衡', description: '默认推荐' },
+  { id: 'quality', label: '高质量', description: '更细致' },
 ];
 
 function extractToc(markdown: string): TocItem[] {
@@ -146,8 +163,8 @@ function renderProgressiveStatus(itemStatus: string, itemProgress: number) {
       </div>
       <div className="text-[10px] text-slate-500">
         {itemStatus === 'uploading' && '文件进入服务端队列'}
-        {itemStatus === 'parsing' && `MinerU 处理中 (${Math.round(itemProgress)}%)`}
-        {itemStatus === 'parsed' && '已生成 Markdown，等待翻译'}
+        {itemStatus === 'parsing' && `正在整理阅读稿 (${Math.round(itemProgress)}%)`}
+        {itemStatus === 'parsed' && '阅读稿已准备好，等待翻译'}
         {itemStatus === 'translating' && '翻译任务进行中'}
         {itemStatus === 'completed' && '阅读稿已就绪'}
         {itemStatus === 'error' && '任务异常'}
@@ -169,6 +186,7 @@ export default function Home() {
     isZenMode,
     activeFileName,
     targetLang,
+    translationQualityPreset,
     translationStatus,
     error,
   } = useTranslationStore(useShallow((state) => ({
@@ -183,6 +201,7 @@ export default function Home() {
     isZenMode: state.isZenMode,
     activeFileName: state.activeFileName,
     targetLang: state.targetLang,
+    translationQualityPreset: state.translationQualityPreset,
     translationStatus: state.translationStatus,
     error: state.error,
   })));
@@ -199,6 +218,7 @@ export default function Home() {
     toggleZenMode,
     importFromArxiv,
     setTargetLang,
+    setTranslationQualityPreset,
   } = useTranslationStore(useShallow((state) => ({
     setFile: state.setFile,
     retryParsing: state.retryParsing,
@@ -212,18 +232,23 @@ export default function Home() {
     toggleZenMode: state.toggleZenMode,
     importFromArxiv: state.importFromArxiv,
     setTargetLang: state.setTargetLang,
+    setTranslationQualityPreset: state.setTranslationQualityPreset,
   })));
 
   const [sidebarTab, setSidebarTab] = useState<'files' | 'outline'>('outline');
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [showArxivDialog, setShowArxivDialog] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
   const [showStorage, setShowStorage] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showProviderProfiles, setShowProviderProfiles] = useState(false);
   const [showRestartConfirm, setShowRestartConfirm] = useState(false);
-  const [translationContextMenu, setTranslationContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const translationContextMenuRef = useRef<HTMLDivElement | null>(null);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [advancedMenuOpen, setAdvancedMenuOpen] = useState(false);
+  const [readerView, setReaderView] = useState<ReaderView>('translation');
+  const [dragFeedback, setDragFeedback] = useState('拖入 PDF 或点击选择');
+  const moreMenuRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const didRehydrateStoreRef = useRef(false);
   const isOnline = useSyncExternalStore(
     subscribeOnlineStatus,
@@ -231,6 +256,7 @@ export default function Home() {
     getServerOnlineSnapshot
   );
   const hasSourceSnapshot = Boolean(sourceMarkdown.trim());
+  const activeQualityOption = TRANSLATION_QUALITY_OPTIONS.find((option) => option.id === translationQualityPreset) || TRANSLATION_QUALITY_OPTIONS[1];
   const isRecoverableParseTask = Boolean(
     batchId &&
     fileHash &&
@@ -269,7 +295,12 @@ export default function Home() {
     return extractToc(effectiveSourceMarkdown);
   }, [effectiveSourceMarkdown, sourceProjection]);
   const hasParsedDocument = Boolean(effectiveSourceMarkdown.trim());
-  const canRetryPendingParse = Boolean(batchId && fileHash);
+  const canRecoverParsing = Boolean(batchId && fileHash);
+  const needsFreshImportAfterError = status === 'error' && !hasParsedDocument && !canRecoverParsing;
+  const openFilePicker = useCallback(() => {
+    setMoreMenuOpen(false);
+    fileInputRef.current?.click();
+  }, []);
   const translationControlState = useMemo<TranslationControlState>(() => {
     if (!hasParsedDocument) return 'unparsed';
     if (status === 'translating') return 'active';
@@ -285,6 +316,19 @@ export default function Home() {
     return Math.min(Math.max(progress, 0), 100);
   }, [progress, status]);
   const showRestartControl = (translationControlState === 'resumable' || translationControlState === 'completed') && status !== 'translating';
+  const showImportLanding = status === 'idle' && !hasParsedDocument && !fileHash;
+  const documentTitle = activeFileName || file?.name || '准备导入 PDF';
+  const targetLangLabel = getTargetLangLabel(targetLang);
+  const workflowHint = useMemo(() => {
+    if (status === 'uploading') return '正在上传文件，稍后进入解析。';
+    if (status === 'parsing') return `正在解析 PDF，${Math.round(displayedProgress)}%。`;
+    if (status === 'parsed') return `原文已就绪，可以翻译成 ${targetLangLabel}。`;
+    if (status === 'translating') return translationStatus || `正在生成 ${targetLangLabel} 译文。`;
+    if (status === 'completed') return '译文已就绪，可以阅读、批注或导出当前视图。';
+    if (status === 'error') return error || '任务遇到问题，可以用主动作继续。';
+    if (file) return '文件已选择，下一步开始解析。';
+    return '拖入 PDF 或从 arXiv 导入，开始翻译阅读。';
+  }, [displayedProgress, error, file, status, targetLangLabel, translationStatus]);
   const translationControlMeta = useMemo<TranslationControlMeta>(() => {
     if (translationControlState === 'unparsed') {
       if (status === 'uploading' || status === 'parsing') {
@@ -299,15 +343,21 @@ export default function Home() {
       }
 
       return {
-        title: status === 'error' ? (canRetryPendingParse ? '继续解析' : '重新解析') : '解析',
+        title: status === 'error' ? (canRecoverParsing ? '继续解析' : '重新导入 PDF') : '解析',
         detail: status === 'error'
-          ? (canRetryPendingParse ? '恢复当前解析任务' : file ? undefined : '等待文件')
-          : file ? undefined : '等待文件',
+          ? (canRecoverParsing ? '恢复当前解析任务' : '重新选择文件')
+          : (file ? '准备解析' : '等待文件'),
         tone: 'slate' as const,
         actionable: true,
-        disabled: (!file && !canRetryPendingParse) || !isOnline,
+        disabled: (!file && !canRecoverParsing && !needsFreshImportAfterError) || !isOnline,
         icon: status === 'error' ? 'refresh' as const : 'play' as const,
-        onClick: () => void retryParsing(),
+        onClick: () => {
+          if (needsFreshImportAfterError) {
+            openFilePicker();
+            return;
+          }
+          void retryParsing();
+        },
       };
     }
 
@@ -347,7 +397,7 @@ export default function Home() {
 
     return {
       title: '翻译',
-      detail: status === 'error' ? '可重试' : targetLang,
+      detail: status === 'error' ? '可重试' : targetLangLabel,
       tone: 'emerald' as const,
       actionable: true,
       disabled: !isOnline,
@@ -356,32 +406,92 @@ export default function Home() {
     };
   }, [
     file,
-    canRetryPendingParse,
+    canRecoverParsing,
     displayedProgress,
     isOnline,
+    needsFreshImportAfterError,
+    openFilePicker,
     resumeTranslation,
     resumableTranslation?.percentage,
     startTranslation,
     retryParsing,
     status,
-    targetLang,
+    targetLangLabel,
     translationControlState,
   ]);
 
   const handleDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
     const droppedFile = event.dataTransfer.files[0];
-    if (droppedFile?.type === 'application/pdf') {
+    if (!droppedFile) {
+      setDragFeedback('请拖入 PDF 文件');
+      return;
+    }
+    if (isPdfFile(droppedFile)) {
       setFile(droppedFile);
+      setDragFeedback(`已选择 ${droppedFile.name}`);
+    } else {
+      setDragFeedback('请拖入 PDF 文件');
     }
   }, [setFile]);
 
+  const handleDragOver = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+    const draggedFile = event.dataTransfer.items?.[0];
+    if (!draggedFile || draggedFile.kind !== 'file') {
+      setDragFeedback('请拖入 PDF 文件');
+      return;
+    }
+    if (draggedFile.type && draggedFile.type !== 'application/pdf') {
+      setDragFeedback('请拖入 PDF 文件');
+      return;
+    }
+    setDragFeedback('松开即可导入 PDF');
+  }, []);
+
+  const handleDragLeave = useCallback(() => {
+    setDragFeedback(file ? `已选择 ${file.name}` : '拖入 PDF 或点击选择');
+  }, [file]);
+
   const handleFileInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0];
-    if (selectedFile) {
+    if (selectedFile && isPdfFile(selectedFile)) {
       setFile(selectedFile);
+      setDragFeedback(`已选择 ${selectedFile.name}`);
+    } else if (selectedFile) {
+      setDragFeedback('请拖入 PDF 文件');
     }
+    event.target.value = '';
   }, [setFile]);
+
+  const handlePrimaryAction = useCallback(() => {
+    if (!file && !hasParsedDocument && status === 'idle') {
+      openFilePicker();
+      return;
+    }
+
+    if (translationControlState === 'completed') {
+      setShowExport(true);
+      return;
+    }
+
+    translationControlMeta.onClick?.();
+  }, [file, hasParsedDocument, openFilePicker, status, translationControlMeta, translationControlState]);
+
+  const primaryActionLabel = useMemo(() => {
+    if (!file && !hasParsedDocument && status === 'idle') return '导入 PDF';
+    if (translationControlState === 'completed') return '导出当前视图';
+    if (translationControlState === 'untranslated') return `翻译成 ${targetLangLabel}`;
+    if (translationControlState === 'unparsed' && file && status === 'idle') return '开始解析';
+    return translationControlMeta.title;
+  }, [file, hasParsedDocument, status, targetLangLabel, translationControlMeta.title, translationControlState]);
+
+  const primaryActionDisabled = useMemo(() => {
+    if (!file && !hasParsedDocument && status === 'idle') return false;
+    if (translationControlState === 'completed') return !fileHash;
+    if (!translationControlMeta.actionable) return true;
+    return translationControlMeta.disabled;
+  }, [file, fileHash, hasParsedDocument, status, translationControlMeta.actionable, translationControlMeta.disabled, translationControlState]);
 
   const handleTocItemClick = useCallback((semanticId: string) => {
     if (useTranslationStore.getState().highlightedBlockId === semanticId) {
@@ -391,130 +501,37 @@ export default function Home() {
     setHighlightedBlock(semanticId);
   }, [setHighlightedBlock]);
 
-  const openTranslationContextMenu = useCallback((event: React.MouseEvent<HTMLElement | HTMLDivElement>) => {
-    event.preventDefault();
-
-    const menuWidth = 220;
-    const menuHeight = 180;
-    const nextX = Math.min(event.clientX, window.innerWidth - menuWidth - 12);
-    const nextY = Math.min(event.clientY, window.innerHeight - menuHeight - 12);
-
-    setTranslationContextMenu({
-      x: Math.max(12, nextX),
-      y: Math.max(12, nextY),
-    });
+  const handleOpenRestartConfirm = useCallback(() => {
+    setMoreMenuOpen(false);
+    setAdvancedMenuOpen(false);
+    setShowRestartConfirm(true);
   }, []);
 
-  const handleStartParsing = useCallback(() => {
-    setTranslationContextMenu(null);
-    void retryParsing();
-  }, [retryParsing]);
+  const toggleMoreMenu = useCallback(() => {
+    setMoreMenuOpen((open) => !open);
+    setAdvancedMenuOpen(false);
+  }, []);
 
-  const handleStartFreshTranslation = useCallback(() => {
-    setTranslationContextMenu(null);
-    void startTranslation();
-  }, [startTranslation]);
-
-  const handleResumeExistingTranslation = useCallback(() => {
-    setTranslationContextMenu(null);
-    void resumeTranslation();
-  }, [resumeTranslation]);
-
-  const handleOpenRestartConfirm = useCallback(() => {
-    setTranslationContextMenu(null);
-    setShowRestartConfirm(true);
+  const closeMoreMenu = useCallback(() => {
+    setMoreMenuOpen(false);
+    setAdvancedMenuOpen(false);
   }, []);
 
   const handleConfirmRestart = useCallback(() => {
     setShowRestartConfirm(false);
-    setTranslationContextMenu(null);
     void restartTranslation();
   }, [restartTranslation]);
 
-  const translationContextMenuItems = useMemo(() => {
-    if (translationControlState === 'unparsed') {
-      return [
-        {
-          key: 'parse',
-          label: status === 'error' ? (canRetryPendingParse ? '继续解析' : '重新解析') : '解析',
-          disabled: ((!file && !canRetryPendingParse) || !isOnline || status === 'uploading' || status === 'parsing'),
-          tone: 'default' as const,
-          onSelect: handleStartParsing,
-        },
-      ];
-    }
-
-    if (translationControlState === 'resumable') {
-      return [
-        {
-          key: 'resume',
-          label: '继续翻译',
-          disabled: !isOnline,
-          tone: 'default' as const,
-          onSelect: handleResumeExistingTranslation,
-        },
-        {
-          key: 'restart',
-          label: '重新翻译全部',
-          disabled: !isOnline,
-          tone: 'danger' as const,
-          onSelect: handleOpenRestartConfirm,
-        },
-      ];
-    }
-
-    if (translationControlState === 'completed') {
-      return [
-        {
-          key: 'restart',
-          label: '重新翻译全部',
-          disabled: !isOnline,
-          tone: 'danger' as const,
-          onSelect: handleOpenRestartConfirm,
-        },
-      ];
-    }
-
-    if (translationControlState === 'active') {
-      return [
-        {
-          key: 'active',
-          label: '翻译中…',
-          disabled: true,
-          tone: 'default' as const,
-          onSelect: () => undefined,
-        },
-      ];
-    }
-
-    return [
-      {
-        key: 'translate',
-        label: '翻译',
-        disabled: !isOnline,
-        tone: 'default' as const,
-        onSelect: handleStartFreshTranslation,
-      },
-    ];
-  }, [
-    file,
-    canRetryPendingParse,
-    handleOpenRestartConfirm,
-    handleResumeExistingTranslation,
-    handleStartFreshTranslation,
-    handleStartParsing,
-    isOnline,
-    status,
-    translationControlState,
-  ]);
-
   useEffect(() => {
-    if (!translationContextMenu) return;
+    if (!moreMenuOpen) return;
 
-    const closeMenu = () => setTranslationContextMenu(null);
+    const closeMenu = () => {
+      setMoreMenuOpen(false);
+      setAdvancedMenuOpen(false);
+    };
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
-      if (target && translationContextMenuRef.current?.contains(target)) return;
+      if (target && moreMenuRef.current?.contains(target)) return;
       closeMenu();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -534,11 +551,10 @@ export default function Home() {
       window.removeEventListener('resize', closeMenu);
       window.removeEventListener('scroll', closeMenu, true);
     };
-  }, [translationContextMenu]);
+  }, [moreMenuOpen]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      setTranslationContextMenu(null);
       setShowRestartConfirm(false);
     }, 0);
 
@@ -547,221 +563,339 @@ export default function Home() {
 
   return (
     <>
-      <main className="flex h-screen flex-col bg-[radial-gradient(circle_at_top_left,_#dbeafe,_transparent_24%),radial-gradient(circle_at_top_right,_#ffedd5,_transparent_22%),#f8fafc]">
-        <header className="shrink-0 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur xl:px-4">
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-3 py-2 text-sm font-semibold text-white shadow-sm">
-                <FileText size={14} />
-                PDF 翻译台
-              </div>
-              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-medium ${isOnline ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
-                {isOnline ? <Wifi size={12} /> : <WifiOff size={12} />}
-                {isOnline ? '在线' : '离线'}
-              </span>
-              <span className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${status === 'completed' ? 'bg-emerald-100 text-emerald-700' :
-                status === 'error' ? 'bg-red-100 text-red-700' :
-                  status === 'translating' ? 'bg-amber-100 text-amber-700' :
-                    'bg-slate-100 text-slate-600'
-                }`}>
-                {statusLabel(status)}
-              </span>
-              <div className="min-w-[220px] flex-1 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-500 shadow-sm">
-                <span className="block truncate">{activeFileName || '尚未载入文档'}</span>
-              </div>
-              {status !== 'idle' && (
-                <div className="inline-flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 shadow-sm">
-                  <span>{Math.round(displayedProgress)}%</span>
-                  <div className="h-2 w-24 overflow-hidden rounded-full bg-slate-100">
-                    <div
-                      className="h-full rounded-full bg-slate-900 transition-all duration-300"
-                      style={{ width: `${displayedProgress}%` }}
-                    />
-                  </div>
-                </div>
-              )}
+      <main className="flex h-screen flex-col bg-slate-50">
+        <header className="shrink-0 border-b border-slate-200 bg-white px-4 py-3">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf"
+            className="hidden"
+            onChange={handleFileInputChange}
+          />
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-slate-900 text-white shadow-sm">
+              <FileText size={17} />
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex min-w-[240px] max-w-[360px] flex-1 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
-                <span className="shrink-0 text-xs font-medium text-slate-500">翻译模型</span>
-                <ModelSelector className="min-w-0 flex-1" />
-              </div>
-              <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
-                <Languages size={15} className="text-slate-400" />
-                <input
-                  list="target-language-options"
-                  value={targetLang}
-                  onChange={(event) => setTargetLang(event.target.value)}
-                  className="w-28 bg-transparent text-sm outline-none"
-                  placeholder="Chinese"
-                />
-                <datalist id="target-language-options">
-                  {TARGET_LANG_OPTIONS.map((lang) => (
-                    <option key={lang} value={lang} />
-                  ))}
-                </datalist>
-              </div>
-
-              <div
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={handleDrop}
-                className={`flex min-w-[220px] flex-1 items-center gap-2 rounded-2xl border border-dashed px-3 py-2 text-sm shadow-sm transition ${file ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-300 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-700'}`}
-              >
-                <input
-                  type="file"
-                  accept=".pdf"
-                  className="hidden"
-                  id="file-upload"
-                  onChange={handleFileInputChange}
-                />
-                <Upload size={15} />
-                <label htmlFor="file-upload" className="cursor-pointer truncate">
-                  {file ? file.name : '拖拽或选择 PDF'}
-                </label>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={translationControlMeta.onClick}
-                  onContextMenu={openTranslationContextMenu}
-                  disabled={translationControlMeta.actionable ? translationControlMeta.disabled : false}
-                  aria-disabled={!translationControlMeta.actionable || translationControlMeta.disabled}
-                  className={`inline-flex h-10 items-center gap-2 rounded-2xl border px-3 text-sm font-medium shadow-sm transition ${translationControlMeta.actionable
-                    ? 'disabled:cursor-not-allowed disabled:opacity-50'
-                    : 'cursor-default'
-                    } ${translationControlMeta.tone === 'emerald'
-                      ? `border-emerald-200 bg-emerald-50 text-emerald-700 ${translationControlMeta.actionable ? 'hover:border-emerald-300 hover:bg-emerald-100' : ''}`
-                      : translationControlMeta.tone === 'amber'
-                        ? 'border-amber-200 bg-amber-50 text-amber-700'
-                        : `border-slate-200 bg-white text-slate-700 ${translationControlMeta.actionable ? 'hover:border-slate-300 hover:bg-slate-50' : ''}`
-                      }`}
-                >
-                  <span className={`inline-flex h-5 w-5 shrink-0 items-center justify-center ${translationControlMeta.tone === 'emerald'
-                    ? 'text-emerald-600'
-                    : translationControlMeta.tone === 'amber'
-                      ? 'text-amber-600'
-                      : 'text-slate-600'
-                    }`}>
-                    {translationControlMeta.icon === 'loader' ? (
-                      <Loader2 size={15} className="animate-spin" />
-                    ) : translationControlMeta.icon === 'check' ? (
-                      <CheckCircle2 size={15} />
-                    ) : translationControlMeta.icon === 'refresh' ? (
-                      <RefreshCw size={15} />
-                    ) : (
-                      <Play size={15} />
-                    )}
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2">
+                <h1 className="truncate text-sm font-semibold text-slate-950">Doti</h1>
+                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${status === 'completed' ? 'bg-emerald-100 text-emerald-700' :
+                  status === 'error' ? 'bg-red-100 text-red-700' :
+                    status === 'translating' ? 'bg-amber-100 text-amber-700' :
+                      'bg-slate-100 text-slate-600'
+                  }`}>
+                  {statusLabel(status)}
+                </span>
+                {!isOnline ? (
+                  <span className="hidden shrink-0 items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-medium text-red-700 sm:inline-flex">
+                    <WifiOff size={11} />
+                    离线
                   </span>
-                  <span className="whitespace-nowrap">{translationControlMeta.title}</span>
-                  {translationControlMeta.detail ? (
-                    <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${translationControlMeta.tone === 'emerald'
-                      ? 'bg-emerald-100 text-emerald-700'
-                      : translationControlMeta.tone === 'amber'
-                        ? 'bg-amber-100 text-amber-700'
-                        : 'bg-slate-100 text-slate-600'
-                      }`}>
-                      {translationControlMeta.detail}
-                    </span>
-                  ) : null}
-                </button>
-
-                {showRestartControl ? (
-                  <button
-                    type="button"
-                    onClick={handleOpenRestartConfirm}
-                    disabled={!isOnline}
-                    title="重新翻译全部内容"
-                    className="inline-flex h-10 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <RefreshCw size={15} />
-                    重翻
-                  </button>
                 ) : null}
               </div>
-
-              <button
-                type="button"
-                onClick={() => setShowArxivDialog(true)}
-                disabled={!isOnline}
-                className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <CloudDownload size={15} />
-                arXiv
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowGlossary(true)}
-                className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
-              >
-                <BookText size={15} />
-                术语
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowExport(true)}
-                disabled={!fileHash}
-                className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Printer size={15} />
-                导出
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowProviderProfiles(true)}
-                className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
-              >
-                <Database size={15} />
-                模型配置
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowStorage(true)}
-                className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
-              >
-                <Database size={15} />
-                存储
-              </button>
-              <button
-                type="button"
-                onClick={toggleZenMode}
-                className={`rounded-2xl border px-3 py-2 text-sm transition ${isZenMode ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:text-slate-900'}`}
-                title={isZenMode ? '退出专注模式' : '进入专注模式'}
-              >
-                <span className="inline-flex items-center gap-2">
-                  {isZenMode ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-                  {isZenMode ? '退出专注' : '专注模式'}
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={reset}
-                className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
-              >
-                <RefreshCw size={15} />
-                重置
-              </button>
+              <div className="mt-0.5 flex min-w-0 items-center gap-2 text-xs text-slate-500">
+                <span className="truncate font-medium text-slate-700">{documentTitle}</span>
+                <span className="hidden truncate md:inline">{workflowHint}</span>
+              </div>
             </div>
 
-            {(translationStatus && status === 'translating') || error ? (
-              <div className="flex flex-wrap items-center gap-2">
-                {translationStatus && status === 'translating' && (
-                  <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs text-amber-700">
-                    {translationStatus}
-                  </span>
-                )}
-                {error && (
-                  <span className="rounded-full border border-red-200 bg-red-50 px-3 py-1 text-xs text-red-700">
-                    {error}
-                  </span>
-                )}
+            {status !== 'idle' ? (
+              <div className="hidden items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 shadow-sm md:inline-flex">
+                <span>{Math.round(displayedProgress)}%</span>
+                <div className="h-2 w-24 overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className="h-full rounded-full bg-slate-900 transition-all duration-300"
+                    style={{ width: `${displayedProgress}%` }}
+                  />
+                </div>
               </div>
             ) : null}
+
+            {!showImportLanding ? (
+              <button
+                type="button"
+                onClick={handlePrimaryAction}
+                disabled={primaryActionDisabled}
+                className={`inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-2xl px-4 text-sm font-semibold shadow-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${translationControlMeta.tone === 'amber'
+                  ? 'border border-amber-200 bg-amber-50 text-amber-700'
+                  : 'bg-slate-900 text-white hover:bg-slate-800'
+                  }`}
+              >
+                {translationControlMeta.icon === 'loader' ? (
+                  <Loader2 size={15} className="animate-spin" />
+                ) : translationControlState === 'completed' ? (
+                  <Printer size={15} />
+                ) : translationControlMeta.icon === 'refresh' ? (
+                  <RefreshCw size={15} />
+                ) : !file && !hasParsedDocument && status === 'idle' ? (
+                  <Upload size={15} />
+                ) : (
+                  <Play size={15} />
+                )}
+                <span className="whitespace-nowrap">{primaryActionLabel}</span>
+              </button>
+            ) : null}
+
+            {!showImportLanding && (
+            <div className="relative" ref={moreMenuRef}>
+              <button
+                type="button"
+                onClick={toggleMoreMenu}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-600 transition hover:border-slate-300 hover:text-slate-950"
+                aria-expanded={moreMenuOpen}
+                aria-label="更多"
+              >
+                <MoreHorizontal size={18} />
+              </button>
+
+              {moreMenuOpen ? (
+                <div className="absolute right-0 top-full z-50 mt-2 w-80 overflow-hidden rounded-2xl border border-slate-200 bg-white p-2 shadow-2xl">
+                  <div className="px-2 pb-2 pt-1 text-xs font-medium text-slate-400">更多</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeMoreMenu();
+                      openFilePicker();
+                    }}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950"
+                  >
+                    <Upload size={15} />
+                    导入 PDF
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeMoreMenu();
+                      setShowArxivDialog(true);
+                    }}
+                    disabled={!isOnline}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <CloudDownload size={15} />
+                    arXiv 导入
+                  </button>
+
+                  <div className="my-2 border-t border-slate-100" />
+                  <label className="flex items-center gap-2 rounded-xl px-3 py-2 text-sm text-slate-700">
+                    <Languages size={15} className="text-slate-400" />
+                    <span className="shrink-0">目标语言</span>
+                    <select
+                      value={targetLang}
+                      onChange={(event) => setTargetLang(event.target.value)}
+                      className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm outline-none focus:border-slate-400"
+                    >
+                      {TARGET_LANG_OPTIONS.map((lang) => (
+                        <option key={lang.value} value={lang.value}>
+                          {lang.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="rounded-xl px-3 py-2 text-sm text-slate-700">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span>翻译质量</span>
+                      <span className="text-xs text-slate-400">{activeQualityOption.description}</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1 text-xs">
+                      {TRANSLATION_QUALITY_OPTIONS.map((preset) => (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          onClick={() => setTranslationQualityPreset(preset.id)}
+                          aria-pressed={translationQualityPreset === preset.id}
+                          className={`rounded-lg px-2 py-1 text-center transition ${translationQualityPreset === preset.id ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="my-2 border-t border-slate-100" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeMoreMenu();
+                      setShowExport(true);
+                    }}
+                    disabled={!fileHash}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Printer size={15} />
+                    导出当前视图
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeMoreMenu();
+                      toggleZenMode();
+                    }}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950"
+                  >
+                    {isZenMode ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+                    {isZenMode ? '退出专注阅读' : '专注阅读'}
+                  </button>
+
+                  <div className="my-2 border-t border-slate-100" />
+                  <button
+                    type="button"
+                    onClick={() => setAdvancedMenuOpen((open) => !open)}
+                    aria-label="高级设置"
+                    aria-expanded={advancedMenuOpen}
+                    className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Database size={15} />
+                      高级设置
+                    </span>
+                    <ChevronRight size={15} className={`transition ${advancedMenuOpen ? 'rotate-90' : ''}`} />
+                  </button>
+                  {advancedMenuOpen ? (
+                    <div className="space-y-1 border-t border-slate-100 pt-2">
+                      {showRestartControl ? (
+                        <button
+                          type="button"
+                          onClick={handleOpenRestartConfirm}
+                          disabled={!isOnline}
+                          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-red-600 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <RefreshCw size={15} />
+                          重新翻译全部
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          closeMoreMenu();
+                          setShowGlossary(true);
+                        }}
+                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
+                      >
+                        <BookText size={15} />
+                        术语库
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          closeMoreMenu();
+                          setShowProviderProfiles(true);
+                        }}
+                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
+                      >
+                        <Database size={15} />
+                        高级模型设置
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          closeMoreMenu();
+                          setShowStorage(true);
+                        }}
+                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
+                      >
+                        <Database size={15} />
+                        存储管理
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          closeMoreMenu();
+                          reset();
+                        }}
+                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
+                      >
+                        <RefreshCw size={15} />
+                        清空当前工作台
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+            )}
           </div>
         </header>
 
-        <div className="flex min-h-0 flex-1 overflow-hidden">
+        {showImportLanding ? (
+          <div
+            className="flex min-h-0 flex-1 items-center justify-center p-4"
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
+            <div className="grid w-full max-w-5xl gap-6 lg:grid-cols-[1.25fr_0.75fr]">
+              <section className="rounded-[28px] border border-dashed border-slate-300 bg-white p-8 shadow-sm">
+                <div className="flex min-h-[360px] flex-col items-center justify-center text-center">
+                  <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-3xl bg-slate-900 text-white shadow-sm">
+                    <Upload size={26} />
+                  </div>
+                  <h2 className="text-2xl font-semibold text-slate-950">拖入 PDF，开始翻译阅读</h2>
+                  <p className="mt-3 max-w-xl text-sm leading-6 text-slate-500">
+                    Doti 会先解析文档，再生成译文。完成后你可以直接阅读、选中文字提问、做笔记，并导出当前看到的视图。
+                  </p>
+                  <div className="mt-5 rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-600">
+                    {dragFeedback}
+                  </div>
+                  {file ? (
+                    <div className="mt-6 flex max-w-full items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                      <FileText size={16} className="shrink-0" />
+                      <span className="truncate">{file.name}</span>
+                    </div>
+                  ) : null}
+                  <div className="mt-7 flex flex-wrap items-center justify-center gap-3">
+                    <button
+                      type="button"
+                      onClick={file ? handlePrimaryAction : openFilePicker}
+                      disabled={primaryActionDisabled}
+                      className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-slate-900 px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {file ? <Play size={16} /> : <Upload size={16} />}
+                      {file ? '开始解析' : '选择 PDF'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowArxivDialog(true)}
+                      disabled={!isOnline}
+                      className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-5 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <CloudDownload size={16} />
+                      arXiv 导入
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-sm font-semibold text-slate-950">最近文档</h2>
+                  <span className="text-xs text-slate-400">{history.length} 个</span>
+                </div>
+                <div className="mt-4 space-y-2">
+                  {history.length > 0 ? history.slice(0, 5).map((item) => (
+                    <button
+                      type="button"
+                      key={item.fileHash}
+                      onClick={() => void loadFromHistory(item.fileHash)}
+                      className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-left transition hover:border-slate-300 hover:bg-slate-50"
+                    >
+                      <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                        <FileText size={15} className="shrink-0 text-slate-400" />
+                        <span className="truncate">{item.fileName}</span>
+                      </div>
+                      {renderProgressiveStatus(item.status, item.progress)}
+                    </button>
+                  )) : (
+                    <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500">
+                      还没有历史文档
+                    </div>
+                  )}
+                </div>
+              </section>
+            </div>
+          </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 overflow-hidden">
           <aside className={`flex min-h-0 shrink-0 flex-col border-r border-slate-200 bg-white/80 backdrop-blur transition-all duration-300 ${sidebarCollapsed ? 'w-12' : 'w-64 xl:w-72'}`}>
             <button
               type="button"
@@ -847,7 +981,7 @@ export default function Home() {
                         </button>
                       )) : (
                         <div className="rounded-3xl border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
-                          {sourceMarkdown ? '当前内容没有识别到 Markdown 标题' : '处理 PDF 后会在这里生成大纲'}
+                          {sourceMarkdown ? '当前内容没有识别到章节标题' : '处理 PDF 后会在这里生成大纲'}
                         </div>
                       )}
                     </div>
@@ -884,6 +1018,15 @@ export default function Home() {
 
           <div className="min-h-0 flex-1 overflow-hidden p-3 xl:p-4">
             <div className={`grid h-full min-h-0 gap-3 ${isZenMode ? 'grid-cols-1' : 'grid-cols-1 2xl:grid-cols-2'}`}>
+              <AppErrorBoundary title="阅读工作区异常">
+                <div className="h-full min-h-0">
+                  <MarkdownEditor
+                    onReaderViewChange={setReaderView}
+                    sourceProjection={sourceProjection}
+                  />
+                </div>
+              </AppErrorBoundary>
+
               {!isZenMode && (
                 <AppErrorBoundary title="PDF 预览面板异常">
                   <div className="h-full min-h-0">
@@ -891,59 +1034,22 @@ export default function Home() {
                   </div>
                 </AppErrorBoundary>
               )}
-
-              <AppErrorBoundary title="Markdown 工作区异常">
-                <div className="h-full min-h-0">
-                  <MarkdownEditor
-                    onTranslationWorkspaceContextMenu={openTranslationContextMenu}
-                    sourceProjection={sourceProjection}
-                  />
-                </div>
-              </AppErrorBoundary>
             </div>
           </div>
-        </div>
+          </div>
+        )}
       </main>
-
-      {translationContextMenu ? (
-        <div
-          ref={translationContextMenuRef}
-          className="fixed z-50 min-w-[200px] overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5 shadow-2xl"
-          style={{ left: translationContextMenu.x, top: translationContextMenu.y }}
-        >
-          {translationContextMenuItems.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              onClick={() => {
-                if (item.disabled) return;
-                item.onSelect();
-              }}
-              disabled={item.disabled}
-              className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition ${item.disabled
-                ? 'cursor-not-allowed text-slate-300'
-                : item.tone === 'danger'
-                  ? 'text-red-600 hover:bg-red-50'
-                  : 'text-slate-700 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-            >
-              <span>{item.label}</span>
-              {item.key === 'restart' ? <RefreshCw size={14} /> : null}
-            </button>
-          ))}
-        </div>
-      ) : null}
 
       <ModalShell
         open={showRestartConfirm}
         onClose={() => setShowRestartConfirm(false)}
         title="重新翻译"
-        description="当前目标语言的译文缓存将被清除，并从头重新翻译。"
+        description="当前目标语言的译文将被清除，并从头重新翻译。"
         widthClassName="max-w-md"
       >
         <div className="space-y-4 px-6 py-6">
           <div className="rounded-2xl border border-red-100 bg-red-50/70 px-4 py-4 text-sm leading-6 text-red-700">
-            当前目标语言的译文会被清空，并立即从头重新翻译。原始 PDF、解析结果、批注、AI 对话不受影响。
+            当前目标语言的译文会被清空，并立即从头重新翻译。原始 PDF、解析结果、批注、提问记录不受影响。
           </div>
           <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
             <button
@@ -979,7 +1085,9 @@ export default function Home() {
         onClose={() => setShowExport(false)}
         fileHash={fileHash}
         fileName={activeFileName}
+        currentView={readerView}
         targetLang={targetLang}
+        targetLangLabel={targetLangLabel}
       />
     </>
   );

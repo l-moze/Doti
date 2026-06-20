@@ -1,6 +1,8 @@
 'use client';
 
 import { FileOutput, Languages, NotebookPen, ScrollText } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import type { ReaderView } from '@/components/markdown-editor';
 import { getProviderProfile, listUserGlossaryRecords } from '@/lib/db';
 import { useTranslationStore } from '@/lib/store';
 import {
@@ -9,7 +11,11 @@ import {
 } from '@/lib/translation-cache-key';
 import { ModalShell } from './modal-shell';
 
-type ExportMode = 'translation' | 'bilingual' | 'notes' | 'bilingual-notes';
+type ExportMode = 'translation' | 'source' | 'bilingual' | 'notes' | 'bilingual-notes';
+
+function modeIncludesTranslation(mode: ExportMode): boolean {
+    return mode === 'translation' || mode === 'bilingual' || mode === 'bilingual-notes';
+}
 
 const EXPORT_OPTIONS: Array<{
     mode: ExportMode;
@@ -38,29 +44,52 @@ const EXPORT_OPTIONS: Array<{
     {
         mode: 'bilingual-notes',
         icon: FileOutput,
-        title: '译文 + 批注工作稿',
-        description: '用于深度阅读、讨论与打印审阅。',
+        title: '译文 + 阅读笔记',
+        description: '把译文和你的阅读笔记一起导出。',
     },
 ];
 
 interface ExportSheetProps {
+    currentView: ReaderView;
     fileHash: string | null;
     fileName: string | null;
     open: boolean;
     targetLang: string;
+    targetLangLabel: string;
     onClose: () => void;
 }
 
 export function ExportSheet({
+    currentView,
     fileHash,
     fileName,
     open,
     targetLang,
+    targetLangLabel,
     onClose,
 }: ExportSheetProps) {
+    const [showMoreFormats, setShowMoreFormats] = useState(false);
     const providerId = useTranslationStore((state) => state.providerId);
     const model = useTranslationStore((state) => state.model);
     const canExport = Boolean(fileHash);
+    const currentMode: ExportMode = currentView === 'compare'
+        ? 'bilingual'
+        : currentView === 'source'
+            ? 'source'
+            : 'translation';
+    const currentViewLabel = currentView === 'compare'
+        ? '对照视图'
+        : currentView === 'source'
+            ? '原文视图'
+            : '译文视图';
+    const currentViewMeta = {
+        label: currentViewLabel,
+        translationLabel: modeIncludesTranslation(currentMode) ? targetLangLabel : null,
+    };
+
+    useEffect(() => {
+        if (!open) setShowMoreFormats(false);
+    }, [open]);
 
     const openPrintPreview = async (mode: ExportMode) => {
         if (!fileHash) return;
@@ -72,32 +101,34 @@ export function ExportSheet({
 
         let translationArtifact = '';
 
-        try {
-            const providerProfile = providerId.startsWith('custom:')
-                ? await getProviderProfile(providerId.slice('custom:'.length))
-                : undefined;
-            const glossaryTerms = (await listUserGlossaryRecords())
-                .filter((term) => term.enabled)
-                .map((term) => ({
-                    source: term.source,
-                    target: term.target,
-                    category: term.category,
-                }));
+        if (modeIncludesTranslation(mode)) {
+            try {
+                const providerProfile = providerId.startsWith('custom:')
+                    ? await getProviderProfile(providerId.slice('custom:'.length))
+                    : undefined;
+                const glossaryTerms = (await listUserGlossaryRecords())
+                    .filter((term) => term.enabled)
+                    .map((term) => ({
+                        source: term.source,
+                        target: term.target,
+                        category: term.category,
+                    }));
 
-            translationArtifact = buildTranslationArtifactBaseName(
-                buildTranslationCacheKeyInputFromRuntime({
-                    fileHash,
-                    targetLang,
-                    providerId,
-                    model,
-                    providerProfile,
-                    glossaryTerms,
-                    translateMode: providerProfile?.providerType === 'deeplx' ? 'deeplx' : 'default',
-                    outputMode: 'plain',
-                })
-            );
-        } catch (error) {
-            console.warn('[Export] Failed to resolve translation artifact, falling back to legacy path:', error);
+                translationArtifact = buildTranslationArtifactBaseName(
+                    buildTranslationCacheKeyInputFromRuntime({
+                        fileHash,
+                        targetLang,
+                        providerId,
+                        model,
+                        providerProfile,
+                        glossaryTerms,
+                        translateMode: providerProfile?.providerType === 'deeplx' ? 'deeplx' : 'default',
+                        outputMode: 'plain',
+                    })
+                );
+            } catch (error) {
+                console.warn('[Export] Failed to resolve translation artifact, falling back to legacy path:', error);
+            }
         }
 
         const params = new URLSearchParams({
@@ -121,36 +152,68 @@ export function ExportSheet({
     return (
         <ModalShell
             open={open}
-            title="导出与打印"
-            description="使用浏览器打印路径生成阅读稿，支持对照与批注模式。"
+            title="导出当前视图"
+            description="默认导出你正在看的阅读视图，其他格式收在下方。"
             widthClassName="max-w-3xl"
             onClose={onClose}
         >
             <div className="space-y-5 px-6 py-6">
                 <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
                     <div className="font-medium text-slate-900">{fileName || '当前文档'}</div>
-                    <div className="mt-1">导出语言：{targetLang}</div>
+                    <div className="mt-1">
+                        当前视图：{currentViewMeta.label}
+                        {currentViewMeta.translationLabel ? ` · 导出语言：${currentViewMeta.translationLabel}` : ''}
+                    </div>
                 </div>
 
-                <div className="grid gap-4 md:grid-cols-2">
-                    {EXPORT_OPTIONS.map((option) => {
-                        const Icon = option.icon;
-                        return (
-                            <button
-                                key={option.mode}
-                                type="button"
-                                onClick={() => openPrintPreview(option.mode)}
-                                disabled={!canExport}
-                                className="rounded-3xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:border-slate-300 hover:shadow-md disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                                <div className="mb-4 inline-flex rounded-2xl bg-slate-900 p-3 text-white">
-                                    <Icon size={18} />
-                                </div>
-                                <div className="text-base font-semibold text-slate-900">{option.title}</div>
-                                <p className="mt-2 text-sm leading-6 text-slate-500">{option.description}</p>
-                            </button>
-                        );
-                    })}
+                <button
+                    type="button"
+                    onClick={() => openPrintPreview(currentMode)}
+                    disabled={!canExport}
+                    className="flex w-full items-center justify-between gap-4 rounded-3xl bg-slate-900 px-5 py-4 text-left text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                    <span>
+                        <span className="block text-base font-semibold">导出当前视图</span>
+                        <span className="mt-1 block text-sm text-slate-300">
+                            按现在的 {currentViewLabel} 生成打印预览。
+                        </span>
+                    </span>
+                    <FileOutput size={20} className="shrink-0" />
+                </button>
+
+                <div className="rounded-3xl border border-slate-200 bg-white">
+                    <button
+                        type="button"
+                        onClick={() => setShowMoreFormats((open) => !open)}
+                        aria-expanded={showMoreFormats}
+                        className="flex w-full items-center justify-between gap-3 px-5 py-4 text-left text-sm font-medium text-slate-700 transition hover:text-slate-950"
+                    >
+                        <span>更多导出方式</span>
+                        <span className="text-xs text-slate-400">{showMoreFormats ? '收起' : '展开'}</span>
+                    </button>
+
+                    {showMoreFormats ? (
+                        <div className="grid gap-4 border-t border-slate-200 p-4 md:grid-cols-2">
+                            {EXPORT_OPTIONS.map((option) => {
+                                const Icon = option.icon;
+                                return (
+                                    <button
+                                        key={option.mode}
+                                        type="button"
+                                        onClick={() => openPrintPreview(option.mode)}
+                                        disabled={!canExport}
+                                        className="rounded-2xl border border-slate-200 bg-white p-4 text-left transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                        <div className="mb-3 inline-flex rounded-xl bg-slate-900 p-2.5 text-white">
+                                            <Icon size={16} />
+                                        </div>
+                                        <div className="text-sm font-semibold text-slate-900">{option.title}</div>
+                                        <p className="mt-1.5 text-sm leading-6 text-slate-500">{option.description}</p>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    ) : null}
                 </div>
             </div>
         </ModalShell>

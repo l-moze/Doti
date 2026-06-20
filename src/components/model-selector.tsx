@@ -80,13 +80,13 @@ export function ModelSelector({ mode = 'translation', className, compact = false
         return (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Loader2 size={12} className="animate-spin" />
-                <span>Loading...</span>
+                <span>正在加载模型...</span>
             </div>
         );
     }
 
     if (!data) {
-        return <div className="text-xs text-red-500">Failed to load models</div>;
+        return <div className="text-xs text-red-500">模型列表加载失败</div>;
     }
 
     const activeProviderId = mode === 'assist' ? assistProviderId : providerId;

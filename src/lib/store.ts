@@ -33,10 +33,16 @@ import { clearPretextEngineCache } from './pretext';
 export type TaskStatus = 'idle' | 'uploading' | 'parsing' | 'parsed' | 'translating' | 'completed' | 'error';
 export type TranslationPhase = 'idle' | 'preparing' | 'chunking' | 'refining' | 'streaming' | 'stalled' | 'finalizing' | 'completed' | 'error';
 export type PaperPolishStatus = 'idle' | 'processing' | 'completed' | 'error' | 'cancelled';
+export type TranslationQualityPreset = 'fast' | 'balanced' | 'quality';
 
 const TRANSLATION_STREAM_STALL_WARNING_MS = 45000;
 const TRANSLATION_STREAM_HARD_TIMEOUT_MS = 10 * 60 * 1000;
 const TRANSIENT_TASK_STATUSES: TaskStatus[] = ['uploading', 'parsing', 'translating'];
+const TRANSLATION_QUALITY_PRESETS: Record<TranslationQualityPreset, { providerId: string; model: string }> = {
+    fast: { providerId: 'gemini', model: 'gemini-2.5-flash' },
+    balanced: { providerId: 'gemini', model: 'gemini-2.5-flash' },
+    quality: { providerId: 'gemini', model: 'gemini-2.5-pro' },
+};
 
 export interface HistoryItem {
     fileHash: string;
@@ -86,6 +92,7 @@ export interface TranslationState {
     targetLang: string;
     layoutUrl: string | null;
     layoutJsonUrl: string | null;
+    translationQualityPreset: TranslationQualityPreset;
     providerId: string;  // 'gemini' | 'deepseek' | 'glm' | 'ollama' | 'openai'
     model: string;
     assistProviderId: string;
@@ -151,6 +158,8 @@ export interface TranslationState {
     undoPaperPolish: () => Promise<void>;
     reset: () => void;
     setTargetLang: (lang: string) => void;
+    setTranslationQualityPreset: (preset: TranslationQualityPreset) => void;
+    saveEditedTranslation: (editedMarkdown: string) => void;
     setProvider: (providerId: string, model: string) => void;
     setAssistProvider: (providerId: string, model: string) => void;
 }
@@ -713,6 +722,7 @@ export const useTranslationStore = create<TranslationState>()(
             targetLang: 'Chinese',
             layoutUrl: null,
             layoutJsonUrl: null,
+            translationQualityPreset: 'balanced',
             providerId: 'gemini',
             model: 'gemini-2.5-flash',
             assistProviderId: 'gemini',
@@ -1347,8 +1357,59 @@ export const useTranslationStore = create<TranslationState>()(
                 }
             },
 
+            setTranslationQualityPreset: (preset) => {
+                const nextPreset = TRANSLATION_QUALITY_PRESETS[preset];
+                set({ translationQualityPreset: preset });
+                get().setProvider(nextPreset.providerId, nextPreset.model);
+            },
+
             setAssistProvider: (providerId, model) => {
                 set({ assistProviderId: providerId, assistModel: model });
+            },
+
+            saveEditedTranslation: (editedMarkdown) => {
+                const current = get();
+                const nextStatus = current.sourceMarkdown.trim() ? 'completed' : current.status;
+                const nextProgress = current.sourceMarkdown.trim() ? 100 : current.progress;
+
+                set({
+                    targetMarkdown: editedMarkdown,
+                    translationBlocks: [],
+                    error: null,
+                    translationStatus: '已保存编辑',
+                    translationPhase: 'completed',
+                    translationLastEventAt: Date.now(),
+                    status: current.status === 'translating' ? current.status : nextStatus,
+                    progress: current.status === 'translating' ? current.progress : nextProgress,
+                    resumableTranslation: null,
+                });
+
+                const latest = get();
+                if (!latest.fileHash) return;
+
+                void saveSessionSnapshot({
+                    id: `${latest.fileHash}::${latest.targetLang}`,
+                    fileHash: latest.fileHash,
+                    fileName: latest.file?.name || latest.activeFileName || 'unknown.pdf',
+                    status: latest.status,
+                    progress: latest.progress,
+                    targetLang: latest.targetLang,
+                    providerId: latest.providerId,
+                    model: latest.model,
+                    updatedAt: Date.now(),
+                });
+                void persistActiveDocumentSnapshot({
+                    fileHash: latest.fileHash,
+                    fileName: latest.activeFileName,
+                    status: latest.status,
+                    progress: latest.progress,
+                    targetLang: latest.targetLang,
+                    sourceMarkdown: latest.sourceMarkdown,
+                    rawSourceMarkdown: latest.rawSourceMarkdown,
+                    polishedSourceMarkdown: latest.polishedSourceMarkdown,
+                    targetMarkdown: editedMarkdown,
+                    layoutJsonUrl: latest.layoutJsonUrl,
+                });
             },
 
             setHighlightedBlock: (blockId) => set({ highlightedBlockId: blockId }),
@@ -2695,6 +2756,7 @@ export const useTranslationStore = create<TranslationState>()(
                     polishedSourceMarkdown: state.polishedSourceMarkdown,
                     targetMarkdown: state.targetMarkdown,
                     targetLang: state.targetLang,
+                    translationQualityPreset: state.translationQualityPreset,
                     providerId: state.providerId,
                     model: state.model,
                     assistProviderId: state.assistProviderId,

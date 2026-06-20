@@ -13,7 +13,7 @@ import { ModalShell } from './modal-shell';
 
 function toCsv(records: GlossaryRecord[]): string {
     return [
-        'source,target,category,enabled',
+        '原文写法,固定译法,使用场景,是否使用',
         ...records.map((record) =>
             [
                 `"${record.source.replace(/"/g, '""')}"`,
@@ -35,7 +35,7 @@ async function parseCsvFile(file: File): Promise<Array<Pick<GlossaryRecord, 'sou
         .filter(Boolean)
         .map<ParsedGlossaryInput>((line, index) => {
             const parts = line.split(',');
-            if (index === 0 && parts[0]?.toLowerCase().includes('source')) {
+            if (index === 0 && (parts[0]?.toLowerCase().includes('source') || parts[0]?.includes('原文写法'))) {
                 return null;
             }
 
@@ -188,8 +188,8 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
     return (
         <ModalShell
             open={open}
-            title="用户术语库"
-            description="用户术语会覆盖内置词库，翻译时自动注入模型提示。"
+            title="固定译法"
+            description="把论文里的固定写法翻译成你习惯的说法。"
             onClose={onClose}
         >
             <div className="space-y-6 px-6 py-6">
@@ -199,21 +199,21 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                             type="text"
                             value={draft.source}
                             onChange={(event) => setDraft((current) => ({ ...current, source: event.target.value }))}
-                            placeholder="原术语"
+                            placeholder="原文写法"
                             className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-400"
                         />
                         <input
                             type="text"
                             value={draft.target}
                             onChange={(event) => setDraft((current) => ({ ...current, target: event.target.value }))}
-                            placeholder="目标术语"
+                            placeholder="固定译法"
                             className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-400"
                         />
                         <input
                             type="text"
                             value={draft.category}
                             onChange={(event) => setDraft((current) => ({ ...current, category: event.target.value }))}
-                            placeholder="分类，如 vision / math"
+                            placeholder="使用场景，如视觉、数学"
                             className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-400"
                         />
                         <button
@@ -232,7 +232,7 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                             onChange={(event) => setDraft((current) => ({ ...current, enabled: event.target.checked }))}
                             className="h-4 w-4 accent-slate-900"
                         />
-                        新增术语默认启用
+                        新增后立即用于翻译
                     </label>
                 </section>
 
@@ -241,13 +241,13 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                         type="search"
                         value={search}
                         onChange={(event) => setSearch(event.target.value)}
-                        placeholder="搜索术语、翻译或分类"
+                        placeholder="搜索原文、译法或场景"
                         className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm outline-none transition focus:border-slate-400 md:max-w-sm"
                     />
                     <div className="flex flex-wrap items-center gap-2">
                         <label className="inline-flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-700 transition hover:border-slate-300">
                             <Upload size={15} />
-                            导入 CSV
+                            导入词表
                             <input
                                 type="file"
                                 accept=".csv,text/csv"
@@ -261,7 +261,7 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                             className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-700 transition hover:border-slate-300"
                         >
                             <Download size={15} />
-                            导出 CSV
+                            导出词表
                         </button>
                         <button
                             type="button"
@@ -269,25 +269,25 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                             className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-700 transition hover:border-slate-300"
                         >
                             <Download size={15} />
-                            导出 JSON
+                            备份数据
                         </button>
                     </div>
                 </section>
 
                 <section className="overflow-hidden rounded-3xl border border-slate-200">
                     <div className="grid grid-cols-[1.1fr_1.1fr_0.8fr_120px_80px] gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
-                        <span>Source</span>
-                        <span>Target</span>
-                        <span>Category</span>
-                        <span>Status</span>
-                        <span className="text-right">Action</span>
+                        <span>原文</span>
+                        <span>译法</span>
+                        <span>场景</span>
+                        <span>状态</span>
+                        <span className="text-right">操作</span>
                     </div>
 
                     <div className="max-h-[420px] overflow-auto bg-white">
                         {loading ? (
                             <div className="flex items-center justify-center gap-2 px-4 py-10 text-sm text-slate-500">
                                 <Loader2 size={16} className="animate-spin" />
-                                正在读取术语库
+                                正在读取固定译法
                             </div>
                         ) : filteredRecords.length > 0 ? filteredRecords.map((record) => (
                             <div
@@ -303,14 +303,14 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                                     className={`inline-flex h-fit items-center justify-center rounded-full px-3 py-1 text-xs font-medium ${record.enabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'
                                         }`}
                                 >
-                                    {record.enabled ? '启用中' : '已停用'}
+                                    {record.enabled ? '使用中' : '暂停中'}
                                 </button>
                                 <div className="flex justify-end">
                                     <button
                                         type="button"
                                         onClick={() => void removeRecord(record.id)}
                                         className="rounded-full border border-slate-200 p-2 text-slate-500 transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-                                        aria-label={`Delete ${record.source}`}
+                                        aria-label={`删除固定译法：${record.source}`}
                                     >
                                         <Trash2 size={14} />
                                     </button>
@@ -318,7 +318,7 @@ export function GlossaryManager({ open, onClose }: GlossaryManagerProps) {
                             </div>
                         )) : (
                             <div className="px-4 py-10 text-center text-sm text-slate-500">
-                                还没有用户术语，可以先手动添加或导入 CSV。
+                                还没有固定译法，可以先添加一条常见论文写法。
                             </div>
                         )}
                     </div>

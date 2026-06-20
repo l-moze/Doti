@@ -40,8 +40,8 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
     const capabilityDescription = useMemo(() => {
         return draft.providerType === 'deeplx'
-            ? 'DeepLX 只参与翻译链路，不会出现在 AI 对话模型列表。兼容免费 /translate，也兼容官方 /v2/translate。若使用 DeepL 兼容 glossary，请在下方额外填写 glossary ID 与 source_lang。'
-            : 'OpenAI-compatible provider 可用于翻译、AI 辅助，或两者同时使用。';
+            ? 'DeepLX 服务只用于翻译，不会出现在问答模型列表。使用术语表时，请补充术语表 ID 和原文语言。'
+            : '兼容 OpenAI 接口的服务可用于翻译、问答，或两者同时使用。';
     }, [draft.providerType]);
 
     const loadProfiles = async () => {
@@ -91,12 +91,12 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
     const saveDraft = async () => {
         if (!draft.name.trim() || !draft.baseUrl.trim() || !draft.model.trim()) {
-            setError('名称、Endpoint 和默认模型不能为空。');
+            setError('名称、服务地址和默认模型不能为空。');
             return;
         }
 
         if (draft.providerType === 'deeplx' && draft.glossaryId.trim() && !draft.sourceLang.trim()) {
-            setError('启用 DeepL glossary 时需要填写 source_lang，例如 EN。');
+            setError('启用 DeepL 术语表时需要填写原文语言，例如 EN。');
             return;
         }
 
@@ -132,7 +132,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
     const testDraft = async () => {
         if (!draft.baseUrl.trim()) {
-            setError('测试前请先填写 Endpoint。');
+            setError('测试前请先填写服务地址。');
             return;
         }
 
@@ -179,16 +179,16 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
         <ModalShell
             open={open}
             onClose={onClose}
-            title="模型配置"
-            description="添加 OpenAI-compatible 或 DeepLX 端点，后续可直接在翻译模型 / AI 模型选择器中使用。"
+            title="自定义翻译服务"
+            description="添加自建或第三方翻译服务，后续可直接用于翻译或问答。"
             widthClassName="max-w-5xl"
         >
             <div className="grid gap-6 p-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
                 <section className="rounded-3xl border border-slate-200 bg-slate-50/70 p-5">
                     <div className="flex items-center justify-between gap-3">
                         <div>
-                            <h3 className="text-base font-semibold text-slate-900">已保存的 Provider</h3>
-                            <p className="mt-1 text-sm text-slate-500">这里的配置只保存在本机浏览器中，不会写入服务端环境变量。</p>
+                            <h3 className="text-base font-semibold text-slate-900">已保存的服务</h3>
+                            <p className="mt-1 text-sm text-slate-500">这里的配置只保存在本机，不会写入服务器环境。</p>
                         </div>
                         {loading ? <Loader2 size={16} className="animate-spin text-slate-400" /> : null}
                     </div>
@@ -227,7 +227,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                             </article>
                         )) : (
                             <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500">
-                                还没有自定义 provider。添加后会自动进入模型选择器。
+                                还没有自定义服务。添加后会出现在可选模型里。
                             </div>
                         )}
                     </div>
@@ -236,7 +236,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                 <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
                     <div className="flex items-center gap-2 text-slate-900">
                         <Plus size={16} />
-                        <h3 className="text-base font-semibold">新增 Provider</h3>
+                        <h3 className="text-base font-semibold">新增服务</h3>
                     </div>
                     <p className="mt-2 text-sm leading-6 text-slate-500">{capabilityDescription}</p>
 
@@ -247,13 +247,13 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                 type="text"
                                 value={draft.name}
                                 onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
-                                placeholder="例如：公司 OpenAI 网关 / 自建 DeepLX"
+                                placeholder="例如：公司翻译网关 / 自建 DeepLX"
                                 className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                             />
                         </label>
 
                         <label className="block space-y-2 text-sm">
-                            <span className="font-medium text-slate-700">Provider 类型</span>
+                            <span className="font-medium text-slate-700">服务类型</span>
                             <select
                                 value={draft.providerType}
                                 onChange={(event) => {
@@ -272,7 +272,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                         </label>
 
                         <label className="block space-y-2 text-sm">
-                            <span className="font-medium text-slate-700">Endpoint</span>
+                            <span className="font-medium text-slate-700">服务地址</span>
                             <input
                                 type="text"
                                 value={draft.baseUrl}
@@ -283,19 +283,19 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                             {draft.providerType === 'deeplx' ? (
                                 <p className="text-xs leading-5 text-slate-500">
                                     自建 DeepLX 免费接口可填写基础地址，例如 <code>http://127.0.0.1:1188</code>；
-                                    若要启用官方兼容 glossary，建议直接填写完整 <code>/v2/translate</code> 地址。
+                                    若要启用官方兼容术语表，建议直接填写完整 <code>/v2/translate</code> 地址。
                                     托管网关也可在地址里使用 <code>{'{{apiKey}}'}</code> 占位符。
                                 </p>
                             ) : null}
                         </label>
 
                         <label className="block space-y-2 text-sm">
-                            <span className="font-medium text-slate-700">API Key</span>
+                            <span className="font-medium text-slate-700">访问密钥</span>
                             <input
                                 type="password"
                                 value={draft.apiKey}
                                 onChange={(event) => setDraft((current) => ({ ...current, apiKey: event.target.value }))}
-                                placeholder={draft.providerType === 'deeplx' ? '自建实例填 TOKEN；完整 endpoint 已含 key 时可留空' : 'sk-...'}
+                                placeholder={draft.providerType === 'deeplx' ? '自建实例填 TOKEN；完整地址已含 key 时可留空' : 'sk-...'}
                                 className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                             />
                         </label>
@@ -303,18 +303,18 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                         {draft.providerType === 'deeplx' ? (
                             <>
                                 <label className="block space-y-2 text-sm">
-                                    <span className="font-medium text-slate-700">Glossary ID（可选）</span>
+                                    <span className="font-medium text-slate-700">术语表 ID（可选）</span>
                                     <input
                                         type="text"
                                         value={draft.glossaryId}
                                         onChange={(event) => setDraft((current) => ({ ...current, glossaryId: event.target.value }))}
-                                        placeholder="DeepL / DeepLX official glossary_id"
+                                        placeholder="DeepL / DeepLX 官方术语表 ID"
                                         className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                                     />
                                 </label>
 
                                 <label className="block space-y-2 text-sm">
-                                    <span className="font-medium text-slate-700">Source Lang（可选）</span>
+                                    <span className="font-medium text-slate-700">原文语言（可选）</span>
                                     <input
                                         type="text"
                                         value={draft.sourceLang}
@@ -323,7 +323,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                         className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                                     />
                                     <p className="text-xs leading-5 text-slate-500">
-                                        DeepL 兼容 glossary 需要显式 source_lang；不使用 glossary 时可留空。
+                                        DeepL 兼容术语表需要原文语言；不使用术语表时可留空。
                                     </p>
                                 </label>
                             </>

@@ -42,6 +42,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 type SidePanelTab = 'notes' | 'ai';
 type AssistAction = 'explain' | 'summarize' | 'rewrite' | 'extract' | 'qa';
+export type ReaderView = EditorTab | 'compare';
 const COLLAPSE_LIMITS = {
     panelPreview: 180,
     annotationQuote: 180,
@@ -146,35 +147,45 @@ function getConversationSessionId(conversation: ConversationRecord): string {
 }
 
 function formatSemanticBlockLabel(semanticBlockId?: string): string {
-    if (!semanticBlockId) return '片段';
+    if (!semanticBlockId) return '所选片段';
 
     const match = semanticBlockId.match(/^sec-(\d+)-([a-z]+)-(\d+)$/i);
-    if (!match) return semanticBlockId;
+    if (!match) return '所选片段';
 
     const [, section, rawType, index] = match;
-    const typeMap: Record<string, string> = {
-        title: '标题',
-        text: '段',
-        image: '图',
-        table: '表',
-        formula: '式',
-        list: '列表',
-        code: '码',
-    };
-    const typeLabel = typeMap[rawType.toLowerCase()] || '片段';
+    const sectionNumber = Number(section) + 1;
+    const itemNumber = Number(index) + 1;
+    const typeKey = rawType.toLowerCase();
 
-    if (rawType.toLowerCase() === 'title') {
-        return `${typeLabel}${Number(section) + 1}`;
+    if (typeKey === 'title') {
+        return `第 ${sectionNumber} 节标题`;
     }
+    if (typeKey === 'text') return `第 ${sectionNumber} 节，第 ${itemNumber} 段`;
+    if (typeKey === 'image') return `第 ${sectionNumber} 节，第 ${itemNumber} 张图`;
+    if (typeKey === 'table') return `第 ${sectionNumber} 节，第 ${itemNumber} 个表格`;
+    if (typeKey === 'formula') return `第 ${sectionNumber} 节，第 ${itemNumber} 个公式`;
+    if (typeKey === 'list') return `第 ${sectionNumber} 节，第 ${itemNumber} 个列表`;
+    if (typeKey === 'code') return `第 ${sectionNumber} 节，第 ${itemNumber} 段代码`;
 
-    return `${typeLabel}${Number(section) + 1}-${Number(index) + 1}`;
+    return `第 ${sectionNumber} 节，所选片段`;
 }
 
 function buildSelectionReferenceLabel(anchor?: AnnotationAnchorRecord | null): string | null {
     if (!anchor) return null;
 
-    const blockLabel = formatSemanticBlockLabel(anchor.semanticBlockId);
-    return `@${blockLabel}`;
+    return formatSemanticBlockLabel(anchor.semanticBlockId);
+}
+
+function getEditorTabLabel(tab?: EditorTab | null): string {
+    if (tab === 'translation') return '译文';
+    if (tab === 'source') return '原文';
+    return '全文';
+}
+
+function buildAssistContextLabel(selection?: SelectionSnapshot | null): string {
+    const tabLabel = getEditorTabLabel(selection?.tab);
+    const referenceLabel = buildSelectionReferenceLabel(selection?.anchor);
+    return referenceLabel ? `来自${tabLabel} · ${referenceLabel}` : `来自${tabLabel}`;
 }
 
 type TranslationBlockCandidate = {
@@ -239,13 +250,18 @@ function CollapsibleText({
 }
 
 interface MarkdownEditorProps {
-    onTranslationWorkspaceContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+    onReaderViewChange?: (view: ReaderView) => void;
     sourceProjection?: DocumentSemanticProjection | null;
 }
 
-export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjection = null }: MarkdownEditorProps) {
+export function MarkdownEditor({
+    onReaderViewChange,
+    sourceProjection = null,
+}: MarkdownEditorProps) {
     const {
         sourceMarkdown,
+        targetMarkdown,
+        translationBlocks,
         batchId,
         status,
         progress,
@@ -284,6 +300,8 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
 
         return {
             sourceMarkdown: state.sourceMarkdown,
+            targetMarkdown: state.targetMarkdown,
+            translationBlocks: state.translationBlocks,
             batchId: state.batchId,
             status: state.status,
             progress: state.progress,
@@ -321,6 +339,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         runPaperPolishAiFallback,
         cancelPaperPolish,
         undoPaperPolish,
+        saveEditedTranslation,
     } = useTranslationStore(useShallow((state) => ({
         setHighlightedBlock: state.setHighlightedBlock,
         setPaperPolishAutoEnabled: state.setPaperPolishAutoEnabled,
@@ -328,10 +347,12 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         runPaperPolishAiFallback: state.runPaperPolishAiFallback,
         cancelPaperPolish: state.cancelPaperPolish,
         undoPaperPolish: state.undoPaperPolish,
+        saveEditedTranslation: state.saveEditedTranslation,
     })));
 
     const vlookLoaded = useVlookStyle();
-    const [manualTab, setManualTab] = useState<EditorTab | null>(null);
+    const [manualView, setManualView] = useState<ReaderView | null>(null);
+    const [sidePanelOpen, setSidePanelOpen] = useState(false);
     const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>('notes');
     const [annotations, setAnnotations] = useState<AnnotationRecord[]>([]);
     const [conversations, setConversations] = useState<ConversationRecord[]>([]);
@@ -343,6 +364,11 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     const [noteTags, setNoteTags] = useState('');
     const [noteSearch, setNoteSearch] = useState('');
     const [assistQuestion, setAssistQuestion] = useState('');
+    const [assistAdvancedOpen, setAssistAdvancedOpen] = useState(false);
+    const [assistSuggestionsOpen, setAssistSuggestionsOpen] = useState(false);
+    const [formatMenuOpen, setFormatMenuOpen] = useState(false);
+    const [translationEditMode, setTranslationEditMode] = useState(false);
+    const [translationEditDraft, setTranslationEditDraft] = useState('');
     const [assistLoading, setAssistLoading] = useState(false);
     const [assistError, setAssistError] = useState<string | null>(null);
     const [assistSessionId, setAssistSessionId] = useState<string | null>(null);
@@ -364,6 +390,9 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
 
     const translationPaneRef = useRef<HTMLDivElement | null>(null);
     const sourcePaneRef = useRef<HTMLDivElement | null>(null);
+    const comparePaneRef = useRef<HTMLDivElement | null>(null);
+    const compareTranslationPaneRef = useRef<HTMLDivElement | null>(null);
+    const compareSourcePaneRef = useRef<HTMLDivElement | null>(null);
     const conversationListRef = useRef<HTMLDivElement | null>(null);
     const assistQuestionRef = useRef<HTMLTextAreaElement | null>(null);
     const previousHighlightedBlockIdRef = useRef<string | null>(null);
@@ -379,9 +408,18 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     );
     const effectiveSourceMarkdown = isRecoverableParseTask ? '' : sourceMarkdown;
     const renderedSourceMarkdown = useMemo(() => normalizeMarkdownMathForDisplay(effectiveSourceMarkdown), [effectiveSourceMarkdown]);
-    const activeTab: EditorTab = manualTab ?? (status === 'parsed' && !hasTranslationContent ? 'source' : 'translation');
-    const activeDocumentId = fileHash ? getDocumentId(fileHash, targetLang, activeTab) : null;
+    const activeView: ReaderView = manualView ?? (status === 'parsed' && !hasTranslationContent ? 'source' : 'translation');
+    const activeDocumentTab: EditorTab = activeView === 'source' ? 'source' : 'translation';
     const translationHeaderLabel = translationConcurrency > 1 ? `并发翻译中 · ${translationConcurrency} 路` : '翻译进行中';
+    const editableTranslationMarkdown = useMemo(() => (
+        targetMarkdown.trim()
+            ? targetMarkdown
+            : buildMarkdownFromTranslationBlocks(translationBlocks)
+    ), [targetMarkdown, translationBlocks]);
+
+    useEffect(() => {
+        onReaderViewChange?.(activeView);
+    }, [activeView, onReaderViewChange]);
 
     useEffect(() => {
         return () => {
@@ -405,7 +443,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             }
             paperPolishTimersRef.current = [];
             setPaperPolishVisualState('processing');
-            startTransition(() => setManualTab('source'));
+            startTransition(() => setManualView('source'));
             return;
         }
 
@@ -528,7 +566,9 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     }) => {
         if (!fileHash) return null;
 
-        const container = target.tab === 'translation' ? translationPaneRef.current : sourcePaneRef.current;
+        const container = activeView === 'compare'
+            ? (target.tab === 'translation' ? compareTranslationPaneRef.current : compareSourcePaneRef.current)
+            : (target.tab === 'translation' ? translationPaneRef.current : sourcePaneRef.current);
         if (!container) return null;
 
         const probe: AnnotationRecord = {
@@ -582,7 +622,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             range: null,
             preferredBlockId,
         };
-    }, [fileHash, localizeAnnotationForBody, resolveTranslationBlockIdForAnchor, targetLang]);
+    }, [activeView, fileHash, localizeAnnotationForBody, resolveTranslationBlockIdForAnchor, targetLang]);
 
     const focusAnnotationLocation = useCallback((target: {
         tab: EditorTab;
@@ -591,7 +631,9 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     }) => {
         if (!target.anchor) return () => undefined;
 
-        startTransition(() => setManualTab(target.tab));
+        if (activeView !== 'compare') {
+            startTransition(() => setManualView(target.tab));
+        }
 
         let retryTimer: number | null = null;
         const initialTimer = window.setTimeout(() => {
@@ -634,7 +676,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                 window.clearTimeout(retryTimer);
             }
         };
-    }, [findAnnotationLocation, scrollTranslationPaneToBlock, setHighlightedBlock]);
+    }, [activeView, findAnnotationLocation, scrollTranslationPaneToBlock, setHighlightedBlock]);
 
     const loadWorkspaceData = useCallback(async () => {
         if (!fileHash) {
@@ -664,13 +706,19 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         setNoteDraft('');
         setNoteTags('');
         setAssistQuestion('');
+        setAssistAdvancedOpen(false);
+        setAssistSuggestionsOpen(false);
+        setSidePanelOpen(false);
+        setFormatMenuOpen(false);
+        setTranslationEditMode(false);
+        setTranslationEditDraft('');
         setAssistError(null);
         setAssistSessionId(null);
         setPendingAssistExchange(null);
         setNoteTargetExpanded(false);
         setExpandedAnnotationIds({});
         setExpandedConversationIds({});
-    }, [fileHash, activeTab]);
+    }, [fileHash, activeDocumentTab]);
 
     useEffect(() => {
         return subscribeSyncEvents((event) => {
@@ -712,8 +760,14 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             }
         };
 
-        applyDecorations(getMarkdownBodies(translationPaneRef.current), translationAnnotations, 'translation');
-        applyDecorations(getMarkdownBodies(sourcePaneRef.current), sourceAnnotations, 'source');
+        applyDecorations([
+            ...getMarkdownBodies(translationPaneRef.current),
+            ...getMarkdownBodies(compareTranslationPaneRef.current),
+        ], translationAnnotations, 'translation');
+        applyDecorations([
+            ...getMarkdownBodies(sourcePaneRef.current),
+            ...getMarkdownBodies(compareSourcePaneRef.current),
+        ], sourceAnnotations, 'source');
     }, [annotations, fileHash, localizeAnnotationForBody, targetLang]);
 
     useEffect(() => {
@@ -733,8 +787,12 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
 
         const translationContainer = translationPaneRef.current;
         const sourceContainer = sourcePaneRef.current;
+        const compareTranslationContainer = compareTranslationPaneRef.current;
+        const compareSourceContainer = compareSourcePaneRef.current;
         translationContainer?.addEventListener('scroll', scheduleDecorate, { passive: true });
         sourceContainer?.addEventListener('scroll', scheduleDecorate, { passive: true });
+        compareTranslationContainer?.addEventListener('scroll', scheduleDecorate, { passive: true });
+        compareSourceContainer?.addEventListener('scroll', scheduleDecorate, { passive: true });
 
         return () => {
             window.clearTimeout(timer);
@@ -743,6 +801,8 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             }
             translationContainer?.removeEventListener('scroll', scheduleDecorate);
             sourceContainer?.removeEventListener('scroll', scheduleDecorate);
+            compareTranslationContainer?.removeEventListener('scroll', scheduleDecorate);
+            compareSourceContainer?.removeEventListener('scroll', scheduleDecorate);
         };
     }, [decorateVisibleBodies, renderedSourceMarkdown, translationDecorationVersion]);
 
@@ -786,6 +846,8 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         const cleanups = [
             attachHashNavigation(translationPaneRef.current),
             attachHashNavigation(sourcePaneRef.current),
+            attachHashNavigation(compareTranslationPaneRef.current),
+            attachHashNavigation(compareSourcePaneRef.current),
         ];
 
         return () => {
@@ -794,6 +856,17 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             }
         };
     }, [renderedSourceMarkdown, setHighlightedBlock, translationDecorationVersion]);
+
+    const handleSemanticBlockClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+        const target = event.target as HTMLElement | null;
+        if (target?.closest('a,button,textarea,input,select')) return;
+
+        const block = target?.closest<HTMLElement>('[data-semantic-block-id]');
+        const semanticId = block?.dataset.semanticBlockId;
+        if (!semanticId) return;
+
+        setHighlightedBlock(semanticId);
+    }, [setHighlightedBlock]);
 
     useEffect(() => {
         if (!highlightedBlockId) {
@@ -827,11 +900,13 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             return null;
         };
 
-        const found = findTarget(activeTab) || findTarget(activeTab === 'translation' ? 'source' : 'translation');
+        const preferredTab = activeView === 'source' ? 'source' : 'translation';
+        const fallbackTab = preferredTab === 'translation' ? 'source' : 'translation';
+        const found = findTarget(preferredTab) || findTarget(fallbackTab);
         if (!found) return;
 
-        if (found.tab !== activeTab) {
-            startTransition(() => setManualTab(found.tab));
+        if (activeView !== 'compare' && found.tab !== activeDocumentTab) {
+            startTransition(() => setManualView(found.tab));
         }
 
         const timer = window.setTimeout(() => {
@@ -841,11 +916,22 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         }, 120);
 
         return () => window.clearTimeout(timer);
-    }, [activeTab, highlightedBlockId]);
+    }, [activeDocumentTab, activeView, highlightedBlockId]);
 
     useEffect(() => {
+        const resolveActiveSelectionPane = (target?: Node | null): { tab: EditorTab; container: HTMLDivElement | null } | null => {
+            const panes: Array<{ tab: EditorTab; container: HTMLDivElement | null }> = [
+                { tab: 'translation', container: translationPaneRef.current },
+                { tab: 'source', container: sourcePaneRef.current },
+                { tab: 'translation', container: compareTranslationPaneRef.current },
+                { tab: 'source', container: compareSourcePaneRef.current },
+            ];
+
+            return panes.find((pane) => Boolean(target && pane.container?.contains(target))) || null;
+        };
+
         const commitSelectionSnapshot = () => {
-            if (!fileHash || !activeDocumentId) {
+            if (!fileHash) {
                 setSelection(null);
                 return;
             }
@@ -857,14 +943,21 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             }
 
             const range = selectionInstance.getRangeAt(0);
-            const bodies = getMarkdownBodies(activeTab === 'translation' ? translationPaneRef.current : sourcePaneRef.current);
+            const pane = resolveActiveSelectionPane(range.commonAncestorContainer);
+            if (!pane) {
+                setSelection(null);
+                return;
+            }
+
+            const selectionDocumentId = getDocumentId(fileHash, targetLang, pane.tab);
+            const bodies = getMarkdownBodies(pane.container);
             const body = bodies.find((candidate) => candidate.contains(range.commonAncestorContainer));
             if (!body) {
                 setSelection(null);
                 return;
             }
 
-            const nextSelection = resolveSelectionSnapshot(body, activeTab, activeDocumentId);
+            const nextSelection = resolveSelectionSnapshot(body, pane.tab, selectionDocumentId);
             setSelection(nextSelection);
             if (nextSelection) {
                 setSelectionMemory(nextSelection);
@@ -878,8 +971,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
 
         const handlePointerDown = (event: PointerEvent) => {
             const target = event.target as Node | null;
-            const activeContainer = activeTab === 'translation' ? translationPaneRef.current : sourcePaneRef.current;
-            pointerSelectionActiveRef.current = Boolean(target && activeContainer?.contains(target));
+            pointerSelectionActiveRef.current = Boolean(resolveActiveSelectionPane(target));
         };
 
         const handlePointerUp = () => {
@@ -909,7 +1001,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                 pointerSelectionCommitRef.current = null;
             }
         };
-    }, [activeDocumentId, activeTab, fileHash]);
+    }, [fileHash, targetLang, translationDecorationVersion]);
 
     useEffect(() => {
         if (!selection) return;
@@ -1038,7 +1130,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     const canRefreshAssistTarget = Boolean(assistTarget && currentAssistSelection && !isSameSelection(assistTarget, currentAssistSelection));
     const canSaveNote = Boolean(fileHash && activeNoteTarget && noteDraft.trim());
     const canSubmitAssistQuestion = Boolean(fileHash && assistQuestion.trim() && !assistLoading);
-    const activeAssistContextLabel = buildSelectionReferenceLabel(activeAssistContext?.anchor);
+    const activeAssistContextLabel = activeAssistContext ? buildAssistContextLabel(activeAssistContext) : null;
     const pendingExchangeVisible = Boolean(
         pendingAssistExchange &&
         (pendingAssistExchange.sessionId === currentAssistSessionId || currentAssistSessionId === 'draft-session')
@@ -1128,7 +1220,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
             .map((term) => ({ source: term.source, target: term.target, category: term.category }));
 
         const currentTranslationState = useTranslationStore.getState();
-        const currentActiveMarkdown = activeTab === 'translation'
+        const currentActiveMarkdown = activeDocumentTab === 'translation'
             ? (currentTranslationState.targetMarkdown.trim()
                 ? currentTranslationState.targetMarkdown
                 : buildMarkdownFromTranslationBlocks(currentTranslationState.translationBlocks))
@@ -1136,18 +1228,19 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
         const selectionText = contextTarget?.text || currentActiveMarkdown.slice(0, 2400);
         const contextText = contextTarget?.contextText || currentActiveMarkdown;
         const promptLabel = buildAssistPromptLabel(action, assistQuestion);
-        const contextLabel = buildSelectionReferenceLabel(contextTarget?.anchor);
+        const contextLabel = contextTarget ? buildAssistContextLabel(contextTarget) : undefined;
 
         if (!selectionText.trim()) return;
 
         setAssistLoading(true);
         setAssistError(null);
         setAssistSessionId(sessionIdForRequest);
+        setSidePanelOpen(true);
         setPendingAssistExchange({
             sessionId: sessionIdForRequest,
             prompt: promptLabel,
             selectionText: contextTarget?.text || undefined,
-            contextLabel: contextLabel || undefined,
+            contextLabel,
             contextTab: contextTarget?.tab,
             contextAnchor: contextTarget?.anchor,
             createdAt: Date.now(),
@@ -1178,7 +1271,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
 
             const data = await response.json();
             if (!response.ok) {
-                throw new Error(data.error || 'AI 辅助请求失败');
+                throw new Error(data.error || '回答生成失败');
             }
 
             await saveConversation({
@@ -1189,7 +1282,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                 scope: contextTarget ? 'selection' : 'document',
                 prompt: promptLabel,
                 selectionText: contextTarget?.text || undefined,
-                contextLabel: contextLabel || undefined,
+                contextLabel,
                 contextTab: contextTarget?.tab,
                 contextAnchor: contextTarget?.anchor,
                 response: data.text || '',
@@ -1205,7 +1298,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                 setAssistQuestion('');
             }
         } catch (assistRequestError) {
-            setAssistError(assistRequestError instanceof Error ? assistRequestError.message : 'AI 辅助请求失败');
+            setAssistError(assistRequestError instanceof Error ? assistRequestError.message : '回答生成失败');
         } finally {
             setAssistLoading(false);
             setPendingAssistExchange(null);
@@ -1226,17 +1319,39 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
     const paperPolishProcessing = paperPolishStatus === 'processing';
     const handleRunPaperPolish = () => {
         if (!canRunPaperPolish) return;
+        setFormatMenuOpen(false);
         void runPaperPolish('light');
     };
 
     const handleRunPaperPolishAiFallback = () => {
         if (!paperPolishCanUseAiFallback || paperPolishProcessing) return;
+        setFormatMenuOpen(false);
         void runPaperPolishAiFallback();
     };
 
     const handleUndoPaperPolish = () => {
         if (!paperPolishUndoVisible) return;
+        setFormatMenuOpen(false);
         void undoPaperPolish();
+    };
+
+    const openTranslationEditMode = () => {
+        setTranslationEditDraft(editableTranslationMarkdown);
+        setTranslationEditMode(true);
+        startTransition(() => setManualView('translation'));
+    };
+
+    const closeTranslationEditMode = () => {
+        setTranslationEditMode(false);
+    };
+
+    const saveTranslationEditDraft = () => {
+        saveEditedTranslation(translationEditDraft);
+        setTranslationEditMode(false);
+    };
+
+    const downloadTranslationEditDraft = () => {
+        downloadTextFile(`${fileHash || 'document'}-${targetLang}-edited.md`, translationEditDraft);
     };
 
     const sourcePanePolishClass = paperPolishVisualState === 'processing'
@@ -1434,11 +1549,11 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                 {status === 'parsing' ? (
                     <div className="flex flex-col items-center gap-3">
                         <Loader2 className="animate-spin text-slate-900" size={32} />
-                        <p>MinerU 正在解析 PDF...</p>
+                        <p>正在整理 PDF 内容...</p>
                         <span className="text-xs text-slate-400">{Math.round(progress)}%</span>
                     </div>
                 ) : (
-                    <p>上传或导入 PDF 后，这里会变成可批注的 Markdown 工作区。</p>
+                    <p>上传或导入 PDF 后，这里会变成可批注的阅读工作区。</p>
                 )}
             </div>
         );
@@ -1459,6 +1574,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                             type="button"
                             onClick={() => {
                                 setNoteTarget(selection);
+                                setSidePanelOpen(true);
                                 startTransition(() => setSidePanelTab('notes'));
                             }}
                             className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
@@ -1474,112 +1590,144 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                         </button>
                         <button
                             type="button"
-                            onClick={() => void runAssist('summarize', selection)}
-                            className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
-                        >
-                            总结
-                        </button>
-                        <button
-                            type="button"
                             onClick={() => void runAssist('rewrite', selection)}
                             className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
                         >
                             改写
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => void runAssist('extract', selection)}
-                            className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
-                        >
-                            提取
                         </button>
                     </div>
                 </div>
             )}
 
             <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50/80 px-4 py-3">
-                <div className="grid w-[220px] grid-cols-2 rounded-full bg-slate-200/70 p-1">
+                <div className="grid w-[300px] grid-cols-3 rounded-full bg-slate-200/70 p-1">
                     <button
                         type="button"
-                        onClick={() => startTransition(() => setManualTab('translation'))}
-                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeTab === 'translation' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                        onClick={() => startTransition(() => setManualView('translation'))}
+                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeView === 'translation' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
                     >
-                        Translation
+                        译文
                     </button>
                     <button
                         type="button"
-                        onClick={() => startTransition(() => setManualTab('source'))}
-                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeTab === 'source' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                        onClick={() => startTransition(() => setManualView('compare'))}
+                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeView === 'compare' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
                     >
-                        Source
+                        对照
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => startTransition(() => setManualView('source'))}
+                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeView === 'source' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                    >
+                        原文
                     </button>
                 </div>
 
                 <div className="flex flex-wrap items-center justify-end gap-2 text-xs text-slate-500">
-                    <label className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600">
-                        <span className={`inline-flex h-2.5 w-2.5 rounded-full ${paperPolishAutoEnabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                        自动整理
-                        <input
-                            type="checkbox"
-                            checked={paperPolishAutoEnabled}
-                            onChange={(event) => setPaperPolishAutoEnabled(event.target.checked)}
-                            className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
-                        />
-                    </label>
-
-                    <button
-                        type="button"
-                        onClick={handleRunPaperPolish}
-                        disabled={!canRunPaperPolish || paperPolishProcessing}
-                        className={`paper-polish-wand inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${paperPolishProcessing
-                            ? 'border-sky-200 bg-sky-50 text-sky-700'
-                            : 'border-slate-200 bg-white text-slate-700 hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700'
-                            } ${!paperPolishProcessing ? 'is-idle' : ''}`}
-                        title="先用本地结构信息快速修复当前 Markdown"
-                    >
-                        {paperPolishProcessing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
-                        <span>{paperPolishProcessing ? (paperPolishMode === 'deep' ? 'AI 深修中…' : '正在修复格式…') : '清理格式'}</span>
-                        <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${paperPolishProcessing ? 'bg-sky-100 text-sky-700' : 'bg-slate-100 text-slate-500'}`}>
-                            {paperPolishProcessing ? `${Math.round(paperPolishProgress)}%` : paperPolishCanUseAiFallback ? `局部 ${paperPolishResidualCount}` : 'PaperPolish'}
-                        </span>
-                    </button>
-
-                    {paperPolishCanUseAiFallback && !paperPolishProcessing ? (
+                    {hasTranslationContent ? (
                         <button
                             type="button"
-                            onClick={handleRunPaperPolishAiFallback}
-                            className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 transition hover:border-amber-300 hover:bg-amber-100"
-                            title="仅对残留的少量疑难窗口进行 AI 兜底"
+                            onClick={openTranslationEditMode}
+                            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition ${translationEditMode
+                                ? 'border-slate-900 bg-slate-900 text-white'
+                                : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:text-slate-900'
+                                }`}
                         >
-                            <Sparkles size={14} />
-                            AI 深修
-                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-700">
-                                {paperPolishResidualCount}
-                            </span>
+                            编辑译文
                         </button>
                     ) : null}
-
-                    {paperPolishProcessing ? (
+                    <div className="relative">
                         <button
                             type="button"
-                            onClick={cancelPaperPolish}
-                            className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-white px-3 py-1.5 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
+                            onClick={() => setFormatMenuOpen((open) => !open)}
+                            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition ${paperPolishProcessing
+                                ? 'border-sky-200 bg-sky-50 text-sky-700'
+                                : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:text-slate-900'
+                                }`}
+                            aria-expanded={formatMenuOpen}
+                            aria-label="整理阅读稿"
                         >
-                            <X size={12} />
-                            取消
+                            {paperPolishProcessing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
+                            <span>{paperPolishProcessing ? `整理中 ${Math.round(paperPolishProgress)}%` : '整理'}</span>
+                            {paperPolishCanUseAiFallback && !paperPolishProcessing ? (
+                                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-700">
+                                    {paperPolishResidualCount}
+                                </span>
+                            ) : null}
                         </button>
-                    ) : null}
 
-                    {paperPolishUndoVisible ? (
-                        <button
-                            type="button"
-                            onClick={handleUndoPaperPolish}
-                            className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700 transition hover:bg-emerald-100"
-                        >
-                            <RotateCcw size={12} />
-                            撤销
-                        </button>
-                    ) : null}
+                        {formatMenuOpen ? (
+                            <div className="absolute right-0 top-full z-30 mt-2 w-64 overflow-hidden rounded-2xl border border-slate-200 bg-white p-2 text-sm shadow-xl">
+                                <label className="flex items-center justify-between gap-3 rounded-xl px-3 py-2 text-slate-700 transition hover:bg-slate-50">
+                                    <span className="inline-flex items-center gap-2">
+                                        <span className={`inline-flex h-2.5 w-2.5 rounded-full ${paperPolishAutoEnabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                                        自动整理阅读稿
+                                    </span>
+                                    <input
+                                        type="checkbox"
+                                        checked={paperPolishAutoEnabled}
+                                        onChange={(event) => setPaperPolishAutoEnabled(event.target.checked)}
+                                        className="h-3.5 w-3.5 rounded border-slate-300 text-slate-900"
+                                    />
+                                </label>
+
+                                <button
+                                    type="button"
+                                    onClick={handleRunPaperPolish}
+                                    disabled={!canRunPaperPolish || paperPolishProcessing}
+                                    className="paper-polish-wand flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:text-slate-300"
+                                >
+                                    <span className="inline-flex items-center gap-2">
+                                        <Wand2 size={14} />
+                                        清理格式
+                                    </span>
+                                    <span className="text-xs text-slate-400">本地</span>
+                                </button>
+
+                                {paperPolishCanUseAiFallback && !paperPolishProcessing ? (
+                                    <button
+                                        type="button"
+                                        onClick={handleRunPaperPolishAiFallback}
+                                        className="flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-amber-700 transition hover:bg-amber-50"
+                                    >
+                                        <span className="inline-flex items-center gap-2">
+                                            <Sparkles size={14} />
+                                            深度修复
+                                        </span>
+                                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-700">
+                                            {paperPolishResidualCount}
+                                        </span>
+                                    </button>
+                                ) : null}
+
+                                {paperPolishProcessing ? (
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setFormatMenuOpen(false);
+                                            cancelPaperPolish();
+                                        }}
+                                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-rose-600 transition hover:bg-rose-50"
+                                    >
+                                        <X size={14} />
+                                        取消整理
+                                    </button>
+                                ) : null}
+
+                                {paperPolishUndoVisible ? (
+                                    <button
+                                        type="button"
+                                        onClick={handleUndoPaperPolish}
+                                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-emerald-700 transition hover:bg-emerald-50"
+                                    >
+                                        <RotateCcw size={14} />
+                                        撤销整理
+                                    </button>
+                                ) : null}
+                            </div>
+                        ) : null}
+                    </div>
 
                     {paperPolishStatus === 'completed' && paperPolishSummary[0] ? (
                         <span className="hidden rounded-full border border-sky-200 bg-sky-50 px-3 py-1 text-[11px] text-sky-700 xl:inline-flex">
@@ -1617,7 +1765,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                     <div className="flex flex-wrap items-center gap-3">
                         <div className="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
                             {paperPolishProcessing ? <Loader2 size={14} className="animate-spin text-sky-600" /> : <Sparkles size={14} className="text-sky-600" />}
-                            <span>{paperPolishMessage || 'PaperPolish 已就绪'}</span>
+                            <span>{paperPolishMessage || '阅读稿已整理'}</span>
                         </div>
                         {paperPolishProcessing ? (
                             <div className="flex min-w-[220px] flex-1 items-center gap-3">
@@ -1634,22 +1782,63 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                 </div>
             ) : null}
 
-            <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_360px]">
+            <div className={`grid min-h-0 flex-1 grid-cols-1 overflow-hidden ${sidePanelOpen ? 'lg:grid-cols-[minmax(0,1fr)_360px]' : 'lg:grid-cols-1'}`}>
                 <div className="relative min-h-0 overflow-hidden">
                     <div
                         ref={translationPaneRef}
-                        onContextMenu={onTranslationWorkspaceContextMenu}
-                        className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeTab === 'translation' ? 'visible' : 'invisible'}`}
+                        onClick={handleSemanticBlockClick}
+                        className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeView === 'translation' ? 'visible' : 'invisible'}`}
                     >
-                        <StreamingTranslationPane
-                            viewportRef={translationPaneRef}
-                            onFramesChange={handleTranslationFramesChange}
-                        />
+                        {translationEditMode ? (
+                            <div className="not-prose flex h-full min-h-[520px] flex-col rounded-3xl border border-slate-200 bg-white shadow-sm">
+                                <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+                                    <div>
+                                        <div className="text-sm font-semibold text-slate-900">编辑译文</div>
+                                        <div className="mt-0.5 text-xs text-slate-500">保存后，当前阅读稿和导出预览会使用此版本。</div>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={saveTranslationEditDraft}
+                                            className="rounded-2xl bg-slate-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-slate-800"
+                                        >
+                                            保存编辑
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={downloadTranslationEditDraft}
+                                            className="rounded-2xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+                                        >
+                                            下载副本
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={closeTranslationEditMode}
+                                            className="rounded-2xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+                                        >
+                                            退出编辑
+                                        </button>
+                                    </div>
+                                </div>
+                                <textarea
+                                    value={translationEditDraft}
+                                    onChange={(event) => setTranslationEditDraft(event.target.value)}
+                                    className="min-h-0 flex-1 resize-none bg-white px-4 py-4 font-mono text-sm leading-7 text-slate-800 outline-none"
+                                    spellCheck={false}
+                                />
+                            </div>
+                        ) : (
+                            <StreamingTranslationPane
+                                viewportRef={translationPaneRef}
+                                onFramesChange={handleTranslationFramesChange}
+                            />
+                        )}
                     </div>
 
                     <div
                         ref={sourcePaneRef}
-                        className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeTab === 'source' ? 'visible' : 'invisible'}`}
+                        onClick={handleSemanticBlockClick}
+                        className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeView === 'source' ? 'visible' : 'invisible'}`}
                     >
                         <div className={sourcePanePolishClass}>
                             {sourceProjection ? (
@@ -1658,12 +1847,64 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                     highlightedBlockId={highlightedBlockId}
                                 />
                             ) : (
-                                <MarkdownView value={displayedSourceMarkdown || renderedSourceMarkdown || '_No source content available_'} />
+                                <MarkdownView value={displayedSourceMarkdown || renderedSourceMarkdown || '_暂无原文内容_'} />
                             )}
+                        </div>
+                    </div>
+
+                    <div
+                        ref={comparePaneRef}
+                        className={`absolute inset-0 min-h-0 bg-white ${activeView === 'compare' ? 'visible' : 'invisible'}`}
+                    >
+                        <div className="grid h-full min-h-0 grid-cols-1 divide-y divide-slate-200 xl:grid-cols-2 xl:divide-x xl:divide-y-0">
+                            <section className="flex min-h-0 flex-col overflow-hidden">
+                                <div className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/80 px-4 py-2 text-xs font-semibold text-slate-500">
+                                    <span>译文</span>
+                                    {hasTranslationContent ? (
+                                        <button
+                                            type="button"
+                                            onClick={openTranslationEditMode}
+                                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                        >
+                                            编辑译文
+                                        </button>
+                                    ) : null}
+                                </div>
+                                <div
+                                    ref={compareTranslationPaneRef}
+                                    onClick={handleSemanticBlockClick}
+                                    className={`workspace-scroll min-h-0 flex-1 overflow-auto p-5 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'}`}
+                                >
+                                    <StreamingTranslationPane viewportRef={compareTranslationPaneRef} />
+                                </div>
+                            </section>
+
+                            <section className="flex min-h-0 flex-col overflow-hidden">
+                                <div className="shrink-0 border-b border-slate-200 bg-slate-50/80 px-4 py-2 text-xs font-semibold text-slate-500">
+                                    原文
+                                </div>
+                                <div
+                                    ref={compareSourcePaneRef}
+                                    onClick={handleSemanticBlockClick}
+                                    className={`workspace-scroll min-h-0 flex-1 overflow-auto p-5 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'}`}
+                                >
+                                    <div className={sourcePanePolishClass}>
+                                        {sourceProjection ? (
+                                            <StructuredSourceView
+                                                projection={sourceProjection}
+                                                highlightedBlockId={highlightedBlockId}
+                                            />
+                                        ) : (
+                                            <MarkdownView value={displayedSourceMarkdown || renderedSourceMarkdown || '_暂无原文内容_'} />
+                                        )}
+                                    </div>
+                                </div>
+                            </section>
                         </div>
                     </div>
                 </div>
 
+                {sidePanelOpen ? (
                 <aside className="flex min-h-0 flex-col overflow-hidden border-t border-slate-200 bg-slate-50/60 lg:border-l lg:border-t-0">
                     <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-3">
                         <button
@@ -1680,7 +1921,15 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                             className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-sm transition ${sidePanelTab === 'ai' ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 hover:text-slate-900'}`}
                         >
                             <Sparkles size={14} />
-                            AI 辅助
+                            提问
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setSidePanelOpen(false)}
+                            className="ml-auto rounded-full border border-slate-200 bg-white p-2 text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
+                            aria-label="关闭笔记和提问面板"
+                        >
+                            <X size={14} />
                         </button>
                     </div>
                     {sidePanelTab === 'notes' ? (
@@ -1762,7 +2011,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                             type="text"
                                             value={noteTags}
                                             onChange={(event) => setNoteTags(event.target.value)}
-                                            placeholder="标签，用逗号分隔，如 proof, todo"
+                                            placeholder="标签，用逗号分隔，如 证明、待办"
                                             className="mt-3 w-full rounded-2xl border border-slate-200 px-3 py-3 text-sm outline-none transition focus:border-slate-400"
                                         />
                                         <div className="mt-3 flex gap-2">
@@ -1802,7 +2051,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                                         <div className="flex items-start justify-between gap-3">
                                                             <div className="min-w-0 flex-1">
                                                                 <div className="text-xs uppercase tracking-[0.14em] text-slate-400">
-                                                                    {annotation.targetLang ? 'Translation' : 'Source'} · {new Date(annotation.createdAt).toLocaleString()}
+                                                                    {annotation.targetLang ? '译文' : '原文'} · {new Date(annotation.createdAt).toLocaleString()}
                                                                 </div>
                                                                 <div className="mt-2 rounded-2xl bg-slate-50 px-3 py-3">
                                                                     <CollapsibleText
@@ -1822,7 +2071,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                                                     await loadWorkspaceData();
                                                                 })}
                                                                 className="rounded-full border border-slate-200 p-2 text-slate-500 transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-                                                                aria-label="Delete annotation"
+                                                                aria-label="删除笔记"
                                                             >
                                                                 <Trash2 size={14} />
                                                             </button>
@@ -1895,7 +2144,17 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                             ))}
                                         </select>
                                     </label>
-                                    <ModelSelector mode="assist" compact />
+                                    <button
+                                        type="button"
+                                        onClick={() => setAssistAdvancedOpen((open) => !open)}
+                                        className={`rounded-full border px-2.5 py-1 text-xs transition ${assistAdvancedOpen
+                                            ? 'border-slate-900 bg-slate-900 text-white'
+                                            : 'border-slate-200 text-slate-600 hover:border-slate-300 hover:text-slate-900'
+                                            }`}
+                                        aria-expanded={assistAdvancedOpen}
+                                    >
+                                        高级
+                                    </button>
                                     <button
                                         type="button"
                                         onClick={() => {
@@ -1911,6 +2170,12 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                         新建
                                     </button>
                                 </div>
+                                {assistAdvancedOpen ? (
+                                    <div className="mt-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
+                                        <div className="mb-1 text-[11px] font-medium text-slate-500">回答模型</div>
+                                        <ModelSelector mode="assist" compact />
+                                    </div>
+                                ) : null}
                             </div>
 
                             <div ref={conversationListRef} className="workspace-scroll min-h-0 flex-1 overflow-y-auto bg-slate-50/50 px-3 py-3">
@@ -1960,7 +2225,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                                     <div className="max-w-[92%] rounded-[24px] border border-slate-200 bg-slate-50 px-4 py-3 shadow-sm">
                                                         <div className="flex items-center justify-between gap-2">
                                                             <div className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
-                                                                Assistant
+                                                                回答
                                                             </div>
                                                             <button
                                                                 type="button"
@@ -1969,7 +2234,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                                                     await loadWorkspaceData();
                                                                 })}
                                                                 className="rounded-full border border-slate-200 p-2 text-slate-500 transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-                                                                aria-label="Delete conversation"
+                                                                aria-label="删除对话"
                                                             >
                                                                 <Trash2 size={14} />
                                                             </button>
@@ -2030,7 +2295,7 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                                 <div className="max-w-[92%] rounded-[24px] border border-slate-200 bg-slate-50 px-4 py-3 shadow-sm">
                                                     <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-400">
                                                         <Loader2 size={13} className="animate-spin" />
-                                                        Assistant 正在回复
+                                                        回答正在生成
                                                     </div>
                                                     <div className="mt-2 text-sm leading-6 text-slate-500">
                                                         请求已经发出，正在生成回答...
@@ -2056,6 +2321,12 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
 
                             <div className="shrink-0 border-t border-slate-200 bg-white px-3 py-2">
                                 <div className="rounded-[22px] border border-slate-200 bg-white px-2.5 py-2">
+                                    <div className="mb-2 flex items-center justify-between gap-2 rounded-2xl bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                                        <span className="shrink-0 font-medium text-slate-700">当前上下文</span>
+                                        <span className="truncate">
+                                            {activeAssistContextLabel || '来自全文'}
+                                        </span>
+                                    </div>
                                     <div className="workspace-scroll -mx-0.5 flex items-center gap-2 overflow-x-auto px-0.5 pb-1">
                                         {activeAssistContext && activeAssistContextLabel ? (
                                             <button
@@ -2123,13 +2394,6 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                         </button>
                                         <button
                                             type="button"
-                                            onClick={() => void runAssist('summarize')}
-                                            className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                                        >
-                                            总结
-                                        </button>
-                                        <button
-                                            type="button"
                                             onClick={() => void runAssist('rewrite')}
                                             className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                         >
@@ -2137,12 +2401,31 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                                         </button>
                                         <button
                                             type="button"
-                                            onClick={() => void runAssist('extract')}
+                                            onClick={() => setAssistSuggestionsOpen((open) => !open)}
+                                            aria-expanded={assistSuggestionsOpen}
                                             className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                         >
-                                            提取
+                                            建议
                                         </button>
                                     </div>
+                                    {assistSuggestionsOpen ? (
+                                        <div className="mt-2 flex flex-wrap gap-2 px-0.5">
+                                            <button
+                                                type="button"
+                                                onClick={() => void runAssist('summarize')}
+                                                className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                            >
+                                                总结
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => void runAssist('extract')}
+                                                className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                            >
+                                                提取
+                                            </button>
+                                        </div>
+                                    ) : null}
 
                                     <div className="mt-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
                                         <textarea
@@ -2182,6 +2465,34 @@ export function MarkdownEditor({ onTranslationWorkspaceContextMenu, sourceProjec
                         </div>
                     )}
                 </aside>
+                ) : (
+                    <div className="pointer-events-none absolute right-4 top-20 z-20 flex flex-col gap-2">
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setSidePanelOpen(true);
+                                startTransition(() => setSidePanelTab('notes'));
+                            }}
+                            className="pointer-events-auto inline-flex h-10 items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-sm font-medium text-slate-700 shadow-sm backdrop-blur transition hover:border-slate-300 hover:text-slate-900"
+                            aria-label="打开笔记和提问面板"
+                        >
+                            <NotebookPen size={15} />
+                            笔记
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setSidePanelOpen(true);
+                                startTransition(() => setSidePanelTab('ai'));
+                            }}
+                            className="pointer-events-auto inline-flex h-10 items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-sm font-medium text-slate-700 shadow-sm backdrop-blur transition hover:border-slate-300 hover:text-slate-900"
+                            aria-label="打开提问面板"
+                        >
+                            <Sparkles size={15} />
+                            提问
+                        </button>
+                    </div>
+                )}
             </div>
         </div>
     );

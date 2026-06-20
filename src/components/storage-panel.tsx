@@ -25,7 +25,7 @@ interface StoragePanelProps {
 
 interface CacheInfo {
     names: string[];
-    serviceWorkerReady: boolean;
+    offlineReady: boolean;
 }
 
 function formatBytes(input?: number): string {
@@ -44,7 +44,7 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
     const [loading, setLoading] = useState(false);
     const [estimate, setEstimate] = useState<Awaited<ReturnType<typeof estimateStorageUsage>>>(null);
     const [persistent, setPersistent] = useState(false);
-    const [cacheInfo, setCacheInfo] = useState<CacheInfo>({ names: [], serviceWorkerReady: false });
+    const [cacheInfo, setCacheInfo] = useState<CacheInfo>({ names: [], offlineReady: false });
 
     const refreshState = async () => {
         setLoading(true);
@@ -59,15 +59,15 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                 cacheNames = await caches.keys();
             }
 
-            let serviceWorkerReady = false;
+            let offlineReady = false;
             if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
                 const registration = await navigator.serviceWorker.getRegistration();
-                serviceWorkerReady = Boolean(registration?.active);
+                offlineReady = Boolean(registration?.active);
             }
 
             setEstimate(nextEstimate);
             setPersistent(nextPersistent);
-            setCacheInfo({ names: cacheNames, serviceWorkerReady });
+            setCacheInfo({ names: cacheNames, offlineReady });
         } finally {
             setLoading(false);
         }
@@ -106,8 +106,8 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
     return (
         <ModalShell
             open={open}
-            title="离线与存储"
-            description="查看浏览器存储配额、持久化状态与离线缓存层。"
+            title="本地数据"
+            description="管理临时文件、阅读记录和个人设置。"
             widthClassName="max-w-3xl"
             onClose={onClose}
         >
@@ -117,12 +117,12 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                         <div className="inline-flex rounded-2xl bg-slate-900 p-3 text-white">
                             <Database size={18} />
                         </div>
-                        <div className="mt-4 text-sm text-slate-500">已使用存储</div>
+                        <div className="mt-4 text-sm text-slate-500">已占用空间</div>
                         <div className="mt-1 text-2xl font-semibold text-slate-900">
                             {formatBytes(estimate?.usage)}
                         </div>
                         <div className="mt-2 text-xs text-slate-500">
-                            配额 {formatBytes(estimate?.quota)}
+                            可用空间约 {formatBytes(estimate?.quota)}
                         </div>
                     </article>
 
@@ -130,16 +130,16 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                         <div className="inline-flex rounded-2xl bg-emerald-600 p-3 text-white">
                             <ShieldCheck size={18} />
                         </div>
-                        <div className="mt-4 text-sm text-slate-500">持久化状态</div>
+                        <div className="mt-4 text-sm text-slate-500">重要数据保护</div>
                         <div className="mt-1 text-2xl font-semibold text-slate-900">
-                            {persistent ? '已授予' : '未授予'}
+                            {persistent ? '已开启' : '未开启'}
                         </div>
                         <button
                             type="button"
                             onClick={() => void requestPersistence()}
                             className="mt-4 rounded-2xl border border-slate-200 px-4 py-2 text-sm text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
                         >
-                            请求持久化
+                            开启保护
                         </button>
                     </article>
 
@@ -147,12 +147,12 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                         <div className="inline-flex rounded-2xl bg-amber-500 p-3 text-white">
                             <HardDriveDownload size={18} />
                         </div>
-                        <div className="mt-4 text-sm text-slate-500">离线缓存</div>
+                        <div className="mt-4 text-sm text-slate-500">离线文件</div>
                         <div className="mt-1 text-2xl font-semibold text-slate-900">
                             {cacheInfo.names.length}
                         </div>
                         <div className="mt-2 text-xs text-slate-500">
-                            Service Worker {cacheInfo.serviceWorkerReady ? '已激活' : '未就绪'}
+                            {cacheInfo.offlineReady ? '可离线打开' : '需要联网准备'}
                         </div>
                     </article>
                 </div>
@@ -160,9 +160,9 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                 <section className="rounded-3xl border border-slate-200 bg-slate-50 p-5">
                     <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                         <div>
-                            <div className="text-sm font-medium text-slate-900">缓存与本地数据清理</div>
+                            <div className="text-sm font-medium text-slate-900">清理本地数据</div>
                             <p className="mt-1 text-sm leading-6 text-slate-500">
-                                分级清理派生缓存、工作镜像和笔记知识层，避免误删全部内容。
+                                按影响范围清理，不会把所有内容一次性删掉。
                             </p>
                         </div>
                         <button
@@ -184,8 +184,8 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                             <div className="inline-flex rounded-xl bg-slate-900 p-2 text-white">
                                 <Trash2 size={15} />
                             </div>
-                            <div className="mt-3 text-sm font-medium text-slate-900">清理派生缓存</div>
-                            <p className="mt-1 text-sm text-slate-500">只清掉 Cache Storage 与 Service Worker 运行时缓存。</p>
+                            <div className="mt-3 text-sm font-medium text-slate-900">清理临时文件</div>
+                            <p className="mt-1 text-sm text-slate-500">清理可重新生成的离线文件和加载记录。</p>
                         </button>
 
                         <button
@@ -196,8 +196,8 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                             <div className="inline-flex rounded-xl bg-sky-600 p-2 text-white">
                                 <Trash2 size={15} />
                             </div>
-                            <div className="mt-3 text-sm font-medium text-slate-900">清理工作镜像</div>
-                            <p className="mt-1 text-sm text-slate-500">清理本地历史镜像、会话快照与 AI 对话记录。</p>
+                            <div className="mt-3 text-sm font-medium text-slate-900">清理阅读记录</div>
+                            <p className="mt-1 text-sm text-slate-500">清理最近文档、阅读进度和问答记录。</p>
                         </button>
 
                         <button
@@ -208,24 +208,24 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                             <div className="inline-flex rounded-xl bg-amber-500 p-2 text-white">
                                 <Trash2 size={15} />
                             </div>
-                            <div className="mt-3 text-sm font-medium text-slate-900">清理知识层与模型配置</div>
-                            <p className="mt-1 text-sm text-slate-500">会删除本地批注、高亮、用户术语和自定义 provider 配置。</p>
+                            <div className="mt-3 text-sm font-medium text-slate-900">清理个人设置</div>
+                            <p className="mt-1 text-sm text-slate-500">删除本机批注、高亮、术语和自定义翻译服务。</p>
                         </button>
                     </div>
                 </section>
 
                 <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-                    <div className="text-sm font-medium text-slate-900">缓存容器</div>
+                    <div className="text-sm font-medium text-slate-900">离线文件详情</div>
                     <div className="mt-3 flex flex-wrap gap-2">
-                        {cacheInfo.names.length > 0 ? cacheInfo.names.map((cacheName) => (
+                        {cacheInfo.names.length > 0 ? cacheInfo.names.map((cacheName, index) => (
                             <span
                                 key={cacheName}
                                 className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600"
                             >
-                                {cacheName}
+                                离线文件包 {index + 1}
                             </span>
                         )) : (
-                            <span className="text-sm text-slate-500">当前没有可见的 Cache Storage 记录。</span>
+                            <span className="text-sm text-slate-500">当前没有可清理的离线文件。</span>
                         )}
                     </div>
                 </section>

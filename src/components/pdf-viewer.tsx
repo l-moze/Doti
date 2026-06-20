@@ -1,7 +1,7 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { memo, useEffect, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { useTranslationStore } from '@/lib/store';
 import type { DocumentSemanticAnchor, DocumentSemanticProjection } from '@/lib/document-semantic';
 import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Loader2, Layers } from 'lucide-react';
@@ -55,24 +55,87 @@ function toOpaqueBorderColor(color: string): string {
 
 const DEFAULT_PDF_PAGE_SIZE: readonly [number, number] = [612, 792];
 
+function getParentSemanticId(semanticId: string): string | null {
+    return semanticId.match(/^(sec-\d+-[a-z]+-\d+)-child-\d+$/)?.[1] || null;
+}
+
+function buildActiveSemanticIds(highlightedBlockId: string | null): string[] {
+    if (!highlightedBlockId) return [];
+    const parentSemanticId = getParentSemanticId(highlightedBlockId);
+    return parentSemanticId ? [highlightedBlockId, parentSemanticId] : [highlightedBlockId];
+}
+
+function findHighlightedAnchor(
+    projection: DocumentSemanticProjection | null,
+    activeSemanticIds: readonly string[]
+): DocumentSemanticAnchor | null {
+    if (!projection || activeSemanticIds.length === 0) return null;
+
+    for (const semanticId of activeSemanticIds) {
+        const anchor = projection.anchors.find((candidate) => candidate.semanticId === semanticId);
+        if (anchor) return anchor;
+    }
+
+    for (const semanticId of activeSemanticIds) {
+        for (const block of projection.blocks) {
+            if (block.semanticId === semanticId && block.bbox) {
+                return {
+                    id: `${block.id}-active-anchor`,
+                    semanticId: block.semanticId,
+                    blockId: block.id,
+                    pageIndex: block.pageIndex,
+                    bbox: block.bbox,
+                    kind: block.kind,
+                    rawType: block.kind,
+                    sourceRefs: block.sourceRefs,
+                };
+            }
+
+            const child = block.children.find((candidate) => candidate.semanticId === semanticId && candidate.bbox);
+            if (child?.semanticId && child.bbox) {
+                return {
+                    id: `${child.id}-active-anchor`,
+                    semanticId: child.semanticId,
+                    blockId: block.id,
+                    pageIndex: child.pageIndex,
+                    bbox: child.bbox,
+                    kind: block.kind,
+                    rawType: block.kind,
+                    sourceRefs: child.sourceRefs,
+                };
+            }
+        }
+    }
+
+    return null;
+}
+
 // 布局叠加层组件
 const LayoutOverlay = memo(function LayoutOverlay({
     anchors,
     pdfWidth,
     pdfHeight,
+    activeSemanticIds,
+    highlightedAnchorRef,
 }: {
     anchors: DocumentSemanticAnchor[];
     pdfWidth: number;
     pdfHeight: number;
+    activeSemanticIds?: readonly string[];
+    highlightedAnchorRef?: MutableRefObject<HTMLDivElement | null>;
 }) {
     const { highlightedBlockId, setHighlightedBlock } = useTranslationStore(useShallow((state) => ({
         highlightedBlockId: state.highlightedBlockId,
         setHighlightedBlock: state.setHighlightedBlock,
     })));
+    const activeSemanticIdSet = useMemo(
+        () => new Set(activeSemanticIds?.length ? activeSemanticIds : highlightedBlockId ? [highlightedBlockId] : []),
+        [activeSemanticIds, highlightedBlockId]
+    );
 
     return (
         <div
-            className="absolute inset-0 z-10"
+            className="pointer-events-none absolute inset-0 z-10"
             // 使用 % 定位，容器尺寸跟随父级（PDF Page 容器）
             style={{ width: '100%', height: '100%' }}
         >
@@ -83,7 +146,7 @@ const LayoutOverlay = memo(function LayoutOverlay({
                 const semanticId = anchor.semanticId;
 
                 // 检查是否被高亮
-                const isHighlighted = semanticId === highlightedBlockId;
+                const isHighlighted = activeSemanticIdSet.has(semanticId);
 
                 // 计算百分比位置
                 const left = (x0 / pdfWidth) * 100;
@@ -94,14 +157,16 @@ const LayoutOverlay = memo(function LayoutOverlay({
                 return (
                     <div
                         key={anchor.id}
-                        className={`absolute cursor-pointer transition-all duration-200 group ${isHighlighted ? 'z-50' : 'hover:z-20'}`}
+                        ref={isHighlighted ? highlightedAnchorRef : undefined}
+                        data-pdf-semantic-anchor-id={semanticId}
+                        className={`group pointer-events-auto absolute cursor-pointer rounded-[2px] transition-all duration-200 ${isHighlighted ? 'z-50' : 'hover:z-20'}`}
                         style={{
                             left: `${left}%`,
                             top: `${top}%`,
                             width: `${width}%`,
                             height: `${height}%`,
                             border: isHighlighted ? `3px solid ${borderColor}` : `1px solid transparent`, // 默认透明边框，避免视觉杂乱
-                            boxShadow: isHighlighted ? `0 0 8px ${color}` : 'none',
+                            boxShadow: isHighlighted ? `0 0 0 2px rgba(255, 255, 255, 0.9), 0 0 16px ${borderColor}` : 'none',
                         }}
                         onClick={(e) => {
                             e.stopPropagation();
@@ -142,11 +207,16 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
         fileUrl: state.fileUrl,
         highlightedBlockId: state.highlightedBlockId,
     })));
+    const highlightedAnchorRef = useRef<HTMLDivElement | null>(null);
     const [numPages, setNumPages] = useState<number>(0);
     const [pageNumber, setPageNumber] = useState<number>(1);
     const [scale, setScale] = useState<number>(1.0);
     const [showLayout, setShowLayout] = useState(false);
     const anchors = projection?.anchors;
+    const activeSemanticIds = useMemo(
+        () => buildActiveSemanticIds(highlightedBlockId),
+        [highlightedBlockId]
+    );
 
     const semanticToPage = useMemo(() => {
         const nextSemanticToPage: Record<string, number> = {};
@@ -162,21 +232,48 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
             if (nextSemanticToPage[block.semanticId] === undefined) {
                 nextSemanticToPage[block.semanticId] = block.pageIndex;
             }
+            for (const child of block.children) {
+                if (child.semanticId && nextSemanticToPage[child.semanticId] === undefined) {
+                    nextSemanticToPage[child.semanticId] = child.pageIndex;
+                }
+            }
         }
 
         return nextSemanticToPage;
     }, [projection]);
+
+    const highlightedAnchor = useMemo(
+        () => findHighlightedAnchor(projection, activeSemanticIds),
+        [projection, activeSemanticIds]
+    );
 
     const currentAnchors = useMemo(() => {
         if (!anchors) return [];
         return anchors.filter((anchor) => anchor.pageIndex === pageNumber - 1);
     }, [anchors, pageNumber]);
 
+    const visibleAnchors = useMemo(() => {
+        const currentHighlightedAnchor = highlightedAnchor?.pageIndex === pageNumber - 1
+            ? highlightedAnchor
+            : null;
+
+        if (showLayout) {
+            if (!currentHighlightedAnchor || currentAnchors.some((anchor) => anchor.id === currentHighlightedAnchor.id)) {
+                return currentAnchors;
+            }
+            return [...currentAnchors, currentHighlightedAnchor];
+        }
+
+        return currentHighlightedAnchor ? [currentHighlightedAnchor] : [];
+    }, [currentAnchors, highlightedAnchor, pageNumber, showLayout]);
+
     // 监听 highlightedBlockId 变化，自动跳转页面
     useEffect(() => {
-        if (!highlightedBlockId) return;
+        if (!highlightedBlockId || activeSemanticIds.length === 0) return;
 
-        const targetPage = semanticToPage[highlightedBlockId];
+        const targetPage = activeSemanticIds
+            .map((semanticId) => semanticToPage[semanticId])
+            .find((candidate) => candidate !== undefined);
         if (targetPage === undefined) return;
 
         const nextPageNumber = targetPage + 1;
@@ -186,7 +283,21 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
         });
 
         return () => window.cancelAnimationFrame(frame);
-    }, [highlightedBlockId, semanticToPage]);
+    }, [activeSemanticIds, highlightedBlockId, semanticToPage]);
+
+    useEffect(() => {
+        if (!highlightedBlockId || !highlightedAnchor || highlightedAnchor.pageIndex !== pageNumber - 1) return;
+
+        const frame = window.requestAnimationFrame(() => {
+            highlightedAnchorRef.current?.scrollIntoView({
+                block: 'center',
+                inline: 'center',
+                behavior: 'smooth',
+            });
+        });
+
+        return () => window.cancelAnimationFrame(frame);
+    }, [highlightedAnchor, highlightedBlockId, pageNumber, scale, visibleAnchors]);
 
     // 重置状态当文件改变时
     useEffect(() => {
@@ -206,7 +317,7 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
     if (!fileUrl) {
         return (
             <div className="flex h-full items-center justify-center bg-muted/20 text-muted-foreground p-8 border-2 border-dashed rounded-lg">
-                <p>No PDF loaded</p>
+                <p>未导入 PDF</p>
             </div>
         );
     }
@@ -229,7 +340,7 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                         <ChevronLeft size={20} />
                     </button>
                     <span className="text-sm">
-                        Page {pageNumber} of {numPages}
+                        第 {pageNumber} / {numPages || '-'} 页
                     </span>
                     <button
                         onClick={() => setPageNumber(Math.min(numPages, pageNumber + 1))}
@@ -242,15 +353,18 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
 
                 {canShowLayout && (
                     <div className="flex items-center gap-2">
-                        <label className="text-xs font-medium cursor-pointer flex items-center gap-2 select-none">
+                        <label
+                            className={`flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border text-slate-600 transition-colors hover:bg-slate-100 ${showLayout ? 'border-primary bg-primary/10 text-primary' : 'border-transparent'}`}
+                            title="显示结构定位层"
+                        >
                             <input
                                 type="checkbox"
                                 checked={showLayout}
                                 onChange={(e) => setShowLayout(e.target.checked)}
-                                className="accent-primary h-4 w-4"
+                                className="sr-only"
                             />
                             <Layers size={14} />
-                            Show Layout
+                            <span className="sr-only">显示结构定位层</span>
                         </label>
                     </div>
                 )}
@@ -276,12 +390,12 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                         className="shadow-lg"
                         loading={
                             <div className="flex items-center gap-2 text-muted-foreground">
-                                <Loader2 className="animate-spin" /> Loading PDF...
+                                <Loader2 className="animate-spin" /> 正在加载 PDF...
                             </div>
                         }
                         error={
                             <div className="flex flex-col items-center justify-center p-8 text-center h-full">
-                                <p className="text-red-500 font-medium mb-2">Failed to load PDF</p>
+                                <p className="text-red-500 font-medium mb-2">PDF 加载失败</p>
                             </div>
                         }
                     >
@@ -292,11 +406,13 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                             renderAnnotationLayer={false}
                             className="relative" // 确保 Page 是 relative 的，由于 react-pdf 的 Page 内部结构复杂，我们可能需要在外部包裹
                         >
-                            {showLayout && currentAnchors.length > 0 && (
+                            {visibleAnchors.length > 0 && (
                                 <LayoutOverlay
-                                    anchors={currentAnchors}
+                                    anchors={visibleAnchors}
                                     pdfWidth={pdfPageSize[0]}
                                     pdfHeight={pdfPageSize[1]}
+                                    activeSemanticIds={activeSemanticIds}
+                                    highlightedAnchorRef={highlightedAnchorRef}
                                 />
                             )}
                         </Page>
