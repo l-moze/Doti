@@ -12,6 +12,7 @@ node_modules/
 .next/
 .next-dev/
 .next-build*/
+.next-runtime-check/
 .next-prod/
 out/
 build/
@@ -56,6 +57,9 @@ bug.md
 redme.md
 research-agent-markdown.md
 CLAUDE.md
+
+# standalone UI prototype (separate Vite project, not part of main app)
+原型设计/
 
 # local debug artifacts
 /table-debug-print.png

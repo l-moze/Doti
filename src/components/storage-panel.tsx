@@ -209,7 +209,7 @@ export function StoragePanel({ open, onClose }: StoragePanelProps) {
                                 <Trash2 size={15} />
                             </div>
                             <div className="mt-3 text-sm font-medium text-slate-900">清理个人设置</div>
-                            <p className="mt-1 text-sm text-slate-500">删除本机批注、高亮、术语和自定义翻译服务。</p>
+                            <p className="mt-1 text-sm text-slate-500">删除本机阅读笔记、高亮、术语和自定义翻译服务。</p>
                         </button>
                     </div>
                 </section>

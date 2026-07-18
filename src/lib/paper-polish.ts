@@ -1233,7 +1233,7 @@ function collectStructuredResidualIssues(
         residualIssues.push({
             id: 'layout-fallback',
             kind: 'unsupported-structure',
-            message: '当前仅拿到 layout.json，已保留最小结构信息，复杂块仍建议局部 AI 兜底。',
+            message: '当前只恢复了基础结构，复杂段落建议人工复核。',
             headingText: getNearestHeadingText(blocks, Math.min(2, blocks.length - 1)),
             blockIds: blocks.slice(0, Math.min(3, blocks.length)).map((block) => block.id),
         });
@@ -1289,7 +1289,7 @@ function buildStructuredSummary(
     }
 
     if (residualIssues.length > 0) {
-        summary.push(`发现 ${residualIssues.length} 处疑难结构，已保留 AI 深修兜底能力。`);
+        summary.push(`发现 ${residualIssues.length} 处难处理的结构，建议人工复核。`);
     }
 
     return Array.from(new Set(summary.filter(Boolean)));

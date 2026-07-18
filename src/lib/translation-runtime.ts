@@ -13,6 +13,15 @@ export interface TranslationMarkdownBlock extends TranslationChunkPlan {
     state: TranslationBlockState;
 }
 
+export function normalizeTranslationBlockText(text: string): string {
+    return text
+        .replace(/\r\n?/g, '\n')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n[ \t]+/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
 export function createTranslationBlocksFromPlan(
     plan: TranslationChunkPlan[],
     initialState: TranslationBlockState = 'planned'
@@ -26,21 +35,26 @@ export function createTranslationBlocksFromPlan(
 
 export function buildMarkdownFromTranslationBlocks(blocks: TranslationMarkdownBlock[]): string {
     return blocks
-        .filter((block) => block.text.trim().length > 0)
+        .map((block) => ({
+            ...block,
+            text: normalizeTranslationBlockText(block.text),
+        }))
+        .filter((block) => block.text.length > 0)
         .sort((a, b) => a.index - b.index)
         .map((block) => block.text)
         .join('\n\n');
 }
 
 export function createSingleTranslationBlock(text: string, title = 'Document'): TranslationMarkdownBlock[] {
-    if (!text.trim()) return [];
+    const normalizedText = normalizeTranslationBlockText(text);
+    if (!normalizedText) return [];
 
     return [{
         id: 'full-document',
         index: 0,
         title,
         kind: 'text',
-        text,
+        text: normalizedText,
         state: 'completed',
     }];
 }

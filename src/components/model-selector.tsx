@@ -50,7 +50,7 @@ export function ModelSelector({ mode = 'translation', className, compact = false
     const [customProfiles, setCustomProfiles] = useState<ProviderProfileRecord[]>([]);
     const [loading, setLoading] = useState(true);
 
-    // Fetch models on mount
+    // Fetch available services on mount.
     useEffect(() => {
         const load = async () => {
             try {
@@ -80,13 +80,13 @@ export function ModelSelector({ mode = 'translation', className, compact = false
         return (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Loader2 size={12} className="animate-spin" />
-                <span>正在加载模型...</span>
+                <span>正在加载可用服务...</span>
             </div>
         );
     }
 
     if (!data) {
-        return <div className="text-xs text-red-500">模型列表加载失败</div>;
+        return <div className="text-xs text-red-500">可用服务加载失败</div>;
     }
 
     const activeProviderId = mode === 'assist' ? assistProviderId : providerId;
@@ -96,7 +96,7 @@ export function ModelSelector({ mode = 'translation', className, compact = false
     const providers = Object.values(data.providers)
         .sort((a, b) => optionCollator.compare(a.name, b.name));
 
-    // Build combined options: "Provider - Model"
+    // Build combined service options.
     const allOptions: Array<{ value: string; label: string; providerId: string; model: string }> = [];
 
     providers.forEach(provider => {

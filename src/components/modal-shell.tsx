@@ -47,7 +47,7 @@ export function ModalShell({
                         type="button"
                         onClick={onClose}
                         className="rounded-full border border-slate-200 p-2 text-slate-500 transition hover:border-slate-300 hover:bg-white hover:text-slate-900"
-                        aria-label="Close"
+                        aria-label="关闭"
                     >
                         <X size={16} />
                     </button>

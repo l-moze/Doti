@@ -27,7 +27,7 @@ function MarkdownViewComponent({ value, className }: MarkdownViewProps) {
                 {normalizedValue}
                 {loadFailed ? (
                     <div className="mt-3 text-xs text-amber-600">
-                        Markdown 渲染模块热更新失败，已退回纯文本显示。刷新页面后会恢复富文本渲染。
+                        阅读内容暂时使用简化显示。刷新页面后会恢复完整排版。
                     </div>
                 ) : null}
             </div>

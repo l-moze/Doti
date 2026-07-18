@@ -26,6 +26,7 @@ type TranslationStreamProps = {
     blocks: TranslationMarkdownBlock[];
     viewportRef: RefObject<HTMLDivElement | null>;
     onFramesChange?: (frames: TranslationStreamFrame[]) => void;
+    highlightedBlockId?: string | null;
 };
 
 type TranslationStreamBlockProps = {
@@ -33,6 +34,7 @@ type TranslationStreamBlockProps = {
     top: number;
     onHeightChange: (blockId: string, height: number) => void;
     debug: boolean;
+    highlightedBlockId?: string | null;
 };
 
 type DraftVisual = {
@@ -69,7 +71,7 @@ function renderDraftVisual(
 
     return (
         <div
-            className={`not-prose rounded-3xl border px-5 py-4 shadow-sm duration-300 ease-out ${isOverlay ? 'h-full' : ''} ${isStreaming
+            className={`not-prose rounded-lg border px-5 py-4 duration-300 ease-out ${isOverlay ? 'h-full' : ''} ${isStreaming
                 ? 'border-sky-100 bg-sky-50/80 transition-[background-color,border-color]'
                 : 'border-slate-200 bg-slate-50/90 transition-[min-height,background-color,border-color,box-shadow,opacity,transform,filter]'
                 }`}
@@ -120,7 +122,7 @@ function renderDraftVisual(
                 </div>
             ) : (
                 <div className={`mt-3 text-sm leading-6 ${isStreaming ? 'text-slate-700' : 'text-slate-500'}`}>
-                    {isStreaming ? '正在生成这一段内容...' : '正在拆分队列或等待模型返回这一段内容...'}
+                    {isStreaming ? '正在生成这一段内容...' : '正在准备这一段译文...'}
                 </div>
             )}
         </div>
@@ -132,6 +134,7 @@ function TranslationStreamBlock({
     top,
     onHeightChange,
     debug,
+    highlightedBlockId,
 }: TranslationStreamBlockProps) {
     const blockRef = useRef<HTMLElement | null>(null);
     const [isFinalized, setIsFinalized] = useState(() => block.stage === 'final-rich');
@@ -234,13 +237,19 @@ function TranslationStreamBlock({
         right: 0,
         viewTransitionName: transitionName,
     } satisfies CSSProperties), [top, transitionName]);
+    const isHighlighted = block.id === highlightedBlockId || Boolean(highlightedBlockId?.startsWith(`${block.id}-child-`));
+    const blockClassName = `translation-block relative isolate overflow-hidden rounded-lg transition-[transform,opacity,background-color,box-shadow] duration-300 ease-out ${
+        isHighlighted ? 'bg-sky-50/70 shadow-[0_0_0_3px_rgba(56,189,248,0.16)]' : ''
+    }`.trim();
 
     if (isFinalized || block.stage === 'final-rich') {
         return (
             <section
                 ref={blockRef}
                 data-translation-block-id={block.id}
-                className="translation-block relative isolate overflow-hidden transition-[transform,opacity] duration-300 ease-out"
+                data-semantic-block-id={block.id}
+                data-semantic-active={isHighlighted ? 'true' : undefined}
+                className={blockClassName}
                 style={sectionStyle}
             >
                 <div className="transition-[opacity,transform,filter] duration-300 ease-out">
@@ -266,7 +275,9 @@ function TranslationStreamBlock({
         <section
             ref={blockRef}
             data-translation-block-id={block.id}
-            className="translation-block relative isolate overflow-hidden transition-[transform,opacity] duration-300 ease-out"
+            data-semantic-block-id={block.id}
+            data-semantic-active={isHighlighted ? 'true' : undefined}
+            className={blockClassName}
             style={sectionStyle}
         >
             {renderDraftVisual(activeDraft, debug)}
@@ -276,7 +287,7 @@ function TranslationStreamBlock({
 
 const MemoizedTranslationStreamBlock = memo(TranslationStreamBlock);
 
-function TranslationStreamComponent({ blocks, viewportRef, onFramesChange }: TranslationStreamProps) {
+function TranslationStreamComponent({ blocks, viewportRef, onFramesChange, highlightedBlockId }: TranslationStreamProps) {
     const layoutProfile = useDocumentLayoutProfile(viewportRef);
 
     // 合并 top 和 height 为单一 state，这样每次 scroll 只触发一次渲染而非两次。
@@ -433,6 +444,7 @@ function TranslationStreamComponent({ blocks, viewportRef, onFramesChange }: Tra
                     top={frame.top}
                     onHeightChange={handleHeightChange}
                     debug={layoutProfile.debug}
+                    highlightedBlockId={highlightedBlockId}
                 />
             ))}
         </div>

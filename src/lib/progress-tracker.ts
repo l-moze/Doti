@@ -16,6 +16,7 @@ import {
     type TranslationCacheKeyInput,
 } from "@/lib/translation-cache-key";
 import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { normalizeTranslationBlockText } from "@/lib/translation-runtime";
 
 const ACTIVE_TRANSLATION_JOB_STALE_MS = 15 * 60 * 1000;
 
@@ -372,11 +373,12 @@ export class ProgressTracker {
             throw new Error("[ProgressTracker] Partial cache path is unavailable");
         }
 
+        const normalizedContent = normalizeTranslationBlockText(content);
         const separator = isFirst ? "" : "\n\n";
-        const contentToAppend = separator + content;
+        const contentToAppend = separator + normalizedContent;
 
         await appendFile(partialCachePath, contentToAppend);
-        await this.updateProgress(progress, chunkIndex, content.length);
+        await this.updateProgress(progress, chunkIndex, normalizedContent.length);
     }
 
     /**

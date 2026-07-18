@@ -81,6 +81,10 @@ export function grantFileHashAccess(
     response: NextResponse,
     fileHash: string
 ): void {
+    if (!isPublicDeploymentMode()) {
+        return;
+    }
+
     const hashes = getAccessibleFileHashes(request);
     hashes.add(fileHash);
 

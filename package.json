@@ -14,7 +14,7 @@
     "desktop:build": "node scripts/desktop-build.cjs --win",
     "lint": "eslint src public next.config.ts eslint.config.mjs tailwind.config.ts --cache --cache-location .cache/eslint",
     "typecheck": "tsc --noEmit",
-    "test:desktop": "node --test tests/desktop-auth.test.mjs tests/runtime-paths.test.mjs tests/electron-runtime.test.mjs tests/product-shell.test.mjs"
+    "test:desktop": "node --test tests/desktop-auth.test.mjs tests/runtime-paths.test.mjs tests/electron-runtime.test.mjs tests/media-session.test.mjs tests/mineru-client.test.mjs tests/translation-runtime.test.mjs tests/product-shell.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",

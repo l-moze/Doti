@@ -29,6 +29,29 @@ const EMPTY_DRAFT = {
     capabilities: ['translate', 'assist'] as ProviderCapability[],
 };
 
+function serviceTypeLabel(providerType: ProviderProfileType) {
+    return providerType === 'deeplx' ? 'DeepLX 翻译服务' : 'OpenAI 兼容服务';
+}
+
+function getServiceTestErrorMessage(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    const normalized = message.toLowerCase();
+    if (
+        normalized.includes('invalid provider profile') ||
+        normalized.includes('provider test failed') ||
+        normalized.includes('openai-compatible') ||
+        normalized.includes('api key') ||
+        normalized.includes('unauthorized') ||
+        normalized.includes('forbidden')
+    ) {
+        return '服务测试失败，请检查服务地址、访问密钥和服务标识。';
+    }
+    if (normalized.includes('network') || normalized.includes('fetch failed') || normalized.includes('timeout')) {
+        return '网络连接不稳定，请稍后重试。';
+    }
+    return message.trim() || '测试失败，请检查服务设置。';
+}
+
 export function ProviderProfileManager({ open, onClose }: ProviderProfileManagerProps) {
     const [profiles, setProfiles] = useState<ProviderProfileRecord[]>([]);
     const [loading, setLoading] = useState(false);
@@ -40,7 +63,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
     const capabilityDescription = useMemo(() => {
         return draft.providerType === 'deeplx'
-            ? 'DeepLX 服务只用于翻译，不会出现在问答模型列表。使用术语表时，请补充术语表 ID 和原文语言。'
+            ? 'DeepLX 服务只用于翻译，不会出现在问答服务列表。使用固定译法时，请补充固定译法 ID 和原文语言。'
             : '兼容 OpenAI 接口的服务可用于翻译、问答，或两者同时使用。';
     }, [draft.providerType]);
 
@@ -91,17 +114,17 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
     const saveDraft = async () => {
         if (!draft.name.trim() || !draft.baseUrl.trim() || !draft.model.trim()) {
-            setError('名称、服务地址和默认模型不能为空。');
+            setError('名称、服务地址和服务标识不能为空。');
             return;
         }
 
         if (draft.providerType === 'deeplx' && draft.glossaryId.trim() && !draft.sourceLang.trim()) {
-            setError('启用 DeepL 术语表时需要填写原文语言，例如 EN。');
+            setError('启用 DeepL 固定译法时需要填写原文语言，例如 EN。');
             return;
         }
 
         if (draft.providerType !== 'deeplx' && draft.capabilities.length === 0) {
-            setError('至少选择一个能力范围。');
+            setError('至少选择一个使用场景。');
             return;
         }
 
@@ -163,7 +186,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
 
             setTestMessage(data.preview ? `${data.message} · ${data.preview}` : data.message);
         } catch (testError) {
-            setError(testError instanceof Error ? testError.message : '测试失败');
+            setError(getServiceTestErrorMessage(testError));
         } finally {
             setTesting(false);
         }
@@ -211,23 +234,23 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                     </button>
                                 </div>
                                 <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                                    <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">{profile.providerType}</span>
+                                    <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">{serviceTypeLabel(profile.providerType)}</span>
                                     <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">{profile.model}</span>
                                     {profile.providerType === 'deeplx' && profile.glossaryId ? (
                                         <span className="rounded-full bg-blue-50 px-3 py-1 text-blue-700">
-                                            glossary · {profile.sourceLang || 'AUTO'}
+                                            固定译法 · {profile.sourceLang || '自动识别原文语言'}
                                         </span>
                                     ) : null}
                                     {profile.capabilities.map((capability) => (
                                         <span key={capability} className="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700">
-                                            {capability === 'translate' ? '翻译' : 'AI 辅助'}
+                                            {capability === 'translate' ? '翻译' : '问答'}
                                         </span>
                                     ))}
                                 </div>
                             </article>
                         )) : (
                             <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500">
-                                还没有自定义服务。添加后会出现在可选模型里。
+                                还没有自定义服务。添加后会出现在可用服务里。
                             </div>
                         )}
                     </div>
@@ -266,8 +289,8 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                 }}
                                 className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                             >
-                                <option value="openai-compatible">OpenAI-compatible</option>
-                                <option value="deeplx">DeepLX</option>
+                                <option value="openai-compatible">OpenAI 兼容服务</option>
+                                <option value="deeplx">DeepLX 翻译服务</option>
                             </select>
                         </label>
 
@@ -283,7 +306,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                             {draft.providerType === 'deeplx' ? (
                                 <p className="text-xs leading-5 text-slate-500">
                                     自建 DeepLX 免费接口可填写基础地址，例如 <code>http://127.0.0.1:1188</code>；
-                                    若要启用官方兼容术语表，建议直接填写完整 <code>/v2/translate</code> 地址。
+                                    若要启用官方兼容固定译法，建议直接填写完整 <code>/v2/translate</code> 地址。
                                     托管网关也可在地址里使用 <code>{'{{apiKey}}'}</code> 占位符。
                                 </p>
                             ) : null}
@@ -303,12 +326,12 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                         {draft.providerType === 'deeplx' ? (
                             <>
                                 <label className="block space-y-2 text-sm">
-                                    <span className="font-medium text-slate-700">术语表 ID（可选）</span>
+                                    <span className="font-medium text-slate-700">固定译法 ID（可选）</span>
                                     <input
                                         type="text"
                                         value={draft.glossaryId}
                                         onChange={(event) => setDraft((current) => ({ ...current, glossaryId: event.target.value }))}
-                                        placeholder="DeepL / DeepLX 官方术语表 ID"
+                                        placeholder="DeepL / DeepLX 的固定译法 ID"
                                         className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                                     />
                                 </label>
@@ -319,18 +342,18 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                         type="text"
                                         value={draft.sourceLang}
                                         onChange={(event) => setDraft((current) => ({ ...current, sourceLang: event.target.value.toUpperCase() }))}
-                                        placeholder="使用 glossary 时填写，例如 EN"
+                                        placeholder="使用固定译法时填写，例如 EN"
                                         className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-slate-400"
                                     />
                                     <p className="text-xs leading-5 text-slate-500">
-                                        DeepL 兼容术语表需要原文语言；不使用术语表时可留空。
+                                        DeepL 兼容固定译法需要原文语言；不使用固定译法时可留空。
                                     </p>
                                 </label>
                             </>
                         ) : null}
 
                         <label className="block space-y-2 text-sm">
-                            <span className="font-medium text-slate-700">默认模型 / 标识</span>
+                            <span className="font-medium text-slate-700">服务标识</span>
                             <input
                                 type="text"
                                 value={draft.model}
@@ -341,7 +364,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                         </label>
 
                         <div className="space-y-2 text-sm">
-                            <div className="font-medium text-slate-700">能力范围</div>
+                            <div className="font-medium text-slate-700">使用场景</div>
                             <div className="flex flex-wrap gap-2">
                                 <button
                                     type="button"
@@ -363,7 +386,7 @@ export function ProviderProfileManager({ open, onClose }: ProviderProfileManager
                                         : 'border-slate-200 text-slate-600 hover:border-slate-300 hover:text-slate-900'
                                         } disabled:cursor-not-allowed disabled:opacity-50`}
                                 >
-                                    AI 辅助
+                                    问答
                                 </button>
                             </div>
                         </div>

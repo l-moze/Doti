@@ -16,8 +16,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "乖积 PDF",
-  description: "乖积 PDF 是一个面向研究阅读场景的 PDF 翻译工作台，支持 MinerU 解析、流式翻译、批注、AI 辅助与导出。",
+  title: "Doti - PDF 翻译阅读工作台",
+  description: "Doti 是一个简单的 PDF 翻译阅读工作台。导入 PDF 或论文后，可以生成译文、对照阅读、做笔记并导出当前视图。",
   icons: {
     icon: "/icon.svg",
     shortcut: "/icon.svg",

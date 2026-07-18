@@ -2,10 +2,11 @@
 
 import { AppErrorBoundary } from '@/components/app-error-boundary';
 import { ArxivImportDialog } from '@/components/arxiv-import-dialog';
-import { ExportSheet } from '@/components/export-sheet';
+import { ExportSheet, type ExportMode } from '@/components/export-sheet';
 import { GlossaryManager } from '@/components/glossary-manager';
 import { MarkdownEditor, type ReaderView } from '@/components/markdown-editor';
 import { ModalShell } from '@/components/modal-shell';
+import { ModelSelector } from '@/components/model-selector';
 import { PDFViewer } from '@/components/pdf-viewer';
 import { ProviderProfileManager } from '@/components/provider-profile-manager';
 import { StoragePanel } from '@/components/storage-panel';
@@ -22,8 +23,6 @@ import {
   Languages,
   Loader2,
   List,
-  Maximize2,
-  Minimize2,
   MoreHorizontal,
   Play,
   Printer,
@@ -42,6 +41,7 @@ interface TocItem {
 }
 
 type TranslationControlState = 'unparsed' | 'untranslated' | 'resumable' | 'active' | 'completed';
+type TranslationQualityOptionId = Exclude<TranslationQualityPreset, 'custom'>;
 type TranslationControlMeta = {
   title: string;
   detail?: string;
@@ -72,7 +72,7 @@ function isPdfFile(file: File): boolean {
 }
 
 const TRANSLATION_QUALITY_OPTIONS: Array<{
-  id: TranslationQualityPreset;
+  id: TranslationQualityOptionId;
   label: string;
   description: string;
 }> = [
@@ -104,19 +104,19 @@ function extractToc(markdown: string): TocItem[] {
 function statusLabel(status: string): string {
   switch (status) {
     case 'idle':
-      return '待命';
+      return '待导入';
     case 'uploading':
-      return '上传中';
+      return '准备文件';
     case 'parsing':
-      return '解析中';
+      return '整理阅读稿';
     case 'parsed':
-      return '已解析';
+      return '待翻译';
     case 'translating':
-      return '翻译中';
+      return '生成译文';
     case 'completed':
-      return '已完成';
+      return '可阅读';
     case 'error':
-      return '异常';
+      return '需处理';
     default:
       return status;
   }
@@ -150,11 +150,11 @@ function renderProgressiveStatus(itemStatus: string, itemProgress: number) {
     <div className="mt-2 space-y-1">
       <div className="flex items-center gap-1 text-[10px]">
         <span className={itemStatus !== 'idle' ? 'text-emerald-600' : 'text-slate-400'}>
-          {itemStatus !== 'idle' ? '●' : '○'} 上传
+          {itemStatus !== 'idle' ? '●' : '○'} 导入
         </span>
         <span className="text-slate-300">/</span>
         <span className={activeIndex >= 1 ? (itemStatus === 'parsing' ? 'text-sky-600' : 'text-emerald-600') : 'text-slate-400'}>
-          {itemStatus === 'parsing' ? '◐' : activeIndex >= 1 ? '●' : '○'} 解析
+          {itemStatus === 'parsing' ? '◐' : activeIndex >= 1 ? '●' : '○'} 整理
         </span>
         <span className="text-slate-300">/</span>
         <span className={activeIndex >= 2 ? (itemStatus === 'translating' ? 'text-sky-600' : 'text-emerald-600') : 'text-slate-400'}>
@@ -162,12 +162,12 @@ function renderProgressiveStatus(itemStatus: string, itemProgress: number) {
         </span>
       </div>
       <div className="text-[10px] text-slate-500">
-        {itemStatus === 'uploading' && '文件进入服务端队列'}
+        {itemStatus === 'uploading' && '正在准备文件'}
         {itemStatus === 'parsing' && `正在整理阅读稿 (${Math.round(itemProgress)}%)`}
         {itemStatus === 'parsed' && '阅读稿已准备好，等待翻译'}
-        {itemStatus === 'translating' && '翻译任务进行中'}
+        {itemStatus === 'translating' && '正在生成译文'}
         {itemStatus === 'completed' && '阅读稿已就绪'}
-        {itemStatus === 'error' && '任务异常'}
+        {itemStatus === 'error' && '需要处理'}
       </div>
     </div>
   );
@@ -183,7 +183,6 @@ export default function Home() {
     fileHash,
     batchId,
     resumableTranslation,
-    isZenMode,
     activeFileName,
     targetLang,
     translationQualityPreset,
@@ -198,7 +197,6 @@ export default function Home() {
     fileHash: state.fileHash,
     batchId: state.batchId,
     resumableTranslation: state.resumableTranslation,
-    isZenMode: state.isZenMode,
     activeFileName: state.activeFileName,
     targetLang: state.targetLang,
     translationQualityPreset: state.translationQualityPreset,
@@ -215,7 +213,6 @@ export default function Home() {
     hydrateStore,
     resumeTranslation,
     restartTranslation,
-    toggleZenMode,
     importFromArxiv,
     setTargetLang,
     setTranslationQualityPreset,
@@ -229,7 +226,6 @@ export default function Home() {
     hydrateStore: state.hydrateStore,
     resumeTranslation: state.resumeTranslation,
     restartTranslation: state.restartTranslation,
-    toggleZenMode: state.toggleZenMode,
     importFromArxiv: state.importFromArxiv,
     setTargetLang: state.setTargetLang,
     setTranslationQualityPreset: state.setTranslationQualityPreset,
@@ -241,12 +237,15 @@ export default function Home() {
   const [showGlossary, setShowGlossary] = useState(false);
   const [showStorage, setShowStorage] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [preferredExportMode, setPreferredExportMode] = useState<ExportMode | null>(null);
+  const [readerPanelExportMode, setReaderPanelExportMode] = useState<ExportMode | null>(null);
   const [showProviderProfiles, setShowProviderProfiles] = useState(false);
   const [showRestartConfirm, setShowRestartConfirm] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [advancedMenuOpen, setAdvancedMenuOpen] = useState(false);
   const [readerView, setReaderView] = useState<ReaderView>('translation');
-  const [dragFeedback, setDragFeedback] = useState('拖入 PDF 或点击选择');
+  const [pdfPreviewOpen, setPdfPreviewOpen] = useState(false);
+  const [dragFeedback, setDragFeedback] = useState('拖入 PDF 或点击导入');
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const didRehydrateStoreRef = useRef(false);
@@ -256,7 +255,7 @@ export default function Home() {
     getServerOnlineSnapshot
   );
   const hasSourceSnapshot = Boolean(sourceMarkdown.trim());
-  const activeQualityOption = TRANSLATION_QUALITY_OPTIONS.find((option) => option.id === translationQualityPreset) || TRANSLATION_QUALITY_OPTIONS[1];
+  const activeQualityOption = TRANSLATION_QUALITY_OPTIONS.find((option) => option.id === translationQualityPreset);
   const isRecoverableParseTask = Boolean(
     batchId &&
     fileHash &&
@@ -317,23 +316,24 @@ export default function Home() {
   }, [progress, status]);
   const showRestartControl = (translationControlState === 'resumable' || translationControlState === 'completed') && status !== 'translating';
   const showImportLanding = status === 'idle' && !hasParsedDocument && !fileHash;
+  const showTopProgress = status === 'uploading' || status === 'parsing' || status === 'translating';
   const documentTitle = activeFileName || file?.name || '准备导入 PDF';
   const targetLangLabel = getTargetLangLabel(targetLang);
   const workflowHint = useMemo(() => {
-    if (status === 'uploading') return '正在上传文件，稍后进入解析。';
-    if (status === 'parsing') return `正在解析 PDF，${Math.round(displayedProgress)}%。`;
+    if (status === 'uploading') return '正在准备文件，稍后整理阅读稿。';
+    if (status === 'parsing') return `正在整理阅读稿，${Math.round(displayedProgress)}%。`;
     if (status === 'parsed') return `原文已就绪，可以翻译成 ${targetLangLabel}。`;
     if (status === 'translating') return translationStatus || `正在生成 ${targetLangLabel} 译文。`;
-    if (status === 'completed') return '译文已就绪，可以阅读、批注或导出当前视图。';
-    if (status === 'error') return error || '任务遇到问题，可以用主动作继续。';
-    if (file) return '文件已选择，下一步开始解析。';
-    return '拖入 PDF 或从 arXiv 导入，开始翻译阅读。';
-  }, [displayedProgress, error, file, status, targetLangLabel, translationStatus]);
+    if (status === 'completed') return '译文已就绪，可以阅读、做笔记或导出当前视图。';
+    if (status === 'error') return error || '处理遇到问题，可以用主动作继续。';
+    if (file) return isOnline ? 'PDF 已准备好，正在进入阅读稿整理。' : 'PDF 已准备好，联网后继续整理阅读稿。';
+    return '拖入 PDF 或导入论文，开始翻译阅读。';
+  }, [displayedProgress, error, file, isOnline, status, targetLangLabel, translationStatus]);
   const translationControlMeta = useMemo<TranslationControlMeta>(() => {
     if (translationControlState === 'unparsed') {
       if (status === 'uploading' || status === 'parsing') {
         return {
-          title: '解析中',
+          title: '整理阅读稿',
           detail: `${Math.round(displayedProgress)}%`,
           tone: 'slate' as const,
           actionable: false,
@@ -343,10 +343,10 @@ export default function Home() {
       }
 
       return {
-        title: status === 'error' ? (canRecoverParsing ? '继续解析' : '重新导入 PDF') : '解析',
+        title: status === 'error' ? (canRecoverParsing ? '继续整理' : '重新导入 PDF') : '整理阅读稿',
         detail: status === 'error'
-          ? (canRecoverParsing ? '恢复当前解析任务' : '重新选择文件')
-          : (file ? '准备解析' : '等待文件'),
+          ? (canRecoverParsing ? '继续整理阅读稿' : '重新导入 PDF')
+          : (file ? 'PDF 已准备好' : '等待导入'),
         tone: 'slate' as const,
         actionable: true,
         disabled: (!file && !canRecoverParsing && !needsFreshImportAfterError) || !isOnline,
@@ -363,7 +363,7 @@ export default function Home() {
 
     if (translationControlState === 'resumable') {
       return {
-        title: '继续翻译',
+        title: '继续生成译文',
         detail: `${resumableTranslation?.percentage ?? 0}%`,
         tone: 'emerald' as const,
         actionable: true,
@@ -375,7 +375,7 @@ export default function Home() {
 
     if (translationControlState === 'active') {
       return {
-        title: '翻译中',
+        title: '生成译文',
         detail: `${Math.round(displayedProgress)}%`,
         tone: 'amber' as const,
         actionable: false,
@@ -386,7 +386,7 @@ export default function Home() {
 
     if (translationControlState === 'completed') {
       return {
-        title: '已完成',
+        title: '导出当前视图',
         detail: '100%',
         tone: 'emerald' as const,
         actionable: false,
@@ -420,6 +420,17 @@ export default function Home() {
     translationControlState,
   ]);
 
+  const importPdfFile = useCallback((nextFile: File) => {
+    setFile(nextFile);
+    if (!isOnline) {
+      setDragFeedback(`${nextFile.name} 已准备好，联网后继续`);
+      return;
+    }
+
+    setDragFeedback(`正在导入 ${nextFile.name}`);
+    void retryParsing();
+  }, [isOnline, retryParsing, setFile]);
+
   const handleDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
     const droppedFile = event.dataTransfer.files[0];
@@ -428,12 +439,11 @@ export default function Home() {
       return;
     }
     if (isPdfFile(droppedFile)) {
-      setFile(droppedFile);
-      setDragFeedback(`已选择 ${droppedFile.name}`);
+      importPdfFile(droppedFile);
     } else {
       setDragFeedback('请拖入 PDF 文件');
     }
-  }, [setFile]);
+  }, [importPdfFile]);
 
   const handleDragOver = useCallback((event: React.DragEvent) => {
     event.preventDefault();
@@ -450,19 +460,27 @@ export default function Home() {
   }, []);
 
   const handleDragLeave = useCallback(() => {
-    setDragFeedback(file ? `已选择 ${file.name}` : '拖入 PDF 或点击选择');
+    setDragFeedback(file ? `${file.name} 已准备好` : '拖入 PDF 或点击导入');
   }, [file]);
 
   const handleFileInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0];
     if (selectedFile && isPdfFile(selectedFile)) {
-      setFile(selectedFile);
-      setDragFeedback(`已选择 ${selectedFile.name}`);
+      importPdfFile(selectedFile);
     } else if (selectedFile) {
       setDragFeedback('请拖入 PDF 文件');
     }
     event.target.value = '';
-  }, [setFile]);
+  }, [importPdfFile]);
+
+  const openExportSheet = useCallback((mode: ExportMode | null = null) => {
+    setPreferredExportMode(mode ?? readerPanelExportMode);
+    setShowExport(true);
+  }, [readerPanelExportMode]);
+
+  const handleVisibleExportModeChange = useCallback((mode: ExportMode | null) => {
+    setReaderPanelExportMode(mode);
+  }, []);
 
   const handlePrimaryAction = useCallback(() => {
     if (!file && !hasParsedDocument && status === 'idle') {
@@ -471,18 +489,18 @@ export default function Home() {
     }
 
     if (translationControlState === 'completed') {
-      setShowExport(true);
+      openExportSheet();
       return;
     }
 
     translationControlMeta.onClick?.();
-  }, [file, hasParsedDocument, openFilePicker, status, translationControlMeta, translationControlState]);
+  }, [file, hasParsedDocument, openExportSheet, openFilePicker, status, translationControlMeta, translationControlState]);
 
   const primaryActionLabel = useMemo(() => {
     if (!file && !hasParsedDocument && status === 'idle') return '导入 PDF';
     if (translationControlState === 'completed') return '导出当前视图';
     if (translationControlState === 'untranslated') return `翻译成 ${targetLangLabel}`;
-    if (translationControlState === 'unparsed' && file && status === 'idle') return '开始解析';
+    if (translationControlState === 'unparsed' && file && status === 'idle') return '整理阅读稿';
     return translationControlMeta.title;
   }, [file, hasParsedDocument, status, targetLangLabel, translationControlMeta.title, translationControlState]);
 
@@ -561,6 +579,10 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [fileHash, status, targetLang]);
 
+  useEffect(() => {
+    setPdfPreviewOpen(false);
+  }, [fileHash]);
+
   return (
     <>
       <main className="flex h-screen flex-col bg-slate-50">
@@ -573,13 +595,14 @@ export default function Home() {
             onChange={handleFileInputChange}
           />
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-slate-900 text-white shadow-sm">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white">
               <FileText size={17} />
             </div>
 
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-2">
-                <h1 className="truncate text-sm font-semibold text-slate-950">Doti</h1>
+                <h1 className="truncate text-sm font-semibold text-slate-950">{documentTitle}</h1>
+                <span className="hidden shrink-0 text-xs font-medium text-slate-400 sm:inline">Doti</span>
                 <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${status === 'completed' ? 'bg-emerald-100 text-emerald-700' :
                   status === 'error' ? 'bg-red-100 text-red-700' :
                     status === 'translating' ? 'bg-amber-100 text-amber-700' :
@@ -595,13 +618,12 @@ export default function Home() {
                 ) : null}
               </div>
               <div className="mt-0.5 flex min-w-0 items-center gap-2 text-xs text-slate-500">
-                <span className="truncate font-medium text-slate-700">{documentTitle}</span>
                 <span className="hidden truncate md:inline">{workflowHint}</span>
               </div>
             </div>
 
-            {status !== 'idle' ? (
-              <div className="hidden items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 shadow-sm md:inline-flex">
+            {showTopProgress ? (
+              <div className="hidden items-center gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 md:inline-flex">
                 <span>{Math.round(displayedProgress)}%</span>
                 <div className="h-2 w-24 overflow-hidden rounded-full bg-slate-100">
                   <div
@@ -617,7 +639,7 @@ export default function Home() {
                 type="button"
                 onClick={handlePrimaryAction}
                 disabled={primaryActionDisabled}
-                className={`inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-2xl px-4 text-sm font-semibold shadow-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${translationControlMeta.tone === 'amber'
+                className={`inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-lg px-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${translationControlMeta.tone === 'amber'
                   ? 'border border-amber-200 bg-amber-50 text-amber-700'
                   : 'bg-slate-900 text-white hover:bg-slate-800'
                   }`}
@@ -642,7 +664,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={toggleMoreMenu}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-600 transition hover:border-slate-300 hover:text-slate-950"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 transition hover:border-slate-300 hover:text-slate-950"
                 aria-expanded={moreMenuOpen}
                 aria-label="更多"
               >
@@ -650,7 +672,7 @@ export default function Home() {
               </button>
 
               {moreMenuOpen ? (
-                <div className="absolute right-0 top-full z-50 mt-2 w-80 overflow-hidden rounded-2xl border border-slate-200 bg-white p-2 shadow-2xl">
+                <div className="absolute right-0 top-full z-50 mt-2 w-80 overflow-hidden rounded-lg border border-slate-200 bg-white p-2 shadow-lg">
                   <div className="px-2 pb-2 pt-1 text-xs font-medium text-slate-400">更多</div>
                   <button
                     type="button"
@@ -673,7 +695,7 @@ export default function Home() {
                     className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <CloudDownload size={15} />
-                    arXiv 导入
+                    导入论文
                   </button>
 
                   <div className="my-2 border-t border-slate-100" />
@@ -692,10 +714,15 @@ export default function Home() {
                       ))}
                     </select>
                   </label>
+                  <label className="flex items-center gap-2 rounded-xl px-3 py-2 text-sm text-slate-700">
+                    <Database size={15} className="text-slate-400" />
+                    <span className="shrink-0">翻译服务</span>
+                    <ModelSelector mode="translation" compact className="min-w-0 flex-1 justify-end" />
+                  </label>
                   <div className="rounded-xl px-3 py-2 text-sm text-slate-700">
                     <div className="mb-2 flex items-center justify-between">
                       <span>翻译质量</span>
-                      <span className="text-xs text-slate-400">{activeQualityOption.description}</span>
+                      <span className="text-xs text-slate-400">{activeQualityOption?.description || '自定义服务'}</span>
                     </div>
                     <div className="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1 text-xs">
                       {TRANSLATION_QUALITY_OPTIONS.map((preset) => (
@@ -703,8 +730,9 @@ export default function Home() {
                           key={preset.id}
                           type="button"
                           onClick={() => setTranslationQualityPreset(preset.id)}
+                          disabled={translationQualityPreset === preset.id || status === 'translating'}
                           aria-pressed={translationQualityPreset === preset.id}
-                          className={`rounded-lg px-2 py-1 text-center transition ${translationQualityPreset === preset.id ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                          className={`rounded-lg px-2 py-1 text-center transition disabled:cursor-not-allowed disabled:opacity-70 ${translationQualityPreset === preset.id ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
                         >
                           {preset.label}
                         </button>
@@ -717,7 +745,7 @@ export default function Home() {
                     type="button"
                     onClick={() => {
                       closeMoreMenu();
-                      setShowExport(true);
+                      openExportSheet();
                     }}
                     disabled={!fileHash}
                     className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
@@ -729,12 +757,12 @@ export default function Home() {
                     type="button"
                     onClick={() => {
                       closeMoreMenu();
-                      toggleZenMode();
+                      setPdfPreviewOpen((open) => !open);
                     }}
                     className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-slate-950"
                   >
-                    {isZenMode ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-                    {isZenMode ? '退出专注阅读' : '专注阅读'}
+                    <FileText size={15} />
+                    {pdfPreviewOpen ? '隐藏 PDF 原文' : '显示 PDF 原文'}
                   </button>
 
                   <div className="my-2 border-t border-slate-100" />
@@ -761,7 +789,7 @@ export default function Home() {
                           className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-red-600 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           <RefreshCw size={15} />
-                          重新翻译全部
+                          重新生成译文
                         </button>
                       ) : null}
                       <button
@@ -773,7 +801,7 @@ export default function Home() {
                         className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
                       >
                         <BookText size={15} />
-                        术语库
+                        固定译法
                       </button>
                       <button
                         type="button"
@@ -784,7 +812,7 @@ export default function Home() {
                         className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
                       >
                         <Database size={15} />
-                        高级模型设置
+                        自定义翻译服务
                       </button>
                       <button
                         type="button"
@@ -795,7 +823,7 @@ export default function Home() {
                         className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
                       >
                         <Database size={15} />
-                        存储管理
+                        本地数据
                       </button>
                       <button
                         type="button"
@@ -819,54 +847,54 @@ export default function Home() {
 
         {showImportLanding ? (
           <div
-            className="flex min-h-0 flex-1 items-center justify-center p-4"
+            className="flex min-h-0 flex-1 items-start justify-center overflow-y-auto overflow-x-hidden p-4 py-6 sm:py-8"
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
-            <div className="grid w-full max-w-5xl gap-6 lg:grid-cols-[1.25fr_0.75fr]">
-              <section className="rounded-[28px] border border-dashed border-slate-300 bg-white p-8 shadow-sm">
-                <div className="flex min-h-[360px] flex-col items-center justify-center text-center">
-                  <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-3xl bg-slate-900 text-white shadow-sm">
-                    <Upload size={26} />
+            <div className="grid w-full max-w-[calc(100vw-2rem)] min-w-0 gap-4 sm:max-w-5xl lg:grid-cols-[1.25fr_0.75fr]">
+              <section className="w-full max-w-full min-w-0 rounded-lg border border-dashed border-slate-300 bg-white p-5 sm:p-8">
+                <div className="flex min-h-[360px] w-full min-w-0 flex-col items-center justify-center text-center">
+                  <div className="mb-6 flex h-14 w-14 items-center justify-center rounded-lg bg-slate-900 text-white">
+                    <Upload size={24} />
                   </div>
                   <h2 className="text-2xl font-semibold text-slate-950">拖入 PDF，开始翻译阅读</h2>
-                  <p className="mt-3 max-w-xl text-sm leading-6 text-slate-500">
-                    Doti 会先解析文档，再生成译文。完成后你可以直接阅读、选中文字提问、做笔记，并导出当前看到的视图。
+                  <p className="mt-3 max-w-full break-words text-sm leading-6 text-slate-500 sm:max-w-xl">
+                    Doti 会先整理阅读稿，再生成译文。完成后你可以直接阅读、选中文字提问、做笔记，并导出当前看到的视图。
                   </p>
-                  <div className="mt-5 rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-600">
+                  <div className="mt-5 max-w-full rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-600">
                     {dragFeedback}
                   </div>
                   {file ? (
-                    <div className="mt-6 flex max-w-full items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                    <div className="mt-6 flex max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
                       <FileText size={16} className="shrink-0" />
                       <span className="truncate">{file.name}</span>
                     </div>
                   ) : null}
-                  <div className="mt-7 flex flex-wrap items-center justify-center gap-3">
+                  <div className="mt-7 flex w-full flex-wrap items-center justify-center gap-3">
                     <button
                       type="button"
                       onClick={file ? handlePrimaryAction : openFilePicker}
                       disabled={primaryActionDisabled}
-                      className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl bg-slate-900 px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-slate-900 px-5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {file ? <Play size={16} /> : <Upload size={16} />}
-                      {file ? '开始解析' : '选择 PDF'}
+                      {file ? '整理阅读稿' : '导入 PDF'}
                     </button>
                     <button
                       type="button"
                       onClick={() => setShowArxivDialog(true)}
                       disabled={!isOnline}
-                      className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-5 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-5 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <CloudDownload size={16} />
-                      arXiv 导入
+                      导入论文
                     </button>
                   </div>
                 </div>
               </section>
 
-              <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
+              <section className="w-full max-w-full min-w-0 rounded-lg border border-slate-200 bg-white p-5">
                 <div className="flex items-center justify-between">
                   <h2 className="text-sm font-semibold text-slate-950">最近文档</h2>
                   <span className="text-xs text-slate-400">{history.length} 个</span>
@@ -877,7 +905,7 @@ export default function Home() {
                       type="button"
                       key={item.fileHash}
                       onClick={() => void loadFromHistory(item.fileHash)}
-                      className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-left transition hover:border-slate-300 hover:bg-slate-50"
+                      className="w-full rounded-lg border border-slate-200 px-4 py-3 text-left transition hover:border-slate-300 hover:bg-slate-50"
                     >
                       <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                         <FileText size={15} className="shrink-0 text-slate-400" />
@@ -886,7 +914,7 @@ export default function Home() {
                       {renderProgressiveStatus(item.status, item.progress)}
                     </button>
                   )) : (
-                    <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500">
+                    <div className="rounded-lg border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500">
                       还没有历史文档
                     </div>
                   )}
@@ -935,7 +963,7 @@ export default function Home() {
                   {sidebarTab === 'files' ? (
                     <div className="space-y-3">
                       {status === 'idle' && file && !hasCurrentFileInHistory && (
-                        <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                        <div className="rounded-lg border border-slate-200 bg-white p-4">
                           <div className="flex items-center gap-2">
                             <FileText size={14} className="text-slate-700" />
                             <span className="truncate text-sm font-medium text-slate-900">{file.name}</span>
@@ -949,7 +977,7 @@ export default function Home() {
                           type="button"
                           key={item.fileHash}
                           onClick={() => void loadFromHistory(item.fileHash)}
-                          className={`w-full rounded-3xl border p-4 text-left shadow-sm transition ${item.fileHash === fileHash ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:shadow-md'}`}
+                          className={`w-full rounded-lg border p-4 text-left transition ${item.fileHash === fileHash ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50'}`}
                         >
                           <div className="flex items-center gap-2">
                             <FileText size={14} className={item.fileHash === fileHash ? 'text-white' : 'text-slate-500'} />
@@ -958,8 +986,8 @@ export default function Home() {
                           {renderProgressiveStatus(item.status, item.progress)}
                         </button>
                       )) : (
-                        <div className="rounded-3xl border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
-                          暂无历史任务
+                        <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
+                          暂无历史文档
                         </div>
                       )}
                     </div>
@@ -980,8 +1008,8 @@ export default function Home() {
                           </span>
                         </button>
                       )) : (
-                        <div className="rounded-3xl border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
-                          {sourceMarkdown ? '当前内容没有识别到章节标题' : '处理 PDF 后会在这里生成大纲'}
+                        <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
+                          {sourceMarkdown ? '当前内容没有识别到章节标题' : '整理阅读稿后会在这里生成大纲'}
                         </div>
                       )}
                     </div>
@@ -996,7 +1024,7 @@ export default function Home() {
                     setSidebarCollapsed(false);
                     startTransition(() => setSidebarTab('files'));
                   }}
-                  className={`rounded-2xl p-2 transition ${sidebarTab === 'files' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}
+                  className={`rounded-lg p-2 transition ${sidebarTab === 'files' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}
                   title="文件"
                 >
                   <FileText size={16} />
@@ -1007,7 +1035,7 @@ export default function Home() {
                     setSidebarCollapsed(false);
                     startTransition(() => setSidebarTab('outline'));
                   }}
-                  className={`rounded-2xl p-2 transition ${sidebarTab === 'outline' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}
+                  className={`rounded-lg p-2 transition ${sidebarTab === 'outline' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'}`}
                   title="大纲"
                 >
                   <List size={16} />
@@ -1017,18 +1045,20 @@ export default function Home() {
           </aside>
 
           <div className="min-h-0 flex-1 overflow-hidden p-3 xl:p-4">
-            <div className={`grid h-full min-h-0 gap-3 ${isZenMode ? 'grid-cols-1' : 'grid-cols-1 2xl:grid-cols-2'}`}>
-              <AppErrorBoundary title="阅读工作区异常">
+            <div className={`grid h-full min-h-0 gap-3 ${pdfPreviewOpen ? 'grid-cols-1 2xl:grid-cols-2' : 'grid-cols-1'}`}>
+              <AppErrorBoundary title="阅读工作区暂时不可用">
                 <div className="h-full min-h-0">
                   <MarkdownEditor
                     onReaderViewChange={setReaderView}
+                    onExportNotes={() => openExportSheet('notes')}
+                    onVisibleExportModeChange={handleVisibleExportModeChange}
                     sourceProjection={sourceProjection}
                   />
                 </div>
               </AppErrorBoundary>
 
-              {!isZenMode && (
-                <AppErrorBoundary title="PDF 预览面板异常">
+              {pdfPreviewOpen && (
+                <AppErrorBoundary title="PDF 预览暂时不可用">
                   <div className="h-full min-h-0">
                     <PDFViewer projection={sourceProjection} />
                   </div>
@@ -1043,13 +1073,13 @@ export default function Home() {
       <ModalShell
         open={showRestartConfirm}
         onClose={() => setShowRestartConfirm(false)}
-        title="重新翻译"
-        description="当前目标语言的译文将被清除，并从头重新翻译。"
+        title="重新生成译文"
+        description="当前语言的译文将被清除，并重新生成。"
         widthClassName="max-w-md"
       >
         <div className="space-y-4 px-6 py-6">
           <div className="rounded-2xl border border-red-100 bg-red-50/70 px-4 py-4 text-sm leading-6 text-red-700">
-            当前目标语言的译文会被清空，并立即从头重新翻译。原始 PDF、解析结果、批注、提问记录不受影响。
+            当前语言的译文会被清空，并重新生成。原始 PDF、阅读稿、阅读笔记、提问记录不受影响。
           </div>
           <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
             <button
@@ -1058,7 +1088,7 @@ export default function Home() {
               className="inline-flex items-center justify-center gap-2 rounded-2xl bg-red-600 px-4 py-3 text-sm font-medium text-white transition hover:bg-red-700"
             >
               <RefreshCw size={15} />
-              重新翻译当前语言
+              重新生成当前语言译文
             </button>
             <button
               type="button"
@@ -1082,10 +1112,14 @@ export default function Home() {
       <StoragePanel open={showStorage} onClose={() => setShowStorage(false)} />
       <ExportSheet
         open={showExport}
-        onClose={() => setShowExport(false)}
+        onClose={() => {
+          setShowExport(false);
+          setPreferredExportMode(null);
+        }}
         fileHash={fileHash}
         fileName={activeFileName}
         currentView={readerView}
+        preferredMode={preferredExportMode}
         targetLang={targetLang}
         targetLangLabel={targetLangLabel}
       />

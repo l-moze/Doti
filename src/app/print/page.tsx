@@ -36,7 +36,7 @@ async function resolveMediaUrl(fileHash: string, relativePath: string): Promise<
 }
 
 function annotationToMarkdown(annotations: AnnotationRecord[]): string {
-    if (annotations.length === 0) return '_暂无批注_';
+    if (annotations.length === 0) return '_暂无阅读笔记_';
 
     return annotations.map((annotation) => {
         const header = `### ${new Date(annotation.createdAt).toLocaleString()}`;
@@ -57,9 +57,11 @@ function PrintPageContent() {
         mode === 'source' ? '原文视图' :
             mode === 'bilingual' ? '对照视图' :
                 mode === 'notes' ? '阅读笔记' :
-                    mode === 'bilingual-notes' ? '译文 + 阅读笔记' :
-                        '译文视图';
-    const modeIncludesTranslation = mode === 'translation' || mode === 'bilingual' || mode === 'bilingual-notes';
+                    mode === 'translation-notes' ? '译文 + 阅读笔记' :
+                        mode === 'source-notes' ? '原文 + 阅读笔记' :
+                            mode === 'bilingual-notes' ? '对照 + 阅读笔记' :
+                                '译文视图';
+    const modeIncludesTranslation = mode === 'translation' || mode === 'bilingual' || mode === 'translation-notes' || mode === 'bilingual-notes';
     const printSubtitle = modeIncludesTranslation ? `${modeLabel} · ${targetLangLabel}` : modeLabel;
 
     const [sourceMarkdown, setSourceMarkdown] = useState('');
@@ -169,13 +171,13 @@ function PrintPageContent() {
                         onClick={() => window.print()}
                         className="rounded-md bg-stone-900 px-4 py-2 text-sm font-medium text-white"
                     >
-                        打印或保存 PDF
+                        保存为 PDF
                     </button>
                 </div>
             </div>
 
             <div className="mx-auto max-w-6xl space-y-8 px-6 py-8">
-                {mode === 'bilingual' && (
+                {(mode === 'bilingual' || mode === 'bilingual-notes') && (
                     <section className={bilingualGridClassName}>
                         <div className="rounded-2xl bg-white p-8 shadow-sm print-doc">
                             <h2 className="mb-4 text-xl font-semibold">原文</h2>
@@ -188,28 +190,21 @@ function PrintPageContent() {
                     </section>
                 )}
 
-                {mode === 'translation' && (
+                {(mode === 'translation' || mode === 'translation-notes') && (
                     <section className="rounded-2xl bg-white p-8 shadow-sm print-doc">
                         <h2 className="mb-4 text-xl font-semibold">译文</h2>
                         <MarkdownView value={renderedTargetMarkdown || '_暂无译文_'} />
                     </section>
                 )}
 
-                {mode === 'source' && (
+                {(mode === 'source' || mode === 'source-notes') && (
                     <section className="rounded-2xl bg-white p-8 shadow-sm print-doc">
                         <h2 className="mb-4 text-xl font-semibold">原文</h2>
                         <MarkdownView value={renderedSourceMarkdown || '_暂无原文内容_'} />
                     </section>
                 )}
 
-                {mode === 'bilingual-notes' && (
-                    <section className="rounded-2xl bg-white p-8 shadow-sm print-doc">
-                        <h2 className="mb-4 text-xl font-semibold">译文</h2>
-                        <MarkdownView value={renderedTargetMarkdown || '_暂无译文_'} />
-                    </section>
-                )}
-
-                {(mode === 'notes' || mode === 'bilingual-notes') && (
+                {(mode === 'notes' || mode === 'translation-notes' || mode === 'source-notes' || mode === 'bilingual-notes') && (
                     <section className="rounded-2xl bg-white p-8 shadow-sm print-doc">
                         <h2 className="mb-4 text-xl font-semibold">阅读笔记</h2>
                         <MarkdownView value={notesMarkdown} />
@@ -223,7 +218,7 @@ function PrintPageContent() {
 function PrintPageFallback() {
     return (
         <main className="min-h-screen bg-stone-100 px-6 py-10 text-stone-500">
-            正在加载打印预览...
+            正在准备导出预览...
         </main>
     );
 }

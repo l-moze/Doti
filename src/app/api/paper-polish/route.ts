@@ -150,7 +150,7 @@ export async function POST(request: NextRequest) {
                 issues: analysis.issues,
                 summary: [
                     ...analysis.summary,
-                    '当前没有需要 AI 深修的局部窗口，已保留本地结构修复结果。',
+                    '当前没有需要额外修复的段落，已保留本地整理结果。',
                 ],
                 usedSource: analysis.usedSource,
                 residualIssues: analysis.residualIssues,
@@ -160,8 +160,8 @@ export async function POST(request: NextRequest) {
             });
         }
 
-        const providerId = body.providerId || 'gemini';
-        const model = body.model || 'gemini-2.5-flash';
+        const providerId = body.providerId || 'groq';
+        const model = body.model || 'llama-3.3-70b-versatile';
         const providerProfile = body.providerProfile?.providerType ? body.providerProfile : undefined;
 
         if (providerProfile?.providerType === 'deeplx') {
@@ -171,7 +171,7 @@ export async function POST(request: NextRequest) {
                 issues: analysis.issues,
                 summary: [
                     ...analysis.summary,
-                    '当前 AI 深修模型配置为 DeepLX，已跳过局部窗口兜底。',
+                    '当前翻译服务不适合继续修复段落，已保留本地整理结果。',
                 ],
                 usedSource: analysis.usedSource,
                 residualIssues: analysis.residualIssues,
@@ -227,11 +227,11 @@ export async function POST(request: NextRequest) {
             summary: Array.from(new Set([
                 ...analysis.summary,
                 repairedWindowCount > 0
-                    ? `已完成 ${repairedWindowCount} 个疑难窗口的 AI 深修。`
-                    : 'AI 深修未改动当前局部窗口，保留本地结构修复结果。',
+                    ? `已修复 ${repairedWindowCount} 个难处理的段落。`
+                    : '难处理的段落没有改动，已保留本地整理结果。',
                 remainingWindows.length > 0
-                    ? `仍有 ${remainingWindows.length} 个窗口建议人工复核。`
-                    : '当前疑难窗口已处理完毕。',
+                    ? `仍有 ${remainingWindows.length} 处内容建议人工复核。`
+                    : '当前难处理的段落已处理完毕。',
             ])),
             usedSource: analysis.usedSource,
             residualIssues: remainingResidualIssues,

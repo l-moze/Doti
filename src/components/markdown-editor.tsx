@@ -16,10 +16,9 @@ import {
 import { fetchWithRetry } from '@/lib/fetch-with-retry';
 import { buildMarkdownFromTranslationBlocks } from '@/lib/translation-runtime';
 import { normalizeMarkdownMathForDisplay } from '@/lib/markdown-normalizer';
-import { useTranslationStore } from '@/lib/store';
+import { getUserFacingErrorMessage, useTranslationStore } from '@/lib/store';
 import { emitSyncEvent, subscribeSyncEvents } from '@/lib/sync-channel';
 import {
-    annotationListToMarkdown,
     applyAnnotationHighlights,
     createMarkdownDecorationState,
     decorateMarkdownBody,
@@ -36,7 +35,7 @@ import { StructuredSourceView } from '@/components/structured-source-view';
 import { ModelSelector } from '@/components/model-selector';
 import { StreamingTranslationPane } from '@/components/streaming-translation-pane';
 import type { TranslationStreamFrame } from '@/components/translation-stream';
-import { CheckCircle2, Loader2, MessageSquarePlus, NotebookPen, RotateCcw, Search, Sparkles, Trash2, Wand2, X } from 'lucide-react';
+import { CheckCircle2, Loader2, MessageSquarePlus, NotebookPen, Plus, RotateCcw, Search, Settings2, Sparkles, Trash2, Wand2, X } from 'lucide-react';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
@@ -81,16 +80,6 @@ function useVlookStyle() {
     }, []);
 
     return loaded;
-}
-
-function downloadTextFile(name: string, content: string) {
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = name;
-    anchor.click();
-    URL.revokeObjectURL(url);
 }
 
 function buildAssistPromptLabel(action: AssistAction, question: string): string {
@@ -182,10 +171,34 @@ function getEditorTabLabel(tab?: EditorTab | null): string {
     return '全文';
 }
 
+function buildContextLabelFromParts(tab?: EditorTab | null, referenceLabel?: string | null): string {
+    const trimmed = referenceLabel?.trim();
+    if (trimmed) {
+        return tab ? `${getEditorTabLabel(tab)} · ${trimmed}` : trimmed;
+    }
+
+    return getEditorTabLabel(tab);
+}
+
 function buildAssistContextLabel(selection?: SelectionSnapshot | null): string {
-    const tabLabel = getEditorTabLabel(selection?.tab);
     const referenceLabel = buildSelectionReferenceLabel(selection?.anchor);
-    return referenceLabel ? `来自${tabLabel} · ${referenceLabel}` : `来自${tabLabel}`;
+    return buildContextLabelFromParts(selection?.tab, referenceLabel);
+}
+
+function buildConversationContextLabel(
+    savedLabel?: string | null,
+    tab?: EditorTab | null,
+    anchor?: AnnotationAnchorRecord | null
+): string | null {
+    const trimmed = savedLabel?.trim();
+    if (trimmed) {
+        const withoutPrefix = trimmed.replace(/^来自\s*/, '');
+        if (withoutPrefix.includes('·')) return withoutPrefix;
+        return tab ? `${getEditorTabLabel(tab)} · ${withoutPrefix}` : withoutPrefix;
+    }
+
+    const referenceLabel = buildSelectionReferenceLabel(anchor);
+    return referenceLabel || tab ? buildContextLabelFromParts(tab, referenceLabel) : null;
 }
 
 type TranslationBlockCandidate = {
@@ -251,11 +264,15 @@ function CollapsibleText({
 
 interface MarkdownEditorProps {
     onReaderViewChange?: (view: ReaderView) => void;
+    onExportNotes: () => void;
+    onVisibleExportModeChange?: (mode: 'translation-notes' | 'source-notes' | 'bilingual-notes' | null) => void;
     sourceProjection?: DocumentSemanticProjection | null;
 }
 
 export function MarkdownEditor({
     onReaderViewChange,
+    onExportNotes,
+    onVisibleExportModeChange,
     sourceProjection = null,
 }: MarkdownEditorProps) {
     const {
@@ -410,7 +427,7 @@ export function MarkdownEditor({
     const renderedSourceMarkdown = useMemo(() => normalizeMarkdownMathForDisplay(effectiveSourceMarkdown), [effectiveSourceMarkdown]);
     const activeView: ReaderView = manualView ?? (status === 'parsed' && !hasTranslationContent ? 'source' : 'translation');
     const activeDocumentTab: EditorTab = activeView === 'source' ? 'source' : 'translation';
-    const translationHeaderLabel = translationConcurrency > 1 ? `并发翻译中 · ${translationConcurrency} 路` : '翻译进行中';
+    const translationHeaderLabel = translationConcurrency > 1 ? `正在生成译文 · ${translationConcurrency} 路` : '正在生成译文';
     const editableTranslationMarkdown = useMemo(() => (
         targetMarkdown.trim()
             ? targetMarkdown
@@ -420,6 +437,28 @@ export function MarkdownEditor({
     useEffect(() => {
         onReaderViewChange?.(activeView);
     }, [activeView, onReaderViewChange]);
+
+    useEffect(() => {
+        setManualView(null);
+    }, [fileHash, targetLang]);
+
+    useEffect(() => {
+        if (!onVisibleExportModeChange) return;
+
+        const nextMode = sidePanelOpen && sidePanelTab === 'notes'
+            ? activeView === 'compare'
+                ? 'bilingual-notes'
+                : activeView === 'source'
+                    ? 'source-notes'
+                    : activeView === 'translation'
+                        ? 'translation-notes'
+                        : 'translation-notes'
+            : null;
+
+        onVisibleExportModeChange(nextMode);
+
+        return () => onVisibleExportModeChange(null);
+    }, [activeView, onVisibleExportModeChange, sidePanelOpen, sidePanelTab]);
 
     useEffect(() => {
         return () => {
@@ -885,10 +924,13 @@ export function MarkdownEditor({
             : [`[data-heading-index="${highlightedBlockId}"]`];
 
         const findTarget = (tab: EditorTab) => {
-            const bodies = getMarkdownBodies(tab === 'translation' ? translationPaneRef.current : sourcePaneRef.current);
-            if (bodies.length === 0) return null;
+            const container = activeView === 'compare'
+                ? (tab === 'translation' ? compareTranslationPaneRef.current : compareSourcePaneRef.current)
+                : (tab === 'translation' ? translationPaneRef.current : sourcePaneRef.current);
+            if (!container) return null;
 
-            for (const body of bodies) {
+            const roots = [container, ...getMarkdownBodies(container)];
+            for (const body of roots) {
                 for (const selector of semanticSelectors) {
                     const element = body.querySelector<HTMLElement>(selector);
                     if (element) {
@@ -1125,12 +1167,11 @@ export function MarkdownEditor({
 
     const activeNoteTarget = noteTarget || selection;
     const currentAssistSelection = selection || selectionMemory;
-    const activeAssistContext = assistTarget || currentAssistSelection;
-    const assistTargetLocked = Boolean(assistTarget);
-    const canRefreshAssistTarget = Boolean(assistTarget && currentAssistSelection && !isSameSelection(assistTarget, currentAssistSelection));
+    const activeAssistContext = currentAssistSelection || assistTarget;
     const canSaveNote = Boolean(fileHash && activeNoteTarget && noteDraft.trim());
     const canSubmitAssistQuestion = Boolean(fileHash && assistQuestion.trim() && !assistLoading);
     const activeAssistContextLabel = activeAssistContext ? buildAssistContextLabel(activeAssistContext) : null;
+    const activeAssistContextSourceLabel = activeAssistContextLabel ? `来自 ${activeAssistContextLabel}` : '来自全文';
     const pendingExchangeVisible = Boolean(
         pendingAssistExchange &&
         (pendingAssistExchange.sessionId === currentAssistSessionId || currentAssistSessionId === 'draft-session')
@@ -1207,7 +1248,7 @@ export function MarkdownEditor({
     const runAssist = async (action: AssistAction, targetOverride?: SelectionSnapshot | null) => {
         if (!fileHash) return;
 
-        const contextTarget = targetOverride || assistTarget || currentAssistSelection;
+        const contextTarget = targetOverride || currentAssistSelection || assistTarget;
         const sessionIdForRequest = currentAssistSessionId === 'draft-session'
             ? crypto.randomUUID()
             : currentAssistSessionId;
@@ -1298,7 +1339,8 @@ export function MarkdownEditor({
                 setAssistQuestion('');
             }
         } catch (assistRequestError) {
-            setAssistError(assistRequestError instanceof Error ? assistRequestError.message : '回答生成失败');
+            const message = assistRequestError instanceof Error ? assistRequestError.message : '回答生成失败';
+            setAssistError(getUserFacingErrorMessage(message));
         } finally {
             setAssistLoading(false);
             setPendingAssistExchange(null);
@@ -1348,10 +1390,6 @@ export function MarkdownEditor({
     const saveTranslationEditDraft = () => {
         saveEditedTranslation(translationEditDraft);
         setTranslationEditMode(false);
-    };
-
-    const downloadTranslationEditDraft = () => {
-        downloadTextFile(`${fileHash || 'document'}-${targetLang}-edited.md`, translationEditDraft);
     };
 
     const sourcePanePolishClass = paperPolishVisualState === 'processing'
@@ -1545,31 +1583,45 @@ export function MarkdownEditor({
 
     if (status === 'idle' || status === 'uploading' || status === 'parsing') {
         return (
-            <div className="flex h-full items-center justify-center rounded-[28px] border-2 border-dashed border-slate-300 bg-white/80 p-8 text-slate-500">
+            <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-slate-300 bg-white/80 p-8 text-slate-500">
                 {status === 'parsing' ? (
                     <div className="flex flex-col items-center gap-3">
                         <Loader2 className="animate-spin text-slate-900" size={32} />
-                        <p>正在整理 PDF 内容...</p>
+                        <p>正在整理阅读稿...</p>
                         <span className="text-xs text-slate-400">{Math.round(progress)}%</span>
                     </div>
                 ) : (
-                    <p>上传或导入 PDF 后，这里会变成可批注的阅读工作区。</p>
+                    <p>导入 PDF 后，这里会显示阅读内容和笔记。</p>
                 )}
             </div>
         );
     }
 
     return (
-        <div className="relative flex h-full flex-col overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-sm">
+        <div className="relative flex h-full flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
             <style>{sharedStyles}</style>
 
             {selection && (
                 <div
                     onMouseDown={(event) => event.preventDefault()}
-                    className="pointer-events-auto fixed z-40 -translate-x-1/2 rounded-full border border-slate-200 bg-white/95 px-2 py-2 shadow-xl backdrop-blur"
+                    className="pointer-events-auto fixed z-40 -translate-x-1/2 rounded-lg border border-slate-200 bg-white/95 px-2 py-2 shadow-lg backdrop-blur"
                     style={{ top: selection.top, left: selection.left }}
                 >
                     <div className="flex items-center gap-1">
+                        <button
+                            type="button"
+                            onClick={() => void runAssist('explain', selection)}
+                            className="rounded-md px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+                        >
+                            解释
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => void runAssist('rewrite', selection)}
+                            className="rounded-md px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+                        >
+                            改写
+                        </button>
                         <button
                             type="button"
                             onClick={() => {
@@ -1577,48 +1629,34 @@ export function MarkdownEditor({
                                 setSidePanelOpen(true);
                                 startTransition(() => setSidePanelTab('notes'));
                             }}
-                            className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+                            className="rounded-md px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
                         >
                             记笔记
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => void runAssist('explain', selection)}
-                            className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
-                        >
-                            解释
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => void runAssist('rewrite', selection)}
-                            className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
-                        >
-                            改写
                         </button>
                     </div>
                 </div>
             )}
 
             <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50/80 px-4 py-3">
-                <div className="grid w-[300px] grid-cols-3 rounded-full bg-slate-200/70 p-1">
+                <div className="grid w-[300px] grid-cols-3 rounded-lg bg-slate-200/70 p-1">
                     <button
                         type="button"
                         onClick={() => startTransition(() => setManualView('translation'))}
-                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeView === 'translation' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                        className={`rounded-md px-3 py-1.5 text-sm transition ${activeView === 'translation' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
                     >
                         译文
                     </button>
                     <button
                         type="button"
                         onClick={() => startTransition(() => setManualView('compare'))}
-                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeView === 'compare' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                        className={`rounded-md px-3 py-1.5 text-sm transition ${activeView === 'compare' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
                     >
                         对照
                     </button>
                     <button
                         type="button"
                         onClick={() => startTransition(() => setManualView('source'))}
-                        className={`rounded-full px-3 py-1.5 text-sm transition ${activeView === 'source' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
+                        className={`rounded-md px-3 py-1.5 text-sm transition ${activeView === 'source' ? 'bg-white font-medium text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
                     >
                         原文
                     </button>
@@ -1629,7 +1667,7 @@ export function MarkdownEditor({
                         <button
                             type="button"
                             onClick={openTranslationEditMode}
-                            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition ${translationEditMode
+                            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition ${translationEditMode
                                 ? 'border-slate-900 bg-slate-900 text-white'
                                 : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:text-slate-900'
                                 }`}
@@ -1641,15 +1679,20 @@ export function MarkdownEditor({
                         <button
                             type="button"
                             onClick={() => setFormatMenuOpen((open) => !open)}
-                            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition ${paperPolishProcessing
+                            className={`inline-flex h-9 min-w-9 items-center justify-center gap-2 rounded-lg border px-2.5 text-sm font-medium transition ${paperPolishProcessing
                                 ? 'border-sky-200 bg-sky-50 text-sky-700'
                                 : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:text-slate-900'
                                 }`}
                             aria-expanded={formatMenuOpen}
                             aria-label="整理阅读稿"
+                            title={paperPolishProcessing ? `正在整理阅读稿 ${Math.round(paperPolishProgress)}%` : '整理阅读稿'}
                         >
                             {paperPolishProcessing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
-                            <span>{paperPolishProcessing ? `整理中 ${Math.round(paperPolishProgress)}%` : '整理'}</span>
+                            {paperPolishProcessing ? (
+                                <span className="text-xs">{Math.round(paperPolishProgress)}%</span>
+                            ) : (
+                                <span className="sr-only">整理阅读稿</span>
+                            )}
                             {paperPolishCanUseAiFallback && !paperPolishProcessing ? (
                                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-700">
                                     {paperPolishResidualCount}
@@ -1658,8 +1701,8 @@ export function MarkdownEditor({
                         </button>
 
                         {formatMenuOpen ? (
-                            <div className="absolute right-0 top-full z-30 mt-2 w-64 overflow-hidden rounded-2xl border border-slate-200 bg-white p-2 text-sm shadow-xl">
-                                <label className="flex items-center justify-between gap-3 rounded-xl px-3 py-2 text-slate-700 transition hover:bg-slate-50">
+                            <div className="absolute right-0 top-full z-30 mt-2 w-64 overflow-hidden rounded-lg border border-slate-200 bg-white p-2 text-sm shadow-lg">
+                                <label className="flex items-center justify-between gap-3 rounded-md px-3 py-2 text-slate-700 transition hover:bg-slate-50">
                                     <span className="inline-flex items-center gap-2">
                                         <span className={`inline-flex h-2.5 w-2.5 rounded-full ${paperPolishAutoEnabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
                                         自动整理阅读稿
@@ -1676,7 +1719,7 @@ export function MarkdownEditor({
                                     type="button"
                                     onClick={handleRunPaperPolish}
                                     disabled={!canRunPaperPolish || paperPolishProcessing}
-                                    className="paper-polish-wand flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:text-slate-300"
+                                    className="paper-polish-wand flex w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:text-slate-300"
                                 >
                                     <span className="inline-flex items-center gap-2">
                                         <Wand2 size={14} />
@@ -1689,7 +1732,7 @@ export function MarkdownEditor({
                                     <button
                                         type="button"
                                         onClick={handleRunPaperPolishAiFallback}
-                                        className="flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-amber-700 transition hover:bg-amber-50"
+                                        className="flex w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-left text-amber-700 transition hover:bg-amber-50"
                                     >
                                         <span className="inline-flex items-center gap-2">
                                             <Sparkles size={14} />
@@ -1708,7 +1751,7 @@ export function MarkdownEditor({
                                             setFormatMenuOpen(false);
                                             cancelPaperPolish();
                                         }}
-                                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-rose-600 transition hover:bg-rose-50"
+                                        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-rose-600 transition hover:bg-rose-50"
                                     >
                                         <X size={14} />
                                         取消整理
@@ -1719,7 +1762,7 @@ export function MarkdownEditor({
                                     <button
                                         type="button"
                                         onClick={handleUndoPaperPolish}
-                                        className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-emerald-700 transition hover:bg-emerald-50"
+                                        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-emerald-700 transition hover:bg-emerald-50"
                                     >
                                         <RotateCcw size={14} />
                                         撤销整理
@@ -1740,7 +1783,7 @@ export function MarkdownEditor({
                     {status === 'translating' && (
                         <>
                             <Loader2 className="h-3 w-3 animate-spin text-slate-900" />
-                            <span>{error ? '翻译中断' : translationHeaderLabel}</span>
+                            <span>{error ? '生成译文遇到问题' : translationHeaderLabel}</span>
                             {translationStatus ? (
                                 <span className={`hidden rounded-full px-2.5 py-1 xl:inline ${translationPhase === 'stalled'
                                     ? 'bg-red-50 text-red-600'
@@ -1754,7 +1797,7 @@ export function MarkdownEditor({
                     {status === 'completed' && <span className="font-medium text-emerald-600">译文已完成</span>}
                     {status === 'error' && (
                         <span className="font-medium text-red-600">
-                            {isRecoverableParseTask ? '解析异常' : '翻译异常'}
+                            {isRecoverableParseTask ? '整理遇到问题' : '生成译文遇到问题'}
                         </span>
                     )}
                 </div>
@@ -1771,7 +1814,7 @@ export function MarkdownEditor({
                             <div className="flex min-w-[220px] flex-1 items-center gap-3">
                                 <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
                                     <div
-                                        className="h-full rounded-full bg-[linear-gradient(90deg,#38bdf8,#60a5fa,#f59e0b)] transition-all duration-500"
+                                        className="h-full rounded-full bg-slate-900 transition-all duration-500"
                                         style={{ width: `${Math.min(100, Math.max(paperPolishProgress, 0))}%` }}
                                     />
                                 </div>
@@ -1790,31 +1833,24 @@ export function MarkdownEditor({
                         className={`workspace-scroll absolute inset-0 overflow-auto p-6 ${vlookLoaded ? 'vlook-doc' : 'prose prose-slate max-w-none'} ${activeView === 'translation' ? 'visible' : 'invisible'}`}
                     >
                         {translationEditMode ? (
-                            <div className="not-prose flex h-full min-h-[520px] flex-col rounded-3xl border border-slate-200 bg-white shadow-sm">
+                            <div className="not-prose flex h-full min-h-[520px] flex-col rounded-lg border border-slate-200 bg-white">
                                 <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
                                     <div>
-                                        <div className="text-sm font-semibold text-slate-900">编辑译文</div>
-                                        <div className="mt-0.5 text-xs text-slate-500">保存后，当前阅读稿和导出预览会使用此版本。</div>
+                                        <div className="text-sm font-semibold text-slate-900">编辑当前译文</div>
+                                        <div className="mt-0.5 text-xs text-slate-500">保存后，阅读区和导出当前视图会使用这版译文。</div>
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <button
                                             type="button"
                                             onClick={saveTranslationEditDraft}
-                                            className="rounded-2xl bg-slate-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-slate-800"
+                                            className="rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-slate-800"
                                         >
                                             保存编辑
                                         </button>
                                         <button
                                             type="button"
-                                            onClick={downloadTranslationEditDraft}
-                                            className="rounded-2xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
-                                        >
-                                            下载副本
-                                        </button>
-                                        <button
-                                            type="button"
                                             onClick={closeTranslationEditMode}
-                                            className="rounded-2xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+                                            className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
                                         >
                                             退出编辑
                                         </button>
@@ -1823,8 +1859,8 @@ export function MarkdownEditor({
                                 <textarea
                                     value={translationEditDraft}
                                     onChange={(event) => setTranslationEditDraft(event.target.value)}
-                                    className="min-h-0 flex-1 resize-none bg-white px-4 py-4 font-mono text-sm leading-7 text-slate-800 outline-none"
-                                    spellCheck={false}
+                                    aria-label="编辑当前译文"
+                                    className="min-h-0 flex-1 resize-none bg-white px-4 py-4 text-sm leading-7 text-slate-800 outline-none"
                                 />
                             </div>
                         ) : (
@@ -1937,10 +1973,7 @@ export function MarkdownEditor({
                             <div className="shrink-0 border-b border-slate-200 bg-white/90 px-4 py-4">
                                 <div className="flex items-start justify-between gap-3">
                                     <div>
-                                        <div className="text-sm font-medium text-slate-900">笔记时间线</div>
-                                        <p className="mt-1 text-xs text-slate-500">
-                                            划线后直接记录，下面按时间倒序查看和回跳。
-                                        </p>
+                                        <div className="text-sm font-medium text-slate-900">阅读笔记</div>
                                     </div>
                                     <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
                                         {sortedAnnotations.length} 条
@@ -1954,50 +1987,40 @@ export function MarkdownEditor({
                                             value={noteSearch}
                                             onChange={(event) => setNoteSearch(event.target.value)}
                                             placeholder="搜索正文、笔记或标签"
-                                            className="w-full rounded-2xl border border-slate-200 py-3 pl-9 pr-3 text-sm outline-none transition focus:border-slate-400"
+                                            className="w-full rounded-lg border border-slate-200 py-3 pl-9 pr-3 text-sm outline-none transition focus:border-slate-400"
                                         />
                                     </div>
                                     <button
                                         type="button"
-                                        onClick={() => downloadTextFile(`${fileHash || 'document'}-annotations.md`, annotationListToMarkdown(sortedAnnotations))}
-                                        className="shrink-0 rounded-2xl border border-slate-200 px-3 py-3 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                        onClick={onExportNotes}
+                                        className="shrink-0 rounded-lg border border-slate-200 px-3 py-3 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                     >
-                                        导出
+                                        导出笔记
                                     </button>
                                 </div>
                             </div>
 
                             <div className="workspace-scroll min-h-0 flex-1 overflow-y-auto px-4 py-4">
                                 <div className="space-y-4">
-                                    <section className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                    {activeNoteTarget ? (
+                                    <section className="rounded-lg border border-slate-200 bg-white p-4">
                                         <div className="flex items-center justify-between gap-3">
                                             <div>
                                                 <div className="text-sm font-medium text-slate-900">新建笔记</div>
-                                                <p className="mt-1 text-xs text-slate-500">
-                                                    当前划选会自动带入，保存后可随时回跳定位。
-                                                </p>
                                             </div>
-                                            {activeNoteTarget ? (
-                                                <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
-                                                    已捕获选区
-                                                </span>
-                                            ) : null}
+                                            <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
+                                                已捕获选区
+                                            </span>
                                         </div>
 
-                                        <div className="mt-3 rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-3 py-3 text-sm leading-6 text-slate-600">
-                                            {activeNoteTarget ? (
-                                                <CollapsibleText
-                                                    text={activeNoteTarget.text}
-                                                    expanded={noteTargetExpanded}
-                                                    onToggle={() => setNoteTargetExpanded((current) => !current)}
-                                                    maxChars={COLLAPSE_LIMITS.panelPreview}
-                                                    className="whitespace-pre-wrap"
-                                                />
-                                            ) : (
-                                                <div className="text-slate-500">
-                                                    在左侧正文中选中内容后，这里会显示你要记录的原文片段。
-                                                </div>
-                                            )}
+                                        <div className="mt-3 rounded-lg border border-dashed border-slate-200 bg-slate-50/70 px-3 py-3 text-sm leading-6 text-slate-600">
+                                            <CollapsibleText
+                                                text={activeNoteTarget.text}
+                                                expanded={noteTargetExpanded}
+                                                onToggle={() => setNoteTargetExpanded((current) => !current)}
+                                                maxChars={COLLAPSE_LIMITS.panelPreview}
+                                                className="whitespace-pre-wrap"
+                                            />
                                         </div>
 
                                         <textarea
@@ -2005,21 +2028,21 @@ export function MarkdownEditor({
                                             onChange={(event) => setNoteDraft(event.target.value)}
                                             rows={4}
                                             placeholder="记录你的理解、疑问或待办"
-                                            className="mt-3 w-full rounded-2xl border border-slate-200 px-3 py-3 text-sm outline-none transition focus:border-slate-400"
+                                            className="mt-3 w-full rounded-lg border border-slate-200 px-3 py-3 text-sm outline-none transition focus:border-slate-400"
                                         />
                                         <input
                                             type="text"
                                             value={noteTags}
                                             onChange={(event) => setNoteTags(event.target.value)}
                                             placeholder="标签，用逗号分隔，如 证明、待办"
-                                            className="mt-3 w-full rounded-2xl border border-slate-200 px-3 py-3 text-sm outline-none transition focus:border-slate-400"
+                                            className="mt-3 w-full rounded-lg border border-slate-200 px-3 py-3 text-sm outline-none transition focus:border-slate-400"
                                         />
                                         <div className="mt-3 flex gap-2">
                                             <button
                                                 type="button"
                                                 onClick={() => void saveCurrentNote()}
                                                 disabled={!canSaveNote}
-                                                className="inline-flex flex-1 items-center justify-center gap-2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                                                className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                                             >
                                                 <MessageSquarePlus size={15} />
                                                 保存笔记
@@ -2032,12 +2055,13 @@ export function MarkdownEditor({
                                                     setNoteTags('');
                                                     clearEditorSelection();
                                                 }}
-                                                className="rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                                className="rounded-lg border border-slate-200 px-4 py-3 text-sm text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                             >
                                                 清空
                                             </button>
                                         </div>
                                     </section>
+                                    ) : null}
 
                                     {sortedAnnotations.length > 0 ? (
                                         <div className="space-y-3">
@@ -2047,13 +2071,13 @@ export function MarkdownEditor({
                                                 const noteExpandable = isTextCollapsible(annotation.note, COLLAPSE_LIMITS.annotationNote);
 
                                                 return (
-                                                    <article key={annotation.id} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                                    <article key={annotation.id} className="rounded-lg border border-slate-200 bg-white p-4">
                                                         <div className="flex items-start justify-between gap-3">
                                                             <div className="min-w-0 flex-1">
                                                                 <div className="text-xs uppercase tracking-[0.14em] text-slate-400">
                                                                     {annotation.targetLang ? '译文' : '原文'} · {new Date(annotation.createdAt).toLocaleString()}
                                                                 </div>
-                                                                <div className="mt-2 rounded-2xl bg-slate-50 px-3 py-3">
+                                                                <div className="mt-2 rounded-lg bg-slate-50 px-3 py-3">
                                                                     <CollapsibleText
                                                                         text={annotation.selectedText}
                                                                         expanded={expanded}
@@ -2106,9 +2130,9 @@ export function MarkdownEditor({
                                                             <button
                                                                 type="button"
                                                                 onClick={() => locateAnnotation(annotation)}
-                                                                className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                                                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                                             >
-                                                                回到原文
+                                                                回到位置
                                                             </button>
                                                         </div>
                                                     </article>
@@ -2116,8 +2140,11 @@ export function MarkdownEditor({
                                             })}
                                         </div>
                                     ) : (
-                                        <div className="rounded-3xl border border-dashed border-slate-300 bg-white px-4 py-10 text-center text-sm text-slate-500">
-                                            还没有笔记，先在正文中选一段文字试试。
+                                        <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-10 text-center text-sm text-slate-500">
+                                            <div className="font-medium text-slate-700">还没有笔记</div>
+                                            <p className="mt-2 leading-6">
+                                                在正文中选中内容后，可以直接保存阅读笔记。
+                                            </p>
                                         </div>
                                     )}
                                 </div>
@@ -2147,13 +2174,15 @@ export function MarkdownEditor({
                                     <button
                                         type="button"
                                         onClick={() => setAssistAdvancedOpen((open) => !open)}
-                                        className={`rounded-full border px-2.5 py-1 text-xs transition ${assistAdvancedOpen
+                                        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-slate-600 transition ${assistAdvancedOpen
                                             ? 'border-slate-900 bg-slate-900 text-white'
                                             : 'border-slate-200 text-slate-600 hover:border-slate-300 hover:text-slate-900'
                                             }`}
                                         aria-expanded={assistAdvancedOpen}
+                                        aria-label="回答设置"
+                                        title="回答设置"
                                     >
-                                        高级
+                                        <Settings2 size={14} />
                                     </button>
                                     <button
                                         type="button"
@@ -2163,16 +2192,16 @@ export function MarkdownEditor({
                                             setAssistError(null);
                                             setPendingAssistExchange(null);
                                         }}
-                                        className="rounded-full border border-slate-200 px-2.5 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                                        className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                         aria-label="新建对话"
                                         title="新建对话"
                                     >
-                                        新建
+                                        <Plus size={14} />
                                     </button>
                                 </div>
                                 {assistAdvancedOpen ? (
-                                    <div className="mt-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
-                                        <div className="mb-1 text-[11px] font-medium text-slate-500">回答模型</div>
+                                    <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                                        <div className="mb-1 text-[11px] font-medium text-slate-500">回答服务</div>
                                         <ModelSelector mode="assist" compact />
                                     </div>
                                 ) : null}
@@ -2184,20 +2213,20 @@ export function MarkdownEditor({
                                         {sortedConversations.map((conversation) => {
                                             const expanded = Boolean(expandedConversationIds[conversation.id]);
                                             const responseExpandable = isTextCollapsible(conversation.response, COLLAPSE_LIMITS.conversationResponse);
-                                            const contextLabel = conversation.contextLabel || buildSelectionReferenceLabel(conversation.contextAnchor);
                                             const contextTab = conversation.contextTab || (conversation.contextAnchor
                                                 ? (conversation.targetLang ? 'translation' : 'source')
                                                 : undefined);
+                                            const contextLabel = buildConversationContextLabel(conversation.contextLabel, contextTab, conversation.contextAnchor);
 
                                             return (
                                                 <div key={conversation.id} className="space-y-2">
-                                                    <div className="ml-auto max-w-[88%] rounded-[24px] bg-slate-900 px-4 py-3 text-white shadow-sm">
-                                                        <div className="flex items-center justify-between gap-2 text-[11px] text-slate-300">
-                                                            <span className="truncate">{conversation.prompt}</span>
+                                                    <div className="ml-auto max-w-[88%] rounded-lg bg-slate-900 px-4 py-3 text-white">
+                                                        <div className="flex items-center justify-end gap-2 text-[11px] text-slate-300">
                                                             <span className="shrink-0">
                                                                 {new Date(conversation.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                                             </span>
                                                         </div>
+                                                        <div className="mt-1 whitespace-pre-wrap text-sm leading-6">{conversation.prompt}</div>
                                                         {contextLabel ? (
                                                             <div className="mt-2 flex items-center">
                                                                 <button
@@ -2216,13 +2245,13 @@ export function MarkdownEditor({
                                                                             : 'bg-white/10 text-slate-300'
                                                                     }`}
                                                                 >
-                                                                    {contextLabel}
+                                                                    来自 {contextLabel}
                                                                 </button>
                                                             </div>
                                                         ) : null}
                                                     </div>
 
-                                                    <div className="max-w-[92%] rounded-[24px] border border-slate-200 bg-slate-50 px-4 py-3 shadow-sm">
+                                                    <div className="max-w-[92%] rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
                                                         <div className="flex items-center justify-between gap-2">
                                                             <div className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
                                                                 回答
@@ -2262,13 +2291,13 @@ export function MarkdownEditor({
                                         })}
                                         {pendingAssistExchange && pendingExchangeVisible ? (
                                             <div className="space-y-2">
-                                                <div className="ml-auto max-w-[88%] rounded-[24px] bg-slate-900 px-4 py-3 text-white shadow-sm ring-1 ring-slate-800/10">
-                                                    <div className="flex items-center justify-between gap-2 text-[11px] text-slate-300">
-                                                        <span className="truncate">{pendingAssistExchange.prompt}</span>
+                                                <div className="ml-auto max-w-[88%] rounded-lg bg-slate-900 px-4 py-3 text-white">
+                                                    <div className="flex items-center justify-end gap-2 text-[11px] text-slate-300">
                                                         <span className="shrink-0">
                                                             {new Date(pendingAssistExchange.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                                         </span>
                                                     </div>
+                                                    <div className="mt-1 whitespace-pre-wrap text-sm leading-6">{pendingAssistExchange.prompt}</div>
                                                     {pendingAssistExchange.contextLabel ? (
                                                         <div className="mt-2 flex items-center">
                                                             <button
@@ -2287,44 +2316,39 @@ export function MarkdownEditor({
                                                                         : 'bg-white/10 text-slate-300'
                                                                 }`}
                                                             >
-                                                                {pendingAssistExchange.contextLabel}
+                                                                来自 {pendingAssistExchange.contextLabel}
                                                             </button>
                                                         </div>
                                                     ) : null}
                                                 </div>
-                                                <div className="max-w-[92%] rounded-[24px] border border-slate-200 bg-slate-50 px-4 py-3 shadow-sm">
+                                                <div className="max-w-[92%] rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
                                                     <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-400">
                                                         <Loader2 size={13} className="animate-spin" />
                                                         回答正在生成
                                                     </div>
                                                     <div className="mt-2 text-sm leading-6 text-slate-500">
-                                                        请求已经发出，正在生成回答...
+                                                        正在根据当前上下文生成回答...
                                                     </div>
                                                 </div>
                                             </div>
                                         ) : null}
                                     </div>
                                 ) : (
-                                    <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50/70 px-4 py-10 text-center text-sm text-slate-500">
+                                    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50/70 px-4 py-10 text-center text-sm text-slate-500">
                                         <div className="font-medium text-slate-700">当前会话还没有消息</div>
                                         <p className="mt-2 leading-6">
-                                            先在左侧选中一段文字，或者直接输入问题开始对话。
+                                            先在正文中选中一段文字，或者直接输入问题开始对话。
                                         </p>
-                                        {assistSessionSummaries.length > 0 ? (
-                                            <p className="mt-2 text-xs text-slate-400">
-                                                上方会话下拉框可以随时切回之前的聊天记录。
-                                            </p>
-                                        ) : null}
                                     </div>
                                 )}
                             </div>
 
                             <div className="shrink-0 border-t border-slate-200 bg-white px-3 py-2">
-                                <div className="rounded-[22px] border border-slate-200 bg-white px-2.5 py-2">
-                                    <div className="mb-2 flex items-center justify-between gap-2 rounded-2xl bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                                <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-2">
+                                    <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
                                         <span className="shrink-0 font-medium text-slate-700">当前上下文</span>
                                         <span className="truncate">
-                                            {activeAssistContextLabel || '来自全文'}
+                                            {activeAssistContextSourceLabel}
                                         </span>
                                     </div>
                                     <div className="workspace-scroll -mx-0.5 flex items-center gap-2 overflow-x-auto px-0.5 pb-1">
@@ -2339,46 +2363,19 @@ export function MarkdownEditor({
                                                 className="inline-flex shrink-0 items-center gap-2 rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white transition hover:bg-slate-800"
                                             >
                                                 <span>{activeAssistContextLabel}</span>
-                                                <span className="text-slate-300">{assistTargetLocked ? '锁定' : '跟随'}</span>
                                             </button>
                                         ) : (
                                             <span className="shrink-0 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">
                                                 全文模式
                                             </span>
                                         )}
-                                        {currentAssistSelection && !assistTargetLocked ? (
-                                            <button
-                                                type="button"
-                                                onClick={() => setAssistTarget(currentAssistSelection)}
-                                                className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                                            >
-                                                锁定
-                                            </button>
-                                        ) : null}
-                                        {assistTargetLocked && canRefreshAssistTarget ? (
-                                            <button
-                                                type="button"
-                                                onClick={() => currentAssistSelection && setAssistTarget(currentAssistSelection)}
-                                                className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                                            >
-                                                更新
-                                            </button>
-                                        ) : null}
-                                        {assistTargetLocked ? (
-                                            <button
-                                                type="button"
-                                                onClick={() => setAssistTarget(null)}
-                                                className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                                            >
-                                                解锁
-                                            </button>
-                                        ) : null}
                                         {activeAssistContext ? (
                                             <button
                                                 type="button"
                                                 onClick={() => {
                                                     setAssistTarget(null);
                                                     setSelectionMemory(null);
+                                                    clearEditorSelection();
                                                 }}
                                                 className="shrink-0 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                                             >
@@ -2427,7 +2424,7 @@ export function MarkdownEditor({
                                         </div>
                                     ) : null}
 
-                                    <div className="mt-1.5 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
+                                    <div className="mt-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                                         <textarea
                                             ref={assistQuestionRef}
                                             value={assistQuestion}
@@ -2447,7 +2444,7 @@ export function MarkdownEditor({
                                                 type="button"
                                                 onClick={submitAssistQuestion}
                                                 disabled={!canSubmitAssistQuestion}
-                                                className="inline-flex items-center justify-center gap-2 rounded-2xl bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                                                className="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                                             >
                                                 {assistLoading ? <Loader2 size={15} className="animate-spin" /> : <Wand2 size={15} />}
                                                 发送
@@ -2456,7 +2453,7 @@ export function MarkdownEditor({
                                     </div>
 
                                     {assistError ? (
-                                        <p className="mt-3 rounded-2xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
+                                        <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
                                             {assistError}
                                         </p>
                                     ) : null}
@@ -2466,7 +2463,7 @@ export function MarkdownEditor({
                     )}
                 </aside>
                 ) : (
-                    <div className="pointer-events-none absolute right-4 top-20 z-20 flex flex-col gap-2">
+                    <div className="pointer-events-none absolute right-4 top-20 z-20 flex">
                         <button
                             type="button"
                             onClick={() => {
@@ -2477,19 +2474,7 @@ export function MarkdownEditor({
                             aria-label="打开笔记和提问面板"
                         >
                             <NotebookPen size={15} />
-                            笔记
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                setSidePanelOpen(true);
-                                startTransition(() => setSidePanelTab('ai'));
-                            }}
-                            className="pointer-events-auto inline-flex h-10 items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-sm font-medium text-slate-700 shadow-sm backdrop-blur transition hover:border-slate-300 hover:text-slate-900"
-                            aria-label="打开提问面板"
-                        >
-                            <Sparkles size={15} />
-                            提问
+                            笔记和提问
                         </button>
                     </div>
                 )}

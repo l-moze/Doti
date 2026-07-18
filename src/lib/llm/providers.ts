@@ -55,6 +55,14 @@ export const PROVIDERS: Record<string, ProviderDef> = {
         modelsEndpoint: '/models',
         isOpenAICompat: true,
     },
+    groq: {
+        id: 'groq',
+        name: 'Groq',
+        baseUrl: 'https://api.groq.com/openai/v1',
+        envKey: 'GROQ_API_KEY',
+        modelsEndpoint: '/models',
+        isOpenAICompat: true,
+    },
     /**
      * Claude：Anthropic 官方 Messages API。
      * - Key: ANTHROPIC_API_KEY（与 @anthropic-ai/sdk 默认一致）
@@ -79,6 +87,7 @@ export const DEFAULT_MODELS: Record<string, string> = {
     glm: 'GLM-4.5-Flash',
     ollama: 'llama3.3',
     openai: 'gpt-4o-mini',
+    groq: 'llama-3.3-70b-versatile',
     /** 官方模型 ID，请以控制台 / 文档为准 */
     claude: 'claude-sonnet-4-20250514',
 };

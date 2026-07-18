@@ -17,7 +17,11 @@ import {
     restorePreservedMarkdownFragments,
 } from "@/lib/markdown-table-utils";
 import { runTranslationIntegrityPass } from "@/lib/translation-integrity";
-import type { TranslationChunkPlan, TranslationMarkdownBlock } from "@/lib/translation-runtime";
+import {
+    normalizeTranslationBlockText,
+    type TranslationChunkPlan,
+    type TranslationMarkdownBlock,
+} from "@/lib/translation-runtime";
 import { buildTranslationCacheKeyInputFromRuntime } from "@/lib/translation-cache-key";
 import crypto from "node:crypto";
 
@@ -98,7 +102,7 @@ function rebuildCompletedBlocks(
             cursor += 2;
         }
 
-        const text = partialContent.slice(cursor, cursor + chunkProgress.length);
+        const text = normalizeTranslationBlockText(partialContent.slice(cursor, cursor + chunkProgress.length));
         cursor += chunkProgress.length;
 
         blocks.push({
@@ -217,12 +221,12 @@ async function translateChunkToCompletion(input: {
         { preserveInlineMath: shouldPreserveInlineMath(input.runtimeProfile) }
     );
 
-    const content = await translateRefinedContextToCompletion({
+    const content = normalizeTranslationBlockText(await translateRefinedContextToCompletion({
         refinedContext,
         targetLang: input.targetLang,
         actModule: input.actModule,
         runtimeProfile: input.runtimeProfile,
-    });
+    }));
 
     return {
         index: input.index,
@@ -334,7 +338,7 @@ async function* agentTranslateGenerator(
         console.log(`[Cache] Found complete translation`);
         yield sseEvent('status', { message: 'Loading from Cache...' });
 
-        const cachedContent = await tracker.readFullCache();
+        const cachedContent = normalizeTranslationBlockText(await tracker.readFullCache() || '');
         yield sseEvent('run_started', {
             runId,
             source: 'cache',
@@ -581,7 +585,7 @@ async function* agentTranslateGenerator(
             // Step 3: Act - Translate
             if (refinedContext.isReference) {
                 yield sseEvent('status', { message: 'Skipping reference section' });
-                chunkContent = chunk.content;
+                chunkContent = normalizeTranslationBlockText(chunk.content);
                 yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: chunkContent });
                 previousTranslation = chunkContent;
             } else {
@@ -606,16 +610,18 @@ async function* agentTranslateGenerator(
                     preservedFragments: refinedContext.preservedFragments,
                 });
 
-                if (integrityResult.changed) {
+                const normalizedIntegrityText = normalizeTranslationBlockText(integrityResult.text);
+
+                if (integrityResult.changed || normalizedIntegrityText !== chunkTranslation) {
                     yield sseEvent('chunk_reset', {
                         chunkId: planItem?.id || chunk.id,
-                        text: integrityResult.text,
+                        text: normalizedIntegrityText,
                         issues: integrityResult.issues.map((issue) => issue.kind),
                     });
                 }
 
-                chunkContent = integrityResult.text;
-                previousTranslation = integrityResult.text;
+                chunkContent = normalizedIntegrityText;
+                previousTranslation = normalizedIntegrityText;
             }
 
             // Save chunk immediately to partial cache
@@ -654,7 +660,7 @@ function agentIteratorToStream(iterator: AsyncGenerator<string, void, unknown>) 
                 if (error instanceof TranslationJobConflictError) {
                     controller.enqueue(new TextEncoder().encode(
                         sseEvent('job_conflict', {
-                            message: '当前翻译任务已在进行中，请勿重复提交。',
+                            message: '这个文档正在生成译文，请等待完成后再试。',
                             activeJob: error.activeJob,
                         })
                     ));
@@ -694,8 +700,8 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: "No text provided" }, { status: 400 });
         }
 
-        const providerIdToUse = providerId || 'gemini';
-        const modelToUse = model || 'gemini-2.5-flash';
+        const providerIdToUse = providerId || 'groq';
+        const modelToUse = model || 'llama-3.3-70b-versatile';
         const shouldResume = resume === true;
         const shouldForceFresh = forceFresh === true;
         const requestedJobId = typeof jobId === "string" && jobId.trim()
@@ -856,8 +862,9 @@ async function* translateWithoutCache(
         );
 
         if (refinedContext.isReference) {
-            yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: chunk.content });
-            previousTranslation = chunk.content;
+            const referenceContent = normalizeTranslationBlockText(chunk.content);
+            yield sseEvent('chunk', { chunkId: planItem?.id || chunk.id, text: referenceContent });
+            previousTranslation = referenceContent;
         } else {
             let chunkTranslation = "";
 
@@ -877,15 +884,17 @@ async function* translateWithoutCache(
                 preservedFragments: refinedContext.preservedFragments,
             });
 
-            if (integrityResult.changed) {
+            const normalizedIntegrityText = normalizeTranslationBlockText(integrityResult.text);
+
+            if (integrityResult.changed || normalizedIntegrityText !== chunkTranslation) {
                 yield sseEvent('chunk_reset', {
                     chunkId: planItem?.id || chunk.id,
-                    text: integrityResult.text,
+                    text: normalizedIntegrityText,
                     issues: integrityResult.issues.map((issue) => issue.kind),
                 });
             }
 
-            previousTranslation = integrityResult.text;
+            previousTranslation = normalizedIntegrityText;
         }
 
         yield sseEvent('chunk_completed', {

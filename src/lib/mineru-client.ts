@@ -282,7 +282,9 @@ export class MinerUClient {
     async uploadFileToUrl(url: string, fileBuffer: Buffer | ArrayBuffer | Blob): Promise<void> {
         const body = fileBuffer instanceof Blob
             ? fileBuffer
-            : new Uint8Array(fileBuffer instanceof ArrayBuffer ? fileBuffer : fileBuffer.buffer);
+            : fileBuffer instanceof ArrayBuffer
+                ? new Uint8Array(fileBuffer)
+                : new Uint8Array(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.byteLength);
 
         await withMinerURetry("Failed to upload file to signed URL", async () => {
             const response = await fetch(url, {

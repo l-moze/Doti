@@ -31,7 +31,7 @@ export class AppErrorBoundary extends React.Component<AppErrorBoundaryProps, App
                 <div className="flex h-full min-h-[240px] flex-col items-center justify-center rounded-2xl border border-red-200 bg-red-50 px-6 text-center">
                     <p className="text-base font-semibold text-red-700">{this.props.title}</p>
                     <p className="mt-2 max-w-md text-sm text-red-600">
-                        {this.props.description || '面板发生错误，请刷新页面后重试。'}
+                        {this.props.description || '这里暂时无法显示，请刷新页面后重试。'}
                     </p>
                 </div>
             );

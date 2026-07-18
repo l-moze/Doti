@@ -11,10 +11,17 @@ import {
 } from '@/lib/translation-cache-key';
 import { ModalShell } from './modal-shell';
 
-type ExportMode = 'translation' | 'source' | 'bilingual' | 'notes' | 'bilingual-notes';
+export type ExportMode =
+    | 'translation'
+    | 'source'
+    | 'bilingual'
+    | 'notes'
+    | 'translation-notes'
+    | 'source-notes'
+    | 'bilingual-notes';
 
 function modeIncludesTranslation(mode: ExportMode): boolean {
-    return mode === 'translation' || mode === 'bilingual' || mode === 'bilingual-notes';
+    return mode === 'translation' || mode === 'bilingual' || mode === 'translation-notes' || mode === 'bilingual-notes';
 }
 
 const EXPORT_OPTIONS: Array<{
@@ -38,14 +45,20 @@ const EXPORT_OPTIONS: Array<{
     {
         mode: 'notes',
         icon: NotebookPen,
-        title: '仅导出批注',
+        title: '仅导出阅读笔记',
         description: '把你的阅读笔记整理成一份独立文档。',
+    },
+    {
+        mode: 'translation-notes',
+        icon: FileOutput,
+        title: '译文 + 阅读笔记',
+        description: '把译文和你的阅读笔记一起导出。',
     },
     {
         mode: 'bilingual-notes',
         icon: FileOutput,
-        title: '译文 + 阅读笔记',
-        description: '把译文和你的阅读笔记一起导出。',
+        title: '对照 + 阅读笔记',
+        description: '把原文、译文和阅读笔记一起导出。',
     },
 ];
 
@@ -54,6 +67,7 @@ interface ExportSheetProps {
     fileHash: string | null;
     fileName: string | null;
     open: boolean;
+    preferredMode?: ExportMode | null;
     targetLang: string;
     targetLangLabel: string;
     onClose: () => void;
@@ -64,6 +78,7 @@ export function ExportSheet({
     fileHash,
     fileName,
     open,
+    preferredMode,
     targetLang,
     targetLangLabel,
     onClose,
@@ -72,16 +87,25 @@ export function ExportSheet({
     const providerId = useTranslationStore((state) => state.providerId);
     const model = useTranslationStore((state) => state.model);
     const canExport = Boolean(fileHash);
-    const currentMode: ExportMode = currentView === 'compare'
+    const currentViewMode: ExportMode = currentView === 'compare'
         ? 'bilingual'
         : currentView === 'source'
             ? 'source'
             : 'translation';
-    const currentViewLabel = currentView === 'compare'
+    const currentMode = preferredMode ?? currentViewMode;
+    const currentViewLabel = currentMode === 'bilingual'
         ? '对照视图'
-        : currentView === 'source'
+        : currentMode === 'source'
             ? '原文视图'
-            : '译文视图';
+            : currentMode === 'notes'
+                ? '阅读笔记'
+                : currentMode === 'translation-notes'
+                    ? '译文 + 阅读笔记'
+                    : currentMode === 'source-notes'
+                        ? '原文 + 阅读笔记'
+                        : currentMode === 'bilingual-notes'
+                            ? '对照 + 阅读笔记'
+                            : '译文视图';
     const currentViewMeta = {
         label: currentViewLabel,
         translationLabel: modeIncludesTranslation(currentMode) ? targetLangLabel : null,
@@ -158,7 +182,7 @@ export function ExportSheet({
             onClose={onClose}
         >
             <div className="space-y-5 px-6 py-6">
-                <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
                     <div className="font-medium text-slate-900">{fileName || '当前文档'}</div>
                     <div className="mt-1">
                         当前视图：{currentViewMeta.label}
@@ -170,18 +194,18 @@ export function ExportSheet({
                     type="button"
                     onClick={() => openPrintPreview(currentMode)}
                     disabled={!canExport}
-                    className="flex w-full items-center justify-between gap-4 rounded-3xl bg-slate-900 px-5 py-4 text-left text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="flex w-full items-center justify-between gap-4 rounded-lg bg-slate-900 px-5 py-4 text-left text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                     <span>
                         <span className="block text-base font-semibold">导出当前视图</span>
                         <span className="mt-1 block text-sm text-slate-300">
-                            按现在的 {currentViewLabel} 生成打印预览。
+                            按现在的 {currentViewLabel} 生成导出预览。
                         </span>
                     </span>
                     <FileOutput size={20} className="shrink-0" />
                 </button>
 
-                <div className="rounded-3xl border border-slate-200 bg-white">
+                <div className="rounded-lg border border-slate-200 bg-white">
                     <button
                         type="button"
                         onClick={() => setShowMoreFormats((open) => !open)}
@@ -202,9 +226,9 @@ export function ExportSheet({
                                         type="button"
                                         onClick={() => openPrintPreview(option.mode)}
                                         disabled={!canExport}
-                                        className="rounded-2xl border border-slate-200 bg-white p-4 text-left transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                        className="rounded-lg border border-slate-200 bg-white p-4 text-left transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                                     >
-                                        <div className="mb-3 inline-flex rounded-xl bg-slate-900 p-2.5 text-white">
+                                        <div className="mb-3 inline-flex rounded-lg bg-slate-900 p-2.5 text-white">
                                             <Icon size={16} />
                                         </div>
                                         <div className="text-sm font-semibold text-slate-900">{option.title}</div>

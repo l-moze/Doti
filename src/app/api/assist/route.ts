@@ -105,8 +105,8 @@ export async function POST(request: NextRequest) {
         }
 
         const client = createLLMClient(
-            providerId || "gemini",
-            model || "gemini-2.5-flash",
+            providerId || "groq",
+            model || "llama-3.3-70b-versatile",
             providerProfile?.providerType ? providerProfile : undefined
         );
         const prompt = buildAssistPrompt({

@@ -14,6 +14,7 @@ import {
     buildMarkdownFromTranslationBlocks,
     createSingleTranslationBlock,
     createTranslationBlocksFromPlan,
+    normalizeTranslationBlockText,
     type TranslationChunkPlan,
     type TranslationMarkdownBlock,
 } from './translation-runtime';
@@ -33,15 +34,16 @@ import { clearPretextEngineCache } from './pretext';
 export type TaskStatus = 'idle' | 'uploading' | 'parsing' | 'parsed' | 'translating' | 'completed' | 'error';
 export type TranslationPhase = 'idle' | 'preparing' | 'chunking' | 'refining' | 'streaming' | 'stalled' | 'finalizing' | 'completed' | 'error';
 export type PaperPolishStatus = 'idle' | 'processing' | 'completed' | 'error' | 'cancelled';
-export type TranslationQualityPreset = 'fast' | 'balanced' | 'quality';
+export type TranslationQualityPreset = 'fast' | 'balanced' | 'quality' | 'custom';
 
 const TRANSLATION_STREAM_STALL_WARNING_MS = 45000;
 const TRANSLATION_STREAM_HARD_TIMEOUT_MS = 10 * 60 * 1000;
 const TRANSIENT_TASK_STATUSES: TaskStatus[] = ['uploading', 'parsing', 'translating'];
 const TRANSLATION_QUALITY_PRESETS: Record<TranslationQualityPreset, { providerId: string; model: string }> = {
-    fast: { providerId: 'gemini', model: 'gemini-2.5-flash' },
-    balanced: { providerId: 'gemini', model: 'gemini-2.5-flash' },
-    quality: { providerId: 'gemini', model: 'gemini-2.5-pro' },
+    fast: { providerId: 'groq', model: 'llama-3.1-8b-instant' },
+    balanced: { providerId: 'groq', model: 'llama-3.3-70b-versatile' },
+    quality: { providerId: 'groq', model: 'llama-3.3-70b-versatile' },
+    custom: { providerId: 'groq', model: 'llama-3.3-70b-versatile' },
 };
 
 export interface HistoryItem {
@@ -171,7 +173,103 @@ type PendingChunkMutation = {
 };
 
 function getErrorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : 'Unexpected error';
+    const rawMessage = error instanceof Error ? error.message : String(error || '');
+    const message = rawMessage.trim();
+    if (!message) {
+        return '操作没有完成，请稍后重试。';
+    }
+
+    return getUserFacingErrorMessage(message);
+}
+
+export function getUserFacingErrorMessage(message: string): string {
+    const normalized = message.toLowerCase();
+
+    if (normalized.includes('no file uploaded')) {
+        return '没有选择 PDF，请重新导入。';
+    }
+    if (normalized.includes('only pdf files are supported')) {
+        return '目前只支持 PDF 文件。';
+    }
+    if (normalized.includes('pdf is too large')) {
+        const sizeMatch = message.match(/(\d+)\s*mb/i);
+        return `PDF 文件太大${sizeMatch ? `，请使用 ${sizeMatch[1]}MB 以内的文件` : ''}。`;
+    }
+    if (
+        normalized.includes('mineru') ||
+        normalized.includes('upload url') ||
+        normalized.includes('zip artifact') ||
+        normalized.includes('markdown file') ||
+        normalized.includes('extraction failed') ||
+        normalized.includes('failed to extract') ||
+        normalized.includes('batch status') ||
+        normalized.includes('parsing failed') ||
+        normalized.includes('no markdown provided')
+    ) {
+        return '阅读稿整理失败，请稍后重试或重新导入 PDF。';
+    }
+    if (normalized.includes('upload failed')) {
+        return 'PDF 没有导入成功，请稍后重试。';
+    }
+    if (
+        normalized.includes('missing batchid') ||
+        normalized.includes('missing required parameters') ||
+        normalized.includes('no text provided') ||
+        normalized.includes('no content provided')
+    ) {
+        return '当前文档信息不完整，请重新打开文档或重新导入。';
+    }
+    if (
+        normalized.includes('arxiv metadata request failed') ||
+        normalized.includes('no arxiv entry') ||
+        normalized.includes('missing arxiv input') ||
+        normalized.includes('failed to import arxiv')
+    ) {
+        return '没有找到论文信息，请检查 ID 或链接。';
+    }
+    if (normalized.includes('failed to download arxiv pdf')) {
+        return '无法下载这篇论文的 PDF，请稍后再试，或手动导入 PDF。';
+    }
+    if (normalized.includes('document not found')) {
+        return '这个文档的阅读内容找不到了，请重新导入。';
+    }
+    if (normalized.includes('semantic projection')) {
+        return '段落定位暂时不可用，不影响正文阅读。';
+    }
+    if (normalized.includes('another translation job') || normalized.includes('already active')) {
+        return '这个文档正在其他窗口生成译文，请等待完成后再试。';
+    }
+    if (normalized.includes('translation already complete')) {
+        return '译文已经生成完成。';
+    }
+    if (
+        normalized.includes('partial translation') ||
+        normalized.includes('progress file') ||
+        normalized.includes('cache key')
+    ) {
+        return '之前的生成进度不可继续，请重新生成译文。';
+    }
+    if (
+        normalized.includes('rate limit') ||
+        normalized.includes('quota') ||
+        message.includes('配额') ||
+        message.includes('限流')
+    ) {
+        return '生成暂时受限，稍后可以继续生成。';
+    }
+    if (
+        normalized.includes('network') ||
+        normalized.includes('fetch failed') ||
+        normalized.includes('timeout') ||
+        message.includes('网络')
+    ) {
+        return '网络连接不稳定，请稍后重试。';
+    }
+    if (normalized.includes('internal server error') || normalized.includes('unexpected error')) {
+        return '操作没有完成，请稍后重试。';
+    }
+
+    return message;
 }
 
 function isTransientTaskStatus(status: TaskStatus): boolean {
@@ -202,13 +300,13 @@ function getRecoveredTaskStatus(input: {
 
 function getInterruptedTaskMessage(status: TaskStatus): string | null {
     if (status === 'translating') {
-        return '上次翻译已中断，已切换为可恢复状态。';
+        return '上次生成译文没有完成，可以继续生成。';
     }
     if (status === 'parsing') {
-        return '上次解析未正常结束，请重新发起解析。';
+        return '上次整理阅读稿没有完成，请重新导入或继续整理。';
     }
     if (status === 'uploading') {
-        return '上次上传未完成，请重新上传文件。';
+        return '上次导入没有完成，请重新导入 PDF。';
     }
     return null;
 }
@@ -250,30 +348,27 @@ function localizeTranslationStatus(message: unknown, concurrency: number): strin
     if (typeof message !== 'string' || !message.trim()) return '准备中...';
 
     if (message.startsWith('Chunking document')) {
-        return '正在拆分文档...';
+        return '正在整理译文结构...';
     }
 
     if (message.startsWith('Loading from Cache')) {
-        return '正在载入缓存译文...';
+        return '正在恢复已有译文...';
     }
 
     if (message.startsWith('Resuming from chunk')) {
-        return message.replace('Resuming from chunk', '正在从分块继续恢复');
+        return '正在接着生成译文...';
     }
 
     if (message.startsWith('Refining: ')) {
-        return `正在整理上下文 · ${message.slice('Refining: '.length)}`;
+        return `正在整理这一段 · ${message.slice('Refining: '.length)}`;
     }
 
     if (message.startsWith('Translating: ')) {
-        const label = concurrency > 1 ? `并发 ${concurrency} 路翻译` : '正在翻译';
-        return `${label} · ${message.slice('Translating: '.length)}`;
+        return `正在生成译文 · ${message.slice('Translating: '.length)}`;
     }
 
     if (message.startsWith('Parallel batch ')) {
-        return message
-            .replace('Parallel batch ', '并发批次 ')
-            .replace(' agents', ' 路 worker');
+        return '正在生成多段译文...';
     }
 
     if (message.startsWith('Skipping reference section')) {
@@ -542,7 +637,7 @@ export const useTranslationStore = create<TranslationState>()(
                     { progress: 33, message: '正在整理标题、列表与空行...' },
                     { progress: 56, message: '正在合并跨页与图表打断片段...' },
                     { progress: 74, message: '正在重建伪代码与结构块...' },
-                    { progress: 84, message: '正在等待模型返回整理结果...' },
+                    { progress: 84, message: '正在完成难处理段落的整理...' },
                 ];
                 let pointer = 0;
 
@@ -723,10 +818,10 @@ export const useTranslationStore = create<TranslationState>()(
             layoutUrl: null,
             layoutJsonUrl: null,
             translationQualityPreset: 'balanced',
-            providerId: 'gemini',
-            model: 'gemini-2.5-flash',
-            assistProviderId: 'gemini',
-            assistModel: 'gemini-2.5-flash',
+            providerId: 'groq',
+            model: 'llama-3.3-70b-versatile',
+            assistProviderId: 'groq',
+            assistModel: 'llama-3.3-70b-versatile',
             translationStatus: '',
             translationPhase: 'idle',
             translationLastEventAt: null,
@@ -807,7 +902,7 @@ export const useTranslationStore = create<TranslationState>()(
                     paperPolishStatus: 'processing',
                     paperPolishMode: mode,
                     paperPolishProgress: mode === 'light' ? 18 : 8,
-                    paperPolishMessage: mode === 'light' ? '正在基于结构信息快速修复...' : '正在对疑难窗口执行 AI 深修...',
+                    paperPolishMessage: mode === 'light' ? '正在整理阅读稿格式...' : '正在修复难处理的段落...',
                     paperPolishSummary: [],
                     paperPolishIssues: [],
                     paperPolishResidualIssues: mode === 'deep' ? current.paperPolishResidualIssues : [],
@@ -851,7 +946,7 @@ export const useTranslationStore = create<TranslationState>()(
                     });
                     const data = await response.json() as PaperPolishApiResponse;
                     if (!response.ok) {
-                        throw new Error(data.error || 'PaperPolish 执行失败');
+                        throw new Error(data.error || '阅读稿整理失败');
                     }
 
                     const result = {
@@ -879,7 +974,7 @@ export const useTranslationStore = create<TranslationState>()(
                         paperPolishMode: mode,
                         paperPolishProgress: 100,
                         paperPolishMessage: mode === 'deep'
-                            ? (sourceChanged ? 'AI 深修完成' : 'AI 深修未改动正文')
+                            ? (sourceChanged ? '难处理的段落已修复' : '正文已保持原样')
                             : result.canUseAiFallback
                                 ? `本地结构修复完成，发现 ${result.issueWindows.length} 处疑难结构`
                                 : (sourceChanged ? '本地结构修复完成' : '正文结构已较稳定'),
@@ -979,7 +1074,7 @@ export const useTranslationStore = create<TranslationState>()(
                     paperPolishRevealKey: sourceChanged
                         ? state.paperPolishRevealKey + 1
                         : state.paperPolishRevealKey,
-                    translationStatus: snapshot.status === 'translating' ? '翻译已中断' : '',
+                    translationStatus: snapshot.status === 'translating' ? '生成译文没有完成' : '',
                     translationPhase: snapshot.status === 'translating' ? 'stalled' : 'idle',
                     translationLastEventAt: snapshot.status === 'translating' ? Date.now() : null,
                 }));
@@ -1154,7 +1249,7 @@ export const useTranslationStore = create<TranslationState>()(
                         status: recoveredStatus,
                         progress: recoveredStatus === 'completed' ? 100 : item.progress,
                         error: isTransientTaskStatus(item.status) ? getInterruptedTaskMessage(item.status) : null,
-                        translationStatus: item.status === 'translating' ? '翻译已中断' : '',
+                        translationStatus: item.status === 'translating' ? '生成译文没有完成' : '',
                         translationPhase: item.status === 'translating' ? 'stalled' : 'idle',
                         translationLastEventAt: item.status === 'translating' ? Date.now() : null,
                     });
@@ -1272,7 +1367,7 @@ export const useTranslationStore = create<TranslationState>()(
                             status: recoveredStatus,
                             progress: recoveredStatus === 'completed' ? 100 : current.progress,
                             error: recoveredMessage,
-                            translationStatus: current.status === 'translating' ? '翻译已中断' : '',
+                            translationStatus: current.status === 'translating' ? '生成译文没有完成' : '',
                             translationPhase: current.status === 'translating' ? 'stalled' : 'idle',
                             translationLastEventAt: current.status === 'translating' ? Date.now() : null,
                         });
@@ -1301,12 +1396,21 @@ export const useTranslationStore = create<TranslationState>()(
 
             setProvider: (providerId, model) => {
                 const previous = get();
+                if (previous.providerId === providerId && previous.model === model) return;
+
                 const fallbackStatus = previous.sourceMarkdown.trim() ? 'parsed' : previous.status;
                 const fallbackProgress = previous.sourceMarkdown.trim() ? 60 : previous.progress;
+                const matchedPreset = (Object.entries(TRANSLATION_QUALITY_PRESETS) as Array<[TranslationQualityPreset, { providerId: string; model: string }]>)
+                    .find(([preset, config]) => (
+                        preset !== 'custom' &&
+                        config.providerId === providerId &&
+                        config.model === model
+                    ))?.[0] ?? 'custom';
 
                 set((state) => ({
                     providerId,
                     model,
+                    translationQualityPreset: matchedPreset,
                     ...(state.status === 'translating'
                         ? {}
                         : {
@@ -1358,6 +1462,10 @@ export const useTranslationStore = create<TranslationState>()(
             },
 
             setTranslationQualityPreset: (preset) => {
+                const current = get();
+                if (preset === 'custom') return;
+                if (current.translationQualityPreset === preset) return;
+
                 const nextPreset = TRANSLATION_QUALITY_PRESETS[preset];
                 set({ translationQualityPreset: preset });
                 get().setProvider(nextPreset.providerId, nextPreset.model);
@@ -1867,7 +1975,7 @@ export const useTranslationStore = create<TranslationState>()(
                                 fileUrl: originalPdfUrl || get().fileUrl,
                                 activeFileName: activeFileName || file?.name || null,
                                 status: 'error',
-                                error: data.error || 'Parsing failed',
+                                error: getUserFacingErrorMessage(data.error || 'Parsing failed'),
                                 progress: 0,
                             });
                             const current = get();
@@ -2017,7 +2125,7 @@ export const useTranslationStore = create<TranslationState>()(
 
                 set({
                     status: 'error',
-                    error: '当前任务没有可恢复的解析批次，请重新上传 PDF 或重新导入 arXiv。',
+                    error: '当前没有可继续的整理进度，请重新导入 PDF 或论文。',
                 });
             },
 
@@ -2073,8 +2181,8 @@ export const useTranslationStore = create<TranslationState>()(
                     translationBlocks: [],
                     translationRunId: requestedJobId,
                     translationStatus: resume
-                        ? '正在恢复翻译任务...'
-                        : (forceFresh ? '正在清理旧译文并重新翻译...' : '准备翻译任务...'),
+                        ? '正在接着生成译文...'
+                        : (forceFresh ? '正在重新生成译文...' : '正在准备译文...'),
                     translationPhase: 'preparing',
                     translationLastEventAt: Date.now(),
                     translationConcurrency: 1,
@@ -2206,7 +2314,7 @@ export const useTranslationStore = create<TranslationState>()(
                             if (blockIndex >= 0) {
                                 const currentBlock = nextBlocks[blockIndex];
                                 const nextText = mutation.mode === 'replace'
-                                    ? mutation.text
+                                    ? normalizeTranslationBlockText(mutation.text)
                                     : currentBlock.text + mutation.text;
 
                                 if (
@@ -2288,7 +2396,7 @@ export const useTranslationStore = create<TranslationState>()(
                     stallWarningTimer = setTimeout(() => {
                         set((state) => ({
                             translationStatus: state.status === 'translating'
-                                ? `翻译耗时较长（>${Math.round(TRANSLATION_STREAM_STALL_WARNING_MS / 1000)} 秒），仍在等待模型返回...`
+                                ? `生成译文耗时较长（>${Math.round(TRANSLATION_STREAM_STALL_WARNING_MS / 1000)} 秒），仍在继续...`
                                 : state.translationStatus,
                             translationLastEventAt: Date.now(),
                         }));
@@ -2337,9 +2445,9 @@ export const useTranslationStore = create<TranslationState>()(
                     if (!response.ok) {
                         try {
                             const errorData = await response.json();
-                            throw new Error(errorData.error || 'Translation failed');
+                            throw new Error(errorData.error || '生成译文失败');
                         } catch {
-                            throw new Error('Translation failed');
+                            throw new Error('生成译文失败');
                         }
                     }
 
@@ -2347,7 +2455,7 @@ export const useTranslationStore = create<TranslationState>()(
                     const decoder = new TextDecoder('utf-8');
 
                     if (!reader) {
-                        throw new Error('Translation stream is unavailable');
+                        throw new Error('译文生成暂时无法开始');
                     }
 
                     let buffer = "";
@@ -2390,8 +2498,8 @@ export const useTranslationStore = create<TranslationState>()(
                                             translationConcurrency: concurrency,
                                             translationPhase: plannedBlocks.length > 0 ? 'chunking' : 'preparing',
                                             translationStatus: plannedBlocks.length > 0
-                                                ? `已拆分 ${plannedBlocks.length} 段，准备${concurrency > 1 ? `并发 ${concurrency} 路翻译` : '进入翻译'}`
-                                                : '准备翻译任务...',
+                                                ? `已整理 ${plannedBlocks.length} 段，开始生成译文`
+                                                : '正在准备译文...',
                                             translationLastEventAt: Date.now(),
                                         });
                                         break;
@@ -2419,7 +2527,7 @@ export const useTranslationStore = create<TranslationState>()(
                                             };
                                         });
                                         markTranslationActivity({
-                                            translationStatus: '已恢复历史分块，继续翻译中...',
+                                            translationStatus: '已恢复进度，继续生成译文...',
                                             translationPhase: 'refining',
                                         });
                                         break;
@@ -2438,7 +2546,7 @@ export const useTranslationStore = create<TranslationState>()(
                                                     : block
                                             )),
                                             translationStatus: data.title
-                                                ? `${state.translationConcurrency > 1 ? `并发 ${state.translationConcurrency} 路翻译` : '正在翻译'} · ${data.title}`
+                                                ? `正在生成译文 · ${data.title}`
                                                 : state.translationStatus,
                                             translationPhase: 'streaming',
                                             translationLastEventAt: Date.now(),
@@ -2480,7 +2588,7 @@ export const useTranslationStore = create<TranslationState>()(
                                                     block.id === chunkId
                                                         ? {
                                                             ...block,
-                                                            text: typeof data.text === 'string' ? data.text : block.text,
+                                                            text: typeof data.text === 'string' ? normalizeTranslationBlockText(data.text) : normalizeTranslationBlockText(block.text),
                                                             state: block.state === 'cached' ? 'cached' as const : 'streaming' as const,
                                                         }
                                                         : block
@@ -2491,7 +2599,7 @@ export const useTranslationStore = create<TranslationState>()(
                                             return {
                                                 translationBlocks: nextBlocks,
                                                 translationStatus: issueCount > 0
-                                                    ? `已自动修复当前分块的 ${issueCount} 处结构问题`
+                                                    ? `已修复当前段落的 ${issueCount} 处格式问题`
                                                     : state.translationStatus,
                                                 translationPhase: 'streaming',
                                                 translationLastEventAt: Date.now(),
@@ -2505,14 +2613,18 @@ export const useTranslationStore = create<TranslationState>()(
                                         set((state) => {
                                             const nextBlocks: TranslationMarkdownBlock[] = state.translationBlocks.map((block) => (
                                                 block.id === data.chunkId
-                                                    ? { ...block, state: data.state === 'cached' ? 'cached' as const : 'completed' as const }
+                                                    ? {
+                                                        ...block,
+                                                        text: normalizeTranslationBlockText(block.text),
+                                                        state: data.state === 'cached' ? 'cached' as const : 'completed' as const,
+                                                    }
                                                     : block
                                             ));
                                             const completedCount = nextBlocks.filter((block) => block.state === 'completed' || block.state === 'cached').length;
 
                                             return {
                                                 translationBlocks: nextBlocks,
-                                                translationStatus: `已完成 ${completedCount}/${nextBlocks.length} 段`,
+                                                translationStatus: `已生成 ${completedCount}/${nextBlocks.length} 段`,
                                                 translationPhase: 'streaming',
                                                 translationLastEventAt: Date.now(),
                                             };
@@ -2547,7 +2659,7 @@ export const useTranslationStore = create<TranslationState>()(
                                         clearTranslationFlushTimers();
                                         const conflictMessage = typeof data.message === 'string' && data.message.trim()
                                             ? data.message
-                                            : '相同配置的翻译任务已在其他标签页运行，请等待当前任务结束后再试。';
+                                            : '这个文档正在其他窗口生成译文，请等待完成后再试。';
                                         const conflictJobId = typeof data.activeJob?.jobId === 'string'
                                             ? data.activeJob.jobId
                                             : null;
@@ -2558,7 +2670,7 @@ export const useTranslationStore = create<TranslationState>()(
                                             error: conflictMessage,
                                             progress: errorProgress,
                                             translationRunId: conflictJobId,
-                                            translationStatus: '已有同配置翻译任务正在运行',
+                                            translationStatus: '这个文档正在其他窗口生成译文',
                                             translationPhase: 'stalled',
                                             translationLastEventAt: Date.now(),
                                         });
@@ -2570,7 +2682,7 @@ export const useTranslationStore = create<TranslationState>()(
                                         {
                                         const rawMessage = typeof data.message === 'string' && data.message.trim()
                                             ? data.message
-                                            : '翻译失败';
+                                            : '生成译文失败';
                                         const isRateLimited = isRateLimitErrorMessage(rawMessage);
                                         const errorProgress = clampErrorProgress(get().progress);
                                         sawTerminalEvent = true;
@@ -2578,11 +2690,11 @@ export const useTranslationStore = create<TranslationState>()(
                                         clearTranslationFlushTimers();
                                         set({
                                             status: 'error',
-                                            error: rawMessage,
+                                            error: getUserFacingErrorMessage(rawMessage),
                                             progress: errorProgress,
                                             translationStatus: isRateLimited
-                                                ? '触发速率限制，翻译已暂停，可点击继续翻译'
-                                                : '翻译失败',
+                                                ? '生成暂时受限，可点击继续生成'
+                                                : '生成译文失败',
                                             translationPhase: isRateLimited ? 'stalled' : 'error',
                                             translationLastEventAt: Date.now(),
                                         });
@@ -2593,7 +2705,7 @@ export const useTranslationStore = create<TranslationState>()(
                                             set((state) => (
                                                 state.status === 'error'
                                                     ? {
-                                                        translationStatus: `速率受限（429），已暂停在 ${state.resumableTranslation?.percentage ?? errorProgress}%`,
+                                                        translationStatus: `生成暂时受限，已暂停在 ${state.resumableTranslation?.percentage ?? errorProgress}%`,
                                                         translationPhase: 'stalled' as const,
                                                     }
                                                     : state
@@ -2613,8 +2725,8 @@ export const useTranslationStore = create<TranslationState>()(
 
                     if (!sawTerminalEvent) {
                         const message = hardTimeoutTriggered
-                            ? `翻译流长时间未返回数据（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已自动终止，请重试。`
-                            : '翻译流意外中断，未收到完成信号，请重试。';
+                            ? `生成译文长时间没有进展（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已暂停，请重试。`
+                            : '生成译文中断，请重试。';
                         const errorProgress = clampErrorProgress(get().progress);
                         const isRateLimited = isRateLimitErrorMessage(message);
 
@@ -2623,8 +2735,8 @@ export const useTranslationStore = create<TranslationState>()(
                             error: message,
                             progress: errorProgress,
                             translationStatus: hardTimeoutTriggered
-                                ? '翻译流超时'
-                                : (isRateLimited ? '触发速率限制，翻译已暂停' : '翻译连接已断开'),
+                                ? '生成译文已暂停'
+                                : (isRateLimited ? '生成暂时受限，已暂停' : '生成译文已中断'),
                             translationPhase: hardTimeoutTriggered || isRateLimited ? 'stalled' : 'error',
                             translationLastEventAt: Date.now(),
                         });
@@ -2644,8 +2756,8 @@ export const useTranslationStore = create<TranslationState>()(
                     clearTranslationFlushTimers();
                     const isAbort = e instanceof DOMException && e.name === 'AbortError';
                     const message = hardTimeoutTriggered
-                        ? `翻译流长时间未返回数据（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已自动终止，请重试。`
-                        : (isAbort ? '翻译请求已中止。' : getErrorMessage(e));
+                        ? `生成译文长时间没有进展（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已暂停，请重试。`
+                        : (isAbort ? '生成译文已停止。' : getErrorMessage(e));
                     const isRateLimited = isRateLimitErrorMessage(message);
                     const errorProgress = clampErrorProgress(get().progress);
 
@@ -2654,8 +2766,8 @@ export const useTranslationStore = create<TranslationState>()(
                         error: message,
                         progress: errorProgress,
                         translationStatus: hardTimeoutTriggered
-                            ? '翻译流超时'
-                            : (isRateLimited ? '触发速率限制，翻译已暂停' : '翻译失败'),
+                            ? '生成译文已暂停'
+                            : (isRateLimited ? '生成暂时受限，已暂停' : '生成译文失败'),
                         translationPhase: hardTimeoutTriggered || isRateLimited ? 'stalled' : 'error',
                         translationLastEventAt: Date.now(),
                     });
@@ -2665,8 +2777,8 @@ export const useTranslationStore = create<TranslationState>()(
                     if (isRateLimited && canResume) {
                         set((state) => (
                             state.status === 'error'
-                                ? {
-                                    translationStatus: `速率受限（429），已暂停在 ${state.resumableTranslation?.percentage ?? errorProgress}%`,
+                                    ? {
+                                    translationStatus: `生成暂时受限，已暂停在 ${state.resumableTranslation?.percentage ?? errorProgress}%`,
                                     translationPhase: 'stalled' as const,
                                 }
                                 : state

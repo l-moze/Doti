@@ -355,7 +355,7 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                     <div className="flex items-center gap-2">
                         <label
                             className={`flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border text-slate-600 transition-colors hover:bg-slate-100 ${showLayout ? 'border-primary bg-primary/10 text-primary' : 'border-transparent'}`}
-                            title="显示结构定位层"
+                            title="显示段落定位"
                         >
                             <input
                                 type="checkbox"
@@ -364,7 +364,7 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                                 className="sr-only"
                             />
                             <Layers size={14} />
-                            <span className="sr-only">显示结构定位层</span>
+                            <span className="sr-only">显示段落定位</span>
                         </label>
                     </div>
                 )}
@@ -395,7 +395,7 @@ export function PDFViewer({ projection = null }: { projection?: DocumentSemantic
                         }
                         error={
                             <div className="flex flex-col items-center justify-center p-8 text-center h-full">
-                                <p className="text-red-500 font-medium mb-2">PDF 加载失败</p>
+                                <p className="text-red-500 font-medium mb-2">PDF 预览暂时无法显示</p>
                             </div>
                         }
                     >

@@ -90,7 +90,7 @@ function FigureBlock({
     if (block.children.length > 0) {
         return (
             <figure
-                className={`not-prose flex flex-col gap-4 rounded-3xl transition ${figureFrameClassName}`.trim()}
+                className={`not-prose flex flex-col gap-4 rounded-lg transition ${figureFrameClassName}`.trim()}
                 data-doti-figure-group="true"
                 data-semantic-active={blockHighlighted || childHighlighted ? 'true' : undefined}
             >
@@ -102,7 +102,7 @@ function FigureBlock({
                 </div>
                 {block.captionText ? (
                     <figcaption
-                        className={`rounded-2xl border px-4 py-3 text-sm leading-6 transition ${
+                    className={`rounded-lg border px-4 py-3 text-sm leading-6 transition ${
                             blockHighlighted || childHighlighted
                                 ? 'border-sky-200 bg-sky-50/80 text-slate-800'
                                 : 'border-slate-200 bg-white text-slate-700'
@@ -117,7 +117,7 @@ function FigureBlock({
 
     return (
         <figure
-            className={`not-prose flex flex-col gap-3 rounded-3xl border p-4 transition ${
+            className={`not-prose flex flex-col gap-3 rounded-lg border p-4 transition ${
                 blockHighlighted
                     ? 'border-sky-300 bg-sky-50/80 shadow-[0_0_0_3px_rgba(56,189,248,0.15)]'
                     : 'border-slate-200 bg-slate-50/70'
@@ -128,7 +128,7 @@ function FigureBlock({
                 <img
                     src={block.assetPath}
                     alt={block.captionText || ''}
-                    className="w-full rounded-2xl border border-slate-200 bg-white object-contain"
+                    className="w-full rounded-lg border border-slate-200 bg-white object-contain"
                     loading="lazy"
                 />
             ) : null}
@@ -176,7 +176,7 @@ function StructuredSourceViewComponent({ projection, className, highlightedBlock
         <div className={`markdown-body ${className || ''}`.trim()}>
             {loadFailed ? (
                 <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-                    Markdown 渲染模块热更新失败，当前已退回稳定渲染模式。刷新页面后会恢复完整富文本能力。
+                    阅读内容暂时使用简化显示。刷新页面后会恢复完整排版。
                 </div>
             ) : null}
 
@@ -193,9 +193,9 @@ function StructuredSourceViewComponent({ projection, className, highlightedBlock
                         data-semantic-active={blockHighlighted || childHighlighted ? 'true' : undefined}
                         className={`${blockWrapperClassName(block)} transition ${
                             blockHighlighted
-                                ? 'rounded-3xl bg-sky-50/60'
+                                ? 'rounded-lg bg-sky-50/60'
                                 : childHighlighted
-                                    ? 'rounded-3xl bg-slate-50/80'
+                                    ? 'rounded-lg bg-slate-50/80'
                                     : ''
                         }`.trim()}
                     >
