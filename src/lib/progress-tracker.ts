@@ -15,7 +15,7 @@ import {
     buildTranslationCacheKey,
     type TranslationCacheKeyInput,
 } from "@/lib/translation-cache-key";
-import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { assertSafeFileHash, getUploadsRoot } from "@/lib/server/runtime-paths";
 import { normalizeTranslationBlockText } from "@/lib/translation-runtime";
 
 const ACTIVE_TRANSLATION_JOB_STALE_MS = 15 * 60 * 1000;
@@ -92,12 +92,12 @@ export class ProgressTracker {
     private currentJobId: string | null;
 
     constructor(cacheIdentity: TranslationCacheKeyInput, jobId?: string) {
-        this.fileHash = cacheIdentity.fileHash;
+        this.fileHash = assertSafeFileHash(cacheIdentity.fileHash);
         this.cacheKey = buildTranslationCacheKey(cacheIdentity);
         this.targetLang = cacheIdentity.targetLang;
         this.currentJobId = jobId || null;
         this.uploadsRoot = getUploadsRoot();
-        this.fileDir = path.join(this.uploadsRoot, cacheIdentity.fileHash);
+        this.fileDir = path.join(this.uploadsRoot, this.fileHash);
         this.artifactBaseName = buildTranslationArtifactBaseName(cacheIdentity);
         this.activeJobPath = path.join(this.fileDir, `${this.artifactBaseName}.active-job.json`);
         this.progressPath = path.join(this.fileDir, `${this.artifactBaseName}.progress.json`);

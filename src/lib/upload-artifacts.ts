@@ -1,6 +1,6 @@
 import { readFile, readdir, stat } from "fs/promises";
 import path from "path";
-import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { getUploadsRoot, isSafeFileHash } from "@/lib/server/runtime-paths";
 
 export interface UploadArtifactPaths {
     contentListRelativePath: string | null;
@@ -43,6 +43,10 @@ async function walkRelativeFiles(
 }
 
 export function resolveUploadDir(fileHash: string): string | null {
+    if (!isSafeFileHash(fileHash)) {
+        return null;
+    }
+
     const uploadsRoot = path.resolve(getUploadsRoot());
     const uploadDir = path.resolve(uploadsRoot, fileHash);
 

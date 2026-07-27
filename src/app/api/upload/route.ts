@@ -15,10 +15,15 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const PDF_SIGNATURE = Buffer.from("%PDF-", "ascii");
 
 function getMaxPdfUploadBytes(): number {
     const parsed = Number.parseInt(process.env.MAX_PDF_UPLOAD_BYTES || "", 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
+}
+
+function hasPdfSignature(arrayBuffer: ArrayBuffer): boolean {
+    return Buffer.from(arrayBuffer.slice(0, PDF_SIGNATURE.length)).equals(PDF_SIGNATURE);
 }
 
 export async function POST(request: NextRequest) {
@@ -46,6 +51,11 @@ export async function POST(request: NextRequest) {
 
         // 读取文件内容并计算哈希
         const arrayBuffer = await file.arrayBuffer();
+
+        if (!hasPdfSignature(arrayBuffer)) {
+            return NextResponse.json({ error: "Only PDF files are supported" }, { status: 400 });
+        }
+
         const fileHash = computeFileHash(arrayBuffer);
 
         // Check for existing files in uploads/[hash]

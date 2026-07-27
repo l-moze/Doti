@@ -9,7 +9,7 @@ import {
 import { grantFileHashAccess } from "@/lib/media-session";
 import { normalizeMarkdownMathForDisplay } from "@/lib/markdown-normalizer";
 import { findUploadArtifactPaths, readTextFileIfExists } from "@/lib/upload-artifacts";
-import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { isSafeFileHash, resolveUploadDir } from "@/lib/server/runtime-paths";
 import JSZip from "jszip";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
@@ -275,6 +275,10 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ error: "Missing batchId" }, { status: 400 });
     }
 
+    if (!isSafeFileHash(batchId) || (fileHash !== null && !isSafeFileHash(fileHash))) {
+        return NextResponse.json({ error: "Invalid batchId or fileHash" }, { status: 400 });
+    }
+
     const apiKey = process.env.MINERU_API_KEY;
     if (!apiKey) {
         return NextResponse.json({ error: "Server misconfigured: MINERU_API_KEY missing" }, { status: 500 });
@@ -302,8 +306,11 @@ export async function GET(request: NextRequest) {
 
         if (fileResult.state === "done") {
             const safeHash = fileHash || batchId;
-            const uploadsRoot = getUploadsRoot();
-            const uploadDir = path.join(uploadsRoot, safeHash);
+            const uploadDir = resolveUploadDir(safeHash);
+
+            if (!uploadDir) {
+                return NextResponse.json({ error: "Invalid batchId or fileHash" }, { status: 400 });
+            }
 
             await mkdir(uploadDir, { recursive: true });
 
