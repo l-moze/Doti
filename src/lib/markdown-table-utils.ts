@@ -668,7 +668,7 @@ export function applySoftGlossaryCorrections(
 
         let next = segment;
         for (const term of normalizedTerms) {
-            next = next.replace(buildTermMatchPattern(term.source), term.target);
+            next = next.replace(buildTermMatchPattern(term.source), () => term.target);
         }
         return next;
     });
@@ -690,7 +690,7 @@ export function restorePreservedMarkdownFragments(
             `(?<![A-Z0-9_])@{0,2}\\s*${escapeRegExp(body)}\\s*@{0,2}(?![A-Z0-9_])`,
             "gi"
         );
-        let next = nextRestored.replace(tolerantMarkerPattern, fragment.content);
+        let next = nextRestored.replace(tolerantMarkerPattern, () => fragment.content);
         next = next.split(fragment.marker).join(fragment.content);
         return next;
     }, markdown);
