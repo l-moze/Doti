@@ -226,7 +226,11 @@ export function useMarkdownRuntime(): MarkdownRuntimeState {
                 if (cancelled) return;
                 setRuntimeModules(nextRuntimeModules);
                 setLoadFailed(false);
-            } catch {
+            } catch (loadError) {
+                console.error(
+                    `[MarkdownRuntime] Failed to load runtime modules (attempt ${attemptIndex + 1}/${LOAD_RETRY_DELAYS.length}):`,
+                    loadError
+                );
                 if (cancelled) return;
 
                 if (attemptIndex >= LOAD_RETRY_DELAYS.length - 1) {

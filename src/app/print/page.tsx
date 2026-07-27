@@ -30,7 +30,8 @@ async function resolveMediaUrl(fileHash: string, relativePath: string): Promise<
         if (!response.ok) return null;
         const data = await response.json();
         return typeof data?.url === 'string' ? data.url : null;
-    } catch {
+    } catch (error) {
+        console.warn('[Print] Failed to resolve media URL:', relativePath, error);
         return null;
     }
 }
@@ -87,7 +88,8 @@ function PrintPageContent() {
                     try {
                         const response = await fetch(sourceUrl);
                         setSourceMarkdown(response.ok ? await response.text() : '');
-                    } catch {
+                    } catch (error) {
+                        console.warn('[Print] Failed to load source markdown:', error);
                         setSourceMarkdown('');
                     }
                 } else {
@@ -118,8 +120,9 @@ function PrintPageContent() {
                     if (!response.ok) continue;
                     setTargetMarkdown(await response.text());
                     return;
-                } catch {
-                    // Try next candidate.
+                } catch (error) {
+                    // Try next candidate, but keep the failure visible for diagnostics.
+                    console.warn('[Print] Failed to load translation candidate:', candidate, error);
                 }
             }
 

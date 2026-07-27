@@ -2443,12 +2443,14 @@ export const useTranslationStore = create<TranslationState>()(
                     });
 
                     if (!response.ok) {
+                        let serverMessage = '';
                         try {
                             const errorData = await response.json();
-                            throw new Error(errorData.error || '生成译文失败');
-                        } catch {
-                            throw new Error('生成译文失败');
+                            serverMessage = typeof errorData?.error === 'string' ? errorData.error.trim() : '';
+                        } catch (parseError) {
+                            console.warn('[Translation] Failed to parse error response:', parseError);
                         }
+                        throw new Error(serverMessage || `生成译文失败（HTTP ${response.status}）`);
                     }
 
                     const reader = response.body?.getReader();
@@ -2479,11 +2481,18 @@ export const useTranslationStore = create<TranslationState>()(
                         for (const event of events) {
                             if (!event.startsWith('data: ')) continue;
                             const jsonStr = event.substring(6);
+                            if (!isActiveRequest()) {
+                                break;
+                            }
+
+                            let data;
                             try {
-                                if (!isActiveRequest()) {
-                                    break;
-                                }
-                                const data = JSON.parse(jsonStr);
+                                data = JSON.parse(jsonStr);
+                            } catch (parseError) {
+                                console.error('[Translation] Skipped malformed SSE event:', parseError, jsonStr.slice(0, 200));
+                                continue;
+                            }
+
                                 switch (data.type) {
                                     case 'run_started': {
                                         const plannedBlocks = Array.isArray(data.chunks)
@@ -2714,9 +2723,6 @@ export const useTranslationStore = create<TranslationState>()(
                                         break;
                                         }
                                 }
-                            } catch (e) {
-                                console.error('Error parsing SSE event:', e);
-                            }
                         }
                     }
 

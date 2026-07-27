@@ -9,11 +9,13 @@ const getCacheDir = () => getPdfParseCacheDir();
  * 确保缓存目录存在
  */
 async function ensureCacheDir(): Promise<void> {
-    try {
-        await fs.mkdir(getCacheDir(), { recursive: true });
-    } catch {
-        // 目录已存在，忽略错误
-    }
+    // recursive mkdir 对已存在目录不会抛错，其余错误（权限、磁盘）必须向上传递
+    await fs.mkdir(getCacheDir(), { recursive: true });
+}
+
+function isMissingEntryError(error: unknown): boolean {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR";
 }
 
 /**
@@ -55,7 +57,10 @@ export async function hasCache(hash: string): Promise<boolean> {
     try {
         await fs.access(getCachePath(hash));
         return true;
-    } catch {
+    } catch (error) {
+        if (!isMissingEntryError(error)) {
+            throw error;
+        }
         return false;
     }
 }
@@ -67,7 +72,10 @@ export async function getCache(hash: string): Promise<string | null> {
     try {
         const content = await fs.readFile(getCachePath(hash), "utf-8");
         return content;
-    } catch {
+    } catch (error) {
+        if (!isMissingEntryError(error)) {
+            throw error;
+        }
         return null;
     }
 }
@@ -103,7 +111,10 @@ export async function getCacheMeta(hash: string): Promise<CacheMeta | null> {
     try {
         const content = await fs.readFile(getMetaPath(hash), "utf-8");
         return JSON.parse(content);
-    } catch {
+    } catch (error) {
+        if (!isMissingEntryError(error)) {
+            console.error("[Cache] Failed to read cache metadata:", hash, error);
+        }
         return null;
     }
 }
@@ -123,12 +134,16 @@ export async function listAllCaches(): Promise<CacheMeta[]> {
             try {
                 const content = await fs.readFile(path.join(cacheDir, file), "utf-8");
                 metas.push(JSON.parse(content));
-            } catch {
-                // 跳过损坏的元数据文件
+            } catch (error) {
+                // 跳过损坏的元数据文件，但记录原因
+                console.warn("[Cache] Skipped unreadable cache metadata:", file, error);
             }
         }
         return metas;
-    } catch {
+    } catch (error) {
+        if (!isMissingEntryError(error)) {
+            throw error;
+        }
         return [];
     }
 }
@@ -137,22 +152,23 @@ export async function listAllCaches(): Promise<CacheMeta[]> {
  * 清除指定缓存
  */
 export async function deleteCache(hash: string): Promise<void> {
-    try {
-        await fs.unlink(getCachePath(hash));
-        await fs.unlink(getMetaPath(hash));
-    } catch {
-        // 文件不存在，忽略
-    }
+    await Promise.all([getCachePath(hash), getMetaPath(hash)].map(async (filePath) => {
+        try {
+            await fs.unlink(filePath);
+        } catch (error) {
+            // 文件不存在时视为已删除，其余错误向上传递
+            if (!isMissingEntryError(error)) {
+                throw error;
+            }
+        }
+    }));
 }
 
 /**
  * 清除所有缓存
  */
 export async function clearAllCaches(): Promise<void> {
-    try {
-        await fs.rm(getCacheDir(), { recursive: true, force: true });
-        await ensureCacheDir();
-    } catch {
-        // 目录不存在或删除失败，忽略
-    }
+    // force: true 已忽略“目录不存在”，删除失败必须让调用方知道
+    await fs.rm(getCacheDir(), { recursive: true, force: true });
+    await ensureCacheDir();
 }

@@ -79,14 +79,17 @@ export async function GET(request: NextRequest) {
                 const meta: CacheMeta = JSON.parse(metaContent);
                 fileName = meta.originalFilename || fileName;
                 createdAt = new Date(meta.createdAt).getTime();
-            } catch {
-                // 元数据文件不存在，尝试从目录内容推断
-                // 或者使用目录修改时间
+            } catch (metaError) {
+                // 元数据文件不存在或损坏，退回到目录修改时间
+                if ((metaError as NodeJS.ErrnoException).code !== "ENOENT") {
+                    console.warn("[History API] Failed to read cache metadata:", metaPath, metaError);
+                }
+
                 try {
                     const stat = await fs.stat(uploadPath);
                     createdAt = stat.mtimeMs;
-                } catch {
-                    // 忽略
+                } catch (statError) {
+                    console.warn("[History API] Failed to stat upload directory:", uploadPath, statError);
                 }
             }
 
@@ -136,8 +139,9 @@ export async function GET(request: NextRequest) {
                 layoutJsonUrl = nestedLayoutJsonPath ? buildMediaDeliveryUrl(fileHash, nestedLayoutJsonPath) : null;
                 layoutUrl = nestedLayoutPdfPath ? buildMediaDeliveryUrl(fileHash, nestedLayoutPdfPath) : null;
                 // 否则保持 parsing 状态（可能是中断的任务）
-            } catch {
-                // 无法读取目录，标记为错误
+            } catch (scanError) {
+                // 无法读取目录，标记为错误并记录原因，避免整页历史失败
+                console.error("[History API] Failed to scan upload directory:", uploadPath, scanError);
                 status = 'error';
                 progress = 0;
             }

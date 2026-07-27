@@ -55,13 +55,19 @@ export function ModelSelector({ mode = 'translation', className, compact = false
         const load = async () => {
             try {
                 const [response, nextProfiles] = await Promise.all([
-                    fetch('/api/models').then((res) => res.json()),
+                    fetch('/api/models').then((res) => {
+                        if (!res.ok) {
+                            throw new Error(`/api/models responded with ${res.status}`);
+                        }
+                        return res.json();
+                    }),
                     listProviderProfiles(),
                 ]);
                 setData(response);
                 setCustomProfiles(nextProfiles);
-            } catch {
-                // no-op
+            } catch (loadError) {
+                console.error('[ModelSelector] Failed to load available services:', loadError);
+                setData(null);
             } finally {
                 setLoading(false);
             }
@@ -71,7 +77,11 @@ export function ModelSelector({ mode = 'translation', className, compact = false
 
         return subscribeSyncEvents((event) => {
             if (event.type === 'storage-updated') {
-                void listProviderProfiles().then(setCustomProfiles);
+                void listProviderProfiles()
+                    .then(setCustomProfiles)
+                    .catch((profileError: unknown) => {
+                        console.error('[ModelSelector] Failed to refresh provider profiles:', profileError);
+                    });
             }
         });
     }, []);

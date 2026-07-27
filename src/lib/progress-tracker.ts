@@ -57,11 +57,19 @@ export interface AcquireActiveJobResult {
     activeJob?: ActiveTranslationJob;
 }
 
+function isMissingEntryError(error: unknown): boolean {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR";
+}
+
 async function pathExists(filePath: string): Promise<boolean> {
     try {
         await access(filePath);
         return true;
-    } catch {
+    } catch (error) {
+        if (!isMissingEntryError(error)) {
+            throw error;
+        }
         return false;
     }
 }
@@ -70,7 +78,7 @@ async function removePathIfExists(filePath: string): Promise<void> {
     try {
         await unlink(filePath);
     } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        if (!isMissingEntryError(error)) {
             throw error;
         }
     }
@@ -129,7 +137,10 @@ export class ProgressTracker {
     async readFullCache(): Promise<string | null> {
         try {
             return await readFile(this.finalCachePath, "utf-8");
-        } catch {
+        } catch (error) {
+            if (!isMissingEntryError(error)) {
+                throw error;
+            }
             return null;
         }
     }
@@ -155,12 +166,16 @@ export class ProgressTracker {
 
             return job;
         } catch (error) {
-            const errno = (error as NodeJS.ErrnoException).code;
-            if (errno === "ENOENT") {
+            if (isMissingEntryError(error)) {
                 return null;
             }
 
-            console.error("[ProgressTracker] Failed to read active job file:", error);
+            // 只有内容损坏才丢弃锁文件；IO/权限错误必须上抛，否则会误判为"无人持锁"并允许并发任务
+            if (!(error instanceof SyntaxError)) {
+                throw error;
+            }
+
+            console.error("[ProgressTracker] Active job file is corrupted:", error);
             if (pruneStale) {
                 await removePathIfExists(this.activeJobPath);
             }
@@ -243,9 +258,15 @@ export class ProgressTracker {
             const content = await readFile(this.progressPath, "utf-8");
             return JSON.parse(content) as TranslationProgress;
         } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-                console.error("[ProgressTracker] Failed to read progress file:", error);
+            if (isMissingEntryError(error)) {
+                return null;
             }
+
+            if (!(error instanceof SyntaxError)) {
+                throw error;
+            }
+
+            console.error("[ProgressTracker] Progress file is corrupted:", error);
             return null;
         }
     }
@@ -266,7 +287,10 @@ export class ProgressTracker {
 
         try {
             return await readFile(partialCachePath, "utf-8");
-        } catch {
+        } catch (error) {
+            if (!isMissingEntryError(error)) {
+                throw error;
+            }
             return null;
         }
     }
