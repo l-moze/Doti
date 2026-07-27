@@ -17,6 +17,7 @@ import {
     restorePreservedMarkdownFragments,
 } from "@/lib/markdown-table-utils";
 import { runTranslationIntegrityPass } from "@/lib/translation-integrity";
+import { getErrorMessage } from "@/lib/errors";
 import {
     normalizeTranslationBlockText,
     type TranslationChunkPlan,
@@ -37,10 +38,6 @@ type ChunkExecutionResult = {
 function sseEvent(type: string, data: object | string): string {
     const payload = typeof data === 'string' ? { message: data } : data;
     return `data: ${JSON.stringify({ type, ...payload })}\n\n`;
-}
-
-function getErrorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : "Translation failed";
 }
 
 function clampTranslationConcurrency(value: number): number {
@@ -666,7 +663,7 @@ function agentIteratorToStream(iterator: AsyncGenerator<string, void, unknown>) 
                     ));
                 } else {
                     controller.enqueue(new TextEncoder().encode(
-                        sseEvent('error', { message: getErrorMessage(error) })
+                        sseEvent('error', { message: getErrorMessage(error, 'Translation failed') })
                     ));
                 }
                 controller.close();

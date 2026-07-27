@@ -1,3 +1,5 @@
+import { escapeRegExp } from "@/lib/text-utils";
+
 export type PreservedMarkdownFragmentKind =
     | "html-table"
     | "markdown-table"
@@ -66,10 +68,6 @@ function protectWithPattern(
     fragments: PreservedMarkdownFragment[]
 ): string {
     return markdown.replace(pattern, (match) => createPreservedFragment(match, kind, fragments));
-}
-
-function escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function isWordLikeCharacter(value: string | undefined): boolean {

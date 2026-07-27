@@ -11,14 +11,14 @@ import { buildMediaDeliveryUrl, signInternalMediaUrlsInMarkdown } from "@/lib/me
 import { grantFileHashAccess } from "@/lib/media-session";
 import { findUploadArtifactPaths } from "@/lib/upload-artifacts";
 import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { readPositiveIntEnv } from "@/lib/env-utils";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 function getMaxPdfUploadBytes(): number {
-    const parsed = Number.parseInt(process.env.MAX_PDF_UPLOAD_BYTES || "", 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
+    return readPositiveIntEnv("MAX_PDF_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD_BYTES);
 }
 
 export async function POST(request: NextRequest) {

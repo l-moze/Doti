@@ -1,3 +1,5 @@
+import { sleep } from "@/lib/async-utils";
+
 type RetryPredicate = (response: Response | null, error: unknown, attempt: number) => boolean;
 
 interface FetchWithRetryOptions extends RequestInit {
@@ -39,8 +41,7 @@ export async function fetchWithRetry(
             }
         }
 
-        const delay = retryDelayMs * 2 ** attempt;
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        await sleep(retryDelayMs * 2 ** attempt);
         attempt += 1;
     }
 

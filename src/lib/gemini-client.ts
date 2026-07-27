@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { getErrorMessage } from "@/lib/errors";
 
 function getErrorStatus(error: unknown): number | undefined {
     if (typeof error === "object" && error !== null && "status" in error) {
@@ -6,10 +7,6 @@ function getErrorStatus(error: unknown): number | undefined {
         return typeof status === "number" ? status : undefined;
     }
     return undefined;
-}
-
-function getErrorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : "";
 }
 
 export class GeminiClient {
