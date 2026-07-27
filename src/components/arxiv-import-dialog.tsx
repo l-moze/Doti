@@ -65,7 +65,11 @@ export function ArxivImportDialog({
 
             const data = await response.json();
             if (!response.ok) {
-                throw new Error('没有找到论文信息，请检查 ID 或链接');
+                throw new Error(
+                    typeof data?.error === 'string' && data.error.trim()
+                        ? data.error
+                        : '没有找到论文信息，请检查 ID 或链接'
+                );
             }
 
             setPreview(data.metadata as ArxivMetadataPreview);
@@ -88,7 +92,8 @@ export function ArxivImportDialog({
         try {
             await onImport(input.trim());
             onClose();
-        } catch {
+        } catch (importError) {
+            console.error('[ArxivImport] Import failed:', importError);
             setError('没有导入成功，请检查 ID 或链接后再试');
         } finally {
             setImporting(false);

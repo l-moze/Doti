@@ -56,7 +56,11 @@ export function resolveUploadDir(fileHash: string): string | null {
 export async function directoryExists(filePath: string): Promise<boolean> {
     try {
         return (await stat(filePath)).isDirectory();
-    } catch {
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") {
+            throw error;
+        }
         return false;
     }
 }
