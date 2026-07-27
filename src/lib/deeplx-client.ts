@@ -1,4 +1,5 @@
 import type { RuntimeProviderProfile } from "@/lib/llm/client";
+import { assertAllowedOutboundUrl } from "@/lib/server/outbound-url-guard";
 
 const TARGET_LANG_MAP: Record<string, string> = {
     chinese: "ZH",
@@ -267,6 +268,10 @@ export class DeepLXClient {
             this.profile.apiKey,
             mergedOptions
         );
+
+        for (const candidate of candidates) {
+            assertAllowedOutboundUrl(candidate.endpoint);
+        }
 
         let lastError: Error | null = null;
 

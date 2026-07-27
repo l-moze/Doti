@@ -36,6 +36,12 @@ function serviceTypeLabel(providerType: ProviderProfileType) {
 function getServiceTestErrorMessage(error: unknown) {
     const message = error instanceof Error ? error.message : String(error || '');
     const normalized = message.toLowerCase();
+    if (normalized.includes('private network address')) {
+        return '该服务地址指向内网或本机地址，公开部署模式下已被拒绝。';
+    }
+    if (normalized.includes('unsupported upstream url protocol') || normalized.includes('invalid upstream url')) {
+        return '服务地址无效，只支持 http / https 地址。';
+    }
     if (
         normalized.includes('invalid provider profile') ||
         normalized.includes('provider test failed') ||

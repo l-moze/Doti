@@ -10,7 +10,7 @@ import {
 } from "@/lib/media-access";
 import { hasFileHashAccess } from "@/lib/media-session";
 import { normalizeMarkdownMathForDisplay } from "@/lib/markdown-normalizer";
-import { getUploadsRoot } from "@/lib/server/runtime-paths";
+import { getUploadsRoot, isSafeFileHash } from "@/lib/server/runtime-paths";
 
 async function pathExists(filePath: string): Promise<boolean> {
     try {
@@ -68,6 +68,10 @@ async function streamFile(filePath: string, contentType: string): Promise<NextRe
 }
 
 async function resolveMediaFilePath(fileHash: string, relativePath: string): Promise<string | null> {
+    if (!isSafeFileHash(fileHash)) {
+        return null;
+    }
+
     const uploadsRoot = path.resolve(getUploadsRoot());
     let filePath = path.resolve(uploadsRoot, fileHash, relativePath);
 

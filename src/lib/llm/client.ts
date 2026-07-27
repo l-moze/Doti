@@ -8,6 +8,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { GoogleGenAI } from '@google/genai';
 import { PROVIDERS } from './providers';
+import { assertAllowedOutboundUrl } from '@/lib/server/outbound-url-guard';
 
 export interface RuntimeProviderProfile {
     id?: string;
@@ -97,6 +98,8 @@ export function createLLMClient(providerId: string, model: string, runtimeProfil
     }
 
     if (runtimeProfile?.providerType === 'openai-compatible') {
+        assertAllowedOutboundUrl(runtimeProfile.baseUrl);
+
         const client = new OpenAI({
             apiKey: runtimeProfile.apiKey || 'placeholder',
             baseURL: runtimeProfile.baseUrl,

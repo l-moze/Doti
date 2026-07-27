@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
-import { getPdfParseCacheDir } from "@/lib/server/runtime-paths";
+import { assertSafeFileHash, getPdfParseCacheDir } from "@/lib/server/runtime-paths";
 
 const getCacheDir = () => getPdfParseCacheDir();
 
@@ -28,14 +28,14 @@ export function computeFileHash(buffer: ArrayBuffer | Buffer): string {
  * 获取缓存文件路径
  */
 function getCachePath(hash: string): string {
-    return path.join(getCacheDir(), `${hash}.md`);
+    return path.join(getCacheDir(), `${assertSafeFileHash(hash)}.md`);
 }
 
 /**
  * 获取缓存元数据文件路径
  */
 function getMetaPath(hash: string): string {
-    return path.join(getCacheDir(), `${hash}.meta.json`);
+    return path.join(getCacheDir(), `${assertSafeFileHash(hash)}.meta.json`);
 }
 
 /**

@@ -15,10 +15,20 @@ type DocumentSemanticRequest = {
     sourceMarkdown?: string;
 };
 
+const MAX_PROJECTION_CACHE_ENTRIES = 32;
+
 const projectionCache = new Map<string, {
     projection: ReturnType<typeof buildDocumentSemanticProjection>;
     markdownSignature: string | null;
 }>();
+
+function pruneProjectionCache(): void {
+    while (projectionCache.size > MAX_PROJECTION_CACHE_ENTRIES) {
+        const oldestKey = projectionCache.keys().next().value;
+        if (oldestKey === undefined) return;
+        projectionCache.delete(oldestKey);
+    }
+}
 
 export async function POST(request: NextRequest) {
     try {
@@ -59,10 +69,12 @@ export async function POST(request: NextRequest) {
             markdown,
             assetPathPrefix: buildRawMediaPrefix(fileHash),
         });
+        projectionCache.delete(fileHash);
         projectionCache.set(fileHash, {
             projection,
             markdownSignature: projection.source === 'markdown' ? markdown.trim() : null,
         });
+        pruneProjectionCache();
 
         return NextResponse.json(projection, {
             headers: {
