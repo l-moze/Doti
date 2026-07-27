@@ -5,15 +5,12 @@
 import { NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { PROVIDERS, DEFAULT_MODELS } from '@/lib/llm/providers';
+import { getErrorMessage } from '@/lib/errors';
 
 const modelCollator = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
 
 function sortModels(list: string[]): string[] {
     return [...list].sort((a, b) => modelCollator.compare(a, b));
-}
-
-function getErrorMessage(error: unknown, fallback: string): string {
-    return error instanceof Error && error.message ? error.message : fallback;
 }
 
 export async function GET() {

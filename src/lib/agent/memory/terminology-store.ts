@@ -2,15 +2,12 @@ import fs from 'fs/promises';
 import path from 'path';
 import { parse } from 'csv-parse/sync';
 import { getTermsRoot } from '@/lib/server/runtime-paths';
+import { escapeRegExp } from '@/lib/text-utils';
 
 export interface Term {
     source: string;
     target: string;
     category?: string;
-}
-
-function escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function isWordLikeCharacter(value: string | undefined): boolean {

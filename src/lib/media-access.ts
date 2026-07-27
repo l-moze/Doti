@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import { escapeRegExp } from "@/lib/text-utils";
+import { readPositiveIntEnv } from "@/lib/env-utils";
 
 const DEFAULT_MEDIA_TOKEN_TTL_SECONDS = 15 * 60;
 
@@ -36,8 +38,7 @@ export function requiresSignedMediaAccess(): boolean {
 }
 
 export function getMediaTokenTtlSeconds(): number {
-    const raw = Number.parseInt(process.env.MEDIA_TOKEN_TTL_SECONDS || "", 10);
-    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MEDIA_TOKEN_TTL_SECONDS;
+    return readPositiveIntEnv("MEDIA_TOKEN_TTL_SECONDS", DEFAULT_MEDIA_TOKEN_TTL_SECONDS);
 }
 
 export function normalizeMediaRelativePath(value: string): string {
@@ -146,10 +147,6 @@ export function buildMediaDeliveryUrl(fileHash: string, relativePath: string): s
         fileHash,
         relativePath,
     });
-}
-
-function escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function decodeMediaPathComponent(value: string): string {

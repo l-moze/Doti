@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { isAbortError, stringifyError } from '@/lib/errors';
 import { persist } from 'zustand/middleware';
 import {
     getProviderProfile,
@@ -173,8 +174,7 @@ type PendingChunkMutation = {
 };
 
 function getErrorMessage(error: unknown): string {
-    const rawMessage = error instanceof Error ? error.message : String(error || '');
-    const message = rawMessage.trim();
+    const message = stringifyError(error).trim();
     if (!message) {
         return '操作没有完成，请稍后重试。';
     }
@@ -1005,7 +1005,7 @@ export const useTranslationStore = create<TranslationState>()(
                     clearPaperPolishProgressTimer();
                     paperPolishAbortController = null;
 
-                    const isAbort = error instanceof DOMException && error.name === 'AbortError';
+                    const isAbort = isAbortError(error);
                     set({
                         paperPolishStatus: isAbort ? 'cancelled' : 'error',
                         paperPolishMode: mode,
@@ -2754,7 +2754,7 @@ export const useTranslationStore = create<TranslationState>()(
                 } catch (e: unknown) {
                     clearStreamTimers();
                     clearTranslationFlushTimers();
-                    const isAbort = e instanceof DOMException && e.name === 'AbortError';
+                    const isAbort = isAbortError(e);
                     const message = hardTimeoutTriggered
                         ? `生成译文长时间没有进展（>${Math.round(TRANSLATION_STREAM_HARD_TIMEOUT_MS / 60000)} 分钟），已暂停，请重试。`
                         : (isAbort ? '生成译文已停止。' : getErrorMessage(e));

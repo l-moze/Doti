@@ -1,4 +1,6 @@
 import type { RuntimeProviderProfile } from "@/lib/llm/client";
+import { readPositiveIntEnv } from "@/lib/env-utils";
+import { isAbortError, toError } from "@/lib/errors";
 
 const TARGET_LANG_MAP: Record<string, string> = {
     chinese: "ZH",
@@ -234,12 +236,7 @@ function isKnownSpamRedirect(value: string): boolean {
 }
 
 function resolveDeepLXTimeoutMs(): number {
-    const raw = Number.parseInt(process.env.DEEPLX_REQUEST_TIMEOUT_MS || "", 10);
-    if (!Number.isFinite(raw) || raw <= 0) {
-        return DEFAULT_DEEPLX_TIMEOUT_MS;
-    }
-
-    return raw;
+    return readPositiveIntEnv("DEEPLX_REQUEST_TIMEOUT_MS", DEFAULT_DEEPLX_TIMEOUT_MS);
 }
 
 export function supportsDeepLXOfficialGlossary(profile: RuntimeProviderProfile): boolean {
@@ -303,10 +300,10 @@ export class DeepLXClient {
 
                 return translated;
             } catch (error) {
-                if (error instanceof Error && error.name === "AbortError") {
+                if (isAbortError(error)) {
                     lastError = new Error(`DeepLX request timed out after ${timeoutMs}ms`);
                 } else {
-                    lastError = error instanceof Error ? error : new Error(String(error));
+                    lastError = toError(error);
                 }
             } finally {
                 clearTimeout(timeout);

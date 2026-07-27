@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isMinerUUpstreamError, MinerUClient } from "@/lib/mineru-client";
 import { setCache } from "@/lib/cache";
+import { sleep } from "@/lib/async-utils";
+import { readPositiveIntEnv } from "@/lib/env-utils";
 import {
     buildMediaDeliveryUrl,
     buildRawMediaUrl,
@@ -44,11 +46,6 @@ class ArtifactProcessingError extends Error {
         this.name = "ArtifactProcessingError";
         this.code = code;
     }
-}
-
-function readPositiveIntEnv(name: string, fallback: number): number {
-    const parsed = Number.parseInt(process.env[name] || "", 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function getZipDownloadLimitBytes(): number {
@@ -143,10 +140,6 @@ function rewriteMarkdownAssetUrls(markdown: string, markdownPath: string, safeHa
         });
 }
 
-function createRetryDelay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function getZipEntrySizeHint(zipEntry: JSZip.JSZipObject): number | null {
     const entryData = (zipEntry as unknown as { _data?: { uncompressedSize?: number } })._data;
     const size = entryData?.uncompressedSize;
@@ -205,7 +198,7 @@ async function downloadZipWithRetry(url: string, attempts = 3): Promise<Buffer> 
         } catch (error) {
             lastError = error;
             if (attempt < attempts) {
-                await createRetryDelay(700 * attempt);
+                await sleep(700 * attempt);
             }
         }
     }

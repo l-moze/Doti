@@ -8,6 +8,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { GoogleGenAI } from '@google/genai';
 import { PROVIDERS } from './providers';
+import { getErrorMessage } from '@/lib/errors';
 
 export interface RuntimeProviderProfile {
     id?: string;
@@ -36,10 +37,6 @@ function getErrorStatus(error: unknown): number | undefined {
         return typeof status === 'number' ? status : undefined;
     }
     return undefined;
-}
-
-function getErrorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : '';
 }
 
 function isStreamingUnsupportedError(error: unknown): boolean {
